@@ -1,0 +1,13 @@
+name: factory
+version: 1.0.0
+description: "Production teams, hierarchy, policy gates, watchdogs, and cost telemetry on Hermes kanban."
+author: Hermes Factory
+kind: general
+provides_tools:
+  - factory_verdict
+  - factory_costs
+  - factory_monitor_add
+hooks:
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
