@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 
+_COMMAND_TIMEOUT = 30.0
+
+
 def _module(name: str) -> Any:
     """Import a sibling module lazily."""
 
@@ -20,7 +23,9 @@ def _module(name: str) -> Any:
 def _run(command: list[str]) -> str:
     """Run a CLI command and return stdout."""
 
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=_COMMAND_TIMEOUT
+    )  # #16-V2: a hung gh/hermes child must not wedge a daemon tick.
     return result.stdout or ""
 
 

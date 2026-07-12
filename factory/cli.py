@@ -12,14 +12,25 @@ from typing import Any, Callable
 
 SEATS_SKELETON = """company: straits-lab-eng
 seats:
+  release:
+    profile: release
+    executor: codex
+    model: gpt-5.6
+    role: devops
   verifier:
     profile: verifier
     executor: claude
     model: sonnet-5
     reasoning: adaptive
-    reports_to: hermes-cos
+    reports_to: architect
     role: qa
     max_concurrent: 2
+  architect:
+    profile: architect
+    executor: codex
+    model: gpt-5.6
+    reports_to: release
+    role: engineer
   dev-backend:
     profile: dev-backend
     executor: codex
@@ -217,3 +228,8 @@ def main(argv: list[str] | None = None) -> Any:
 
 
 __all__ = ["factory_command", "main", "register_cli", "setup_parser"]
+
+
+if __name__ == "__main__":
+    # #16-V1: make the documented standalone CLI executable by subprocess.
+    main()

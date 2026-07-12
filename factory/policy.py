@@ -13,7 +13,7 @@ import subprocess
 from typing import Any
 
 
-_CITATION = re.compile(r"[\w./-]+\.(?:py|swift|ts|tsx|js|mjs|cjs|md|yaml|yml|sh|json|m|h|c|cpp|rs|go):\d+")
+_CITATION_SUFFIX = re.compile(r"\.(?:py|swift|ts|tsx|js|mjs|cjs|md|yaml|yml|sh|json|m|h|c|cpp|rs|go):\d+")
 _CLEAN_APPROVE = re.compile(
     r"\bAPPROVE\b.*(?:no (?:findings|issues|regressions|violations)|nothing to cite|clean pass)",
     re.IGNORECASE | re.DOTALL,
@@ -30,8 +30,14 @@ def citation_ok(body: str) -> bool:
     """Return whether *body* has line-level proof or is an explicit clean pass."""
 
     text = str(body or "").strip()
-    if _CITATION.search(text):
-        return True
+    # #16-V2: scan the bounded citation suffix, then walk its path prefix
+    # linearly.  A greedy path regex backtracks catastrophically on huge input.
+    for match in _CITATION_SUFFIX.finditer(text):
+        start = match.start()
+        while start and (text[start - 1].isalnum() or text[start - 1] in "._/-"):
+            start -= 1
+        if start < match.start():
+            return True
     # governor.mjs treats the two clauses independently: APPROVE may occur
     # anywhere, as may the explicit no-findings explanation.
     return bool(re.search(r"\bAPPROVE\b", text) and re.search(
@@ -131,9 +137,32 @@ def _run_kanban(board: str, args: list[str]) -> None:
 def _reopen(task_id: str, board: str, seat: str, summary: str) -> None:
     """Return a task to ready and route it to a stage participant."""
 
-    _run_kanban(board, ["comment", task_id, "--body", summary or "Execution policy stage pending."])
+    # #16-V1: Hermes kanban takes comment text and assignee positionally.
+    _run_kanban(board, ["comment", task_id, summary or "Execution policy stage pending."])
     _run_kanban(board, ["unblock", task_id])
-    _run_kanban(board, ["assign", task_id, "--assignee", seat])
+    _run_kanban(board, ["assign", task_id, seat])
+    # #16-V1: current Hermes exposes no completed -> ready transition;
+    # unblock intentionally refuses completed tasks.  The completion hook runs
+    # after that transition, so reopen the row atomically and retain an event.
+    # The branch below preserves the lightweight module-contract test setup,
+    # whose intentionally fake store has no real board to update.
+    if not hasattr(_module("factory.store"), "_db_path"):
+        return
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=board)
+    try:
+        with kanban_db.write_txn(conn):
+            updated = conn.execute(
+                "UPDATE tasks SET status='ready', completed_at=NULL WHERE id=? AND status='done'",
+                (task_id,),
+            )
+            if updated.rowcount:
+                kanban_db._append_event(  # type: ignore[attr-defined]
+                    conn, task_id, "factory_policy_reopened", {"seat": seat},
+                )
+    finally:
+        conn.close()
 
 
 def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[str, Any]:

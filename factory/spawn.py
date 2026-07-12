@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,13 @@ def factory_spawn(task, workspace: str, *, board=None) -> int | None:
     executor.identity_files(seat, str(root))
     prompt = _worker_prompt(context)
     command = executor.build_cmd(seat, prompt, str(root))
+    # #16-V1: permit a real-path test/operator harness override without
+    # replacing Factory modules or faking subprocess execution.
+    override = os.environ.get(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()}")
+    if override:
+        command = shlex.split(override)
+        if not command:
+            raise ValueError(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()} is empty")
     logs = _factory_home() / "runs"
     logs.mkdir(parents=True, exist_ok=True)
     log_path = logs / f"{task_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.log"
@@ -92,24 +100,30 @@ def factory_spawn(task, workspace: str, *, board=None) -> int | None:
         "TERMINAL_CWD": str(root),
     })
     log_file = log_path.open("wb")
+    prompt_bytes = prompt.encode("utf-8")
+    # #16-OPERATOR F1: NEVER write the prompt to the child's stdin from the
+    # dispatch thread. Worker context regularly exceeds the 64KB macOS pipe
+    # buffer; a slow-starting or crashed harness never drains the pipe and
+    # the blocking write() WEDGES THE ENTIRE DAEMON — no exception is ever
+    # raised (slowness is not an exception; the #62496 sweeper class).
+    # Empirically proven 07-12: 200KB write to a non-reading child blocks
+    # indefinitely. Fix: hand the child a real file as stdin.
+    prompt_path = logs / f"{task_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.prompt"
+    prompt_path.write_bytes(prompt_bytes)
+    prompt_file = prompt_path.open("rb")
     try:
         proc = subprocess.Popen(
             command,
             cwd=str(root),
-            stdin=subprocess.PIPE,
+            stdin=prompt_file,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
-        assert proc.stdin is not None
-        proc.stdin.write(prompt.encode("utf-8"))
-        proc.stdin.close()
-    except Exception:
-        log_file.close()
-        raise
     finally:
-        # The child owns a duplicated descriptor after Popen; close ours.
+        # The child owns duplicated descriptors after Popen; close ours.
+        prompt_file.close()
         log_file.close()
     run_id = store.record_run_start(task_id, assignee, seat.executor, seat.model, proc.pid)
     _RUNNING[proc.pid] = {
