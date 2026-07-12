@@ -313,3 +313,57 @@ Sentinel (executor prompts MUST instruct, daemon MUST parse):
   last line of harness output: `FACTORY_RESULT: done|blocked <summary>`
 
 All timestamps ISO8601 UTC strings. All public functions get docstrings.
+
+## 16. VALIDATION PASS (post-build hardening — Nous-sweeper standard, 2026-07-12)
+
+Built because the 4-lane build tested lanes against STUBS. This pass applies
+the three lessons from NousResearch's review of our PR #62496:
+(1) tests must drive REAL entry points, (2) every call-site needs an
+execution-context answer (what runs where; what does a SLOW callee do),
+(3) docs must match shipped behavior exactly.
+
+### Lane V1 — REAL-PATH E2E (owner: terra)
+Files: tests/test_e2e_smoke.py, tests/test_e2e_cli.py, docs/VALIDATION.md
+- test_e2e_smoke.py: NO stubs of factory modules. tmp HERMES_HOME; create a
+  REAL kanban board via hermes_cli.kanban_db (sys.path to
+  ~/Developer/products/hermes-mobile); real factory.store init_db; real
+  seats.yaml via factory.config; add a task; run kanban dispatch_once with
+  the REAL factory_spawn but executor command swapped to a /bin/sh stub
+  harness that prints tokens + FACTORY_RESULT sentinel (spawn a REAL
+  subprocess — only the AI harness binary is faked); reap_finished();
+  assert: run row finalized w/ parsed tokens, task transitioned; then a
+  policy: set a review stage, complete the task, assert policy.on_complete
+  reopens; record_verdict w/ citation, assert satisfied; done.
+  Cover BOTH sentinel outcomes and the missing-sentinel=blocked rule.
+- test_e2e_cli.py: run factory/cli.py verbs via subprocess (real argv, real
+  tmp HERMES_HOME): init, seats, org, policy show, costs, runs, pause,
+  resume, daemon --once (empty board OK). Assert exit codes + key output.
+  This also VERIFIES README's quickstart is truthful — fix README if not.
+- docs/VALIDATION.md: what was proven, command transcript, gaps left.
+
+### Lane V2 — ADVERSARIAL / EXECUTION-CONTEXT (owner: luna, high)
+Files: tests/test_adversarial.py, docs/EXECUTION-CONTEXT.md, minimal
+production fixes in factory/*.py where a finding demands one (smallest
+diff, comment with #16-V2 tag).
+- EXECUTION-CONTEXT.md: for EVERY call site in daemon.py, spawn.py,
+  dashboard/server.py, github_sync.py answer: what executes here (main
+  loop / thread / subprocess)? what does a SLOW callee do? what does a
+  crashed callee do? Table format, file:line cites.
+- test_adversarial.py, minimum:
+  a. SLOW gh: github_sync tick with subprocess.run stub sleeping > its
+     timeout — assert daemon tick completes bounded (add a timeout to gh
+     calls if missing: that IS the expected fix).
+  b. Hung executor: spawned pid alive past claim TTL — assert reap doesn't
+     block and TTL semantics hold.
+  c. Dashboard under a slow store accessor — server thread must not wedge
+     other requests indefinitely (document if single-threaded by design).
+  d. Malformed FACTORY_RESULT lines (garbage, multiple, mid-log) — parser
+     must be last-line-wins, never crash.
+  e. store.py under concurrent writers (2 threads x 50 ops) — no
+     sqlite 'database is locked' unhandled (WAL or busy_timeout = fix).
+  f. citation_ok fuzz: empty, unicode, 10MB body, regex-metachar payloads.
+- Every finding = case-law style entry in EXECUTION-CONTEXT.md: pattern,
+  file:line, fix or explicit accepted-risk.
+
+Gate: BOTH lanes' suites + the original 37 ALL green together via
+~/Developer/products/hermes-mobile/.venv/bin/python -m pytest tests/ -q.
