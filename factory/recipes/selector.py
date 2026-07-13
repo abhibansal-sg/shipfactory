@@ -3,7 +3,8 @@
 Fork SHA: e20f12f68084bf7da3358d828c3a01be509eb0a5
 Recipe-engine deltas: ranked candidate output; chosen id@version and
 parameters/skip_steps; strict fail-closed graph validation (never repair
-references); durable Factory DB leases; ``no_recipe_match`` parking.
+references); durable Factory DB leases; ``no_recipe_match`` parking;
+documented assumptions and bounded clarification parking.
 
 Kanban decomposer — fan a triage task out into a graph of child tasks.
 
@@ -125,6 +126,21 @@ Available profiles (assignees you may pick from):
 {roster}
 
 Default assignee (used when no profile fits a task): {default_assignee}
+"""
+
+
+RECIPE_SELECTOR_PROMPT = """You are the Factory recipe selector.
+
+Return one JSON object with an exact `nodes` array. Every node contains:
+id, title, body, needs, ranked_candidates, chosen, parameters, skip_steps,
+assumptions, and needs_clarification. Document low-impact informed defaults
+in assumptions. Put at most three material unresolved questions in
+needs_clarification, prioritized scope > security/privacy > UX > technical.
+
+Task sizing targets one seat-context-comfortable agent_task: about 0-3 files
+touched. At 4-6 files, prefer splitting the node. At 7+ files, split it or
+record a specific justification in assumptions. Never send unresolved
+[NEEDS CLARIFICATION: <specific question>] markers into instantiated work.
 """
 
 
@@ -494,10 +510,15 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
         raise RecipeError("selector output must be {'nodes': [...]}")
     nodes = selection["nodes"]
     ids: set[str] = set()
+    clarification_count = 0
     for index, node in enumerate(nodes):
-        required = {"id", "title", "body", "needs", "ranked_candidates", "chosen", "parameters", "skip_steps"}
-        if not isinstance(node, dict) or set(node) != required or not isinstance(node["id"], str) or not node["id"] or node["id"] in ids or not isinstance(node["title"], str) or not isinstance(node["body"], str) or not isinstance(node["needs"], list) or not isinstance(node["ranked_candidates"], list) or not isinstance(node["parameters"], dict) or not isinstance(node["skip_steps"], list):
+        required = {"id", "title", "body", "needs", "ranked_candidates", "chosen", "parameters", "skip_steps", "assumptions", "needs_clarification"}
+        if not isinstance(node, dict) or set(node) != required or not isinstance(node["id"], str) or not node["id"] or node["id"] in ids or not isinstance(node["title"], str) or not isinstance(node["body"], str) or not isinstance(node["needs"], list) or not isinstance(node["ranked_candidates"], list) or not isinstance(node["parameters"], dict) or not isinstance(node["skip_steps"], list) or not isinstance(node["assumptions"], list) or not all(isinstance(item, str) and item.strip() for item in node["assumptions"]) or not isinstance(node["needs_clarification"], list) or not all(isinstance(item, str) and item.strip() for item in node["needs_clarification"]):
             raise RecipeError(f"invalid selector node {index}")
+        clarification_count += len(node["needs_clarification"])
+        clarification_count += len(re.findall(r"\[NEEDS CLARIFICATION:\s*[^\]]+\]", node["body"], re.IGNORECASE))
+        if clarification_count > 3:
+            raise RecipeError("selector output exceeds 3 clarification markers")
         ids.add(node["id"])
         for candidate in node["ranked_candidates"]:
             if not isinstance(candidate, dict) or set(candidate) != {"id", "score", "reason"} or not isinstance(candidate["id"], str) or not isinstance(candidate["score"], (int, float)) or not isinstance(candidate["reason"], str): raise RecipeError("invalid ranked candidate")
@@ -521,6 +542,40 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
             active.remove(node_id); seen.add(node_id)
     for node_id in by_id: walk(node_id)
     return nodes
+
+
+def _selection_clarifications(nodes: list[dict]) -> list[str]:
+    markers: list[str] = []
+    for node in nodes:
+        markers.extend(item.strip() for item in node["needs_clarification"])
+        markers.extend(
+            match.group(0) for match in re.finditer(
+                r"\[NEEDS CLARIFICATION:\s*[^\]]+\]", node["body"], re.IGNORECASE,
+            )
+        )
+    return markers
+
+
+def validate_or_park_selection(conn, source_task_id: str, selection: object, library,
+                               *, seats: set[str], profiles: set[str]) -> list[dict]:
+    """Validate output and park unresolved questions before instantiation."""
+    nodes = validate_selection(selection, library, seats=seats, profiles=profiles)
+    markers = _selection_clarifications(nodes)
+    if not markers:
+        return nodes
+    task = kb.get_task(conn, source_task_id)
+    if task is None:
+        raise ValueError("unknown selector source task")
+    if task.status == "triage":
+        if not kb.specify_triage_task(conn, source_task_id, author="factory-selector"):
+            raise RuntimeError("selector source moved before clarification park")
+        task = kb.get_task(conn, source_task_id)
+    reason = "needs_clarification: " + json.dumps(markers, ensure_ascii=False)
+    if not task or task.status not in {"ready", "running"} or not kb.block_task(
+        conn, source_task_id, kind="needs_input", reason=reason,
+    ):
+        raise RuntimeError("selector source could not be parked for clarification")
+    return []
 
 
 def lease_source_task(source_task_id: str, board: str, *, seconds: int = 120) -> str | None:

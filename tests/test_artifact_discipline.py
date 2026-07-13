@@ -1,9 +1,11 @@
 """Artifact-discipline recipe regressions."""
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from pathlib import Path
+
+import pytest
 
 from factory import store
 from factory.recipes.advancer import (
@@ -14,7 +16,12 @@ from factory.recipes.advancer import (
     release_review_stall,
 )
 from factory.recipes.instantiate import instantiate
-from factory.recipes.loader import load_library
+from factory.recipes.loader import RecipeError, load_library
+from factory.recipes.selector import (
+    RECIPE_SELECTOR_PROMPT,
+    validate_or_park_selection,
+    validate_selection,
+)
 
 
 PROFILES = {
@@ -265,3 +272,63 @@ def test_wait_for_event_resume_note_is_written_and_consumed(tmp_path, kanban_con
     apply_events(kanban_conn, profiles=PROFILES)
     comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
     assert len([comment for comment in comments if comment.body.startswith("RESUMED ")]) == 1
+
+
+def _selector_node(*, clarifications: list[str]) -> dict:
+    return {
+        "id": "change",
+        "title": "Build the change",
+        "body": "Implement the selected request.",
+        "needs": [],
+        "ranked_candidates": [
+            {"id": "dev-pipeline@2", "score": 1.0, "reason": "software change"},
+        ],
+        "chosen": "dev-pipeline@2",
+        "parameters": {"request": "Implement the selected request."},
+        "skip_steps": [],
+        "assumptions": ["The change touches no more than three files."],
+        "needs_clarification": clarifications,
+    }
+
+
+def test_selector_rejects_four_clarification_markers():
+    library = load_library(ROOT / "recipes", persist=False)
+    selection = {"nodes": [_selector_node(clarifications=["one", "two", "three", "four"])]}
+    with pytest.raises(RecipeError, match="exceeds 3 clarification markers"):
+        validate_selection(
+            selection,
+            library,
+            seats={"verifier", "dev-backend", "operator"},
+            profiles={"standard"},
+        )
+    assert "0-3 files" in RECIPE_SELECTOR_PROMPT
+    assert "4-6 files" in RECIPE_SELECTOR_PROMPT
+    assert "7+ files" in RECIPE_SELECTOR_PROMPT
+
+
+def test_selector_clarification_parks_source_and_instantiates_nothing(kanban_conn):
+    from hermes_cli import kanban_db
+
+    library = load_library(ROOT / "recipes")
+    source = kanban_db.create_task(
+        kanban_conn,
+        title="Ambiguous request",
+        body="Needs an operator answer.",
+        triage=True,
+    )
+    selection = {"nodes": [_selector_node(clarifications=["Which tenant owns the data?"])]}
+    assert validate_or_park_selection(
+        kanban_conn,
+        source,
+        selection,
+        library,
+        seats={"verifier", "dev-backend", "operator"},
+        profiles={"standard"},
+    ) == []
+
+    task = kanban_db.get_task(kanban_conn, source)
+    assert (task.status, task.block_kind) == ("blocked", "needs_input")
+    blocked = [event for event in kanban_db.list_events(kanban_conn, source) if event.kind == "blocked"]
+    assert "Which tenant owns the data?" in blocked[-1].payload["reason"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM recipe_instances").fetchone()[0] == 0
