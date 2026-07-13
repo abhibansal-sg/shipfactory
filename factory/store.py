@@ -60,6 +60,37 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS seat_state (seat TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sync (
           gh_number INTEGER PRIMARY KEY, task_id TEXT NOT NULL, gh_updated TEXT, k_updated TEXT, last_synced_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS recipe_versions (
+          id TEXT NOT NULL, version INTEGER NOT NULL, hash TEXT NOT NULL, status TEXT NOT NULL,
+          normalized_yaml TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id, version));
+        CREATE TABLE IF NOT EXISTS recipe_instances (
+          id TEXT PRIMARY KEY, board TEXT NOT NULL, collector_task_id TEXT NOT NULL,
+          recipe_id TEXT NOT NULL, recipe_version INTEGER NOT NULL, recipe_hash TEXT NOT NULL,
+          status TEXT NOT NULL, parameters_json TEXT NOT NULL, activation_count INTEGER NOT NULL DEFAULT 0,
+          tokens_charged INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS recipe_steps (
+          instance_id TEXT NOT NULL, step_id TEXT NOT NULL, activation INTEGER NOT NULL,
+          primitive TEXT NOT NULL, state TEXT NOT NULL, kanban_task_id TEXT UNIQUE,
+          input_revision_hash TEXT, output_revision INTEGER, blocked_reason TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(instance_id, step_id, activation),
+          FOREIGN KEY(instance_id) REFERENCES recipe_instances(id));
+        CREATE TABLE IF NOT EXISTS advance_events (
+          key TEXT PRIMARY KEY, instance_id TEXT, source TEXT NOT NULL, payload_json TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, applied_at TEXT);
+        CREATE INDEX IF NOT EXISTS idx_advance_events_pending ON advance_events(state, created_at);
+        CREATE TABLE IF NOT EXISTS budget_charges (
+          key TEXT PRIMARY KEY, board TEXT NOT NULL, utc_day TEXT NOT NULL, instance_id TEXT NOT NULL,
+          step_id TEXT NOT NULL, activation INTEGER NOT NULL, tokens INTEGER NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_budget_charges_day ON budget_charges(board, utc_day);
+        CREATE TABLE IF NOT EXISTS outbox (
+          key TEXT PRIMARY KEY, target TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
+        CREATE TABLE IF NOT EXISTS triage_selections (
+          id TEXT PRIMARY KEY, source_task_id TEXT NOT NULL UNIQUE, board TEXT NOT NULL, lease_until TEXT,
+          ranked_json TEXT NOT NULL, chosen_recipe TEXT, parameters_json TEXT, skip_steps_json TEXT,
+          outcome TEXT, root_collector_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         """)
         monitor_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(monitors)")

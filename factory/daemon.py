@@ -11,9 +11,26 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
     from hermes_cli.kanban_db import dispatch_once
     from factory.spawn import factory_spawn, reap_finished
 
-    dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board)
+    dispatch_kwargs: dict[str, Any] = {}
+    result_recipes = None
+    try:
+        from factory.config import FactoryConfigError, load_seats
+        cfg = load_seats()
+        recipes_cfg = cfg.recipes or {}
+        if recipes_cfg.get("enabled"):
+            from factory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
+            startup_guard(cfg)
+            dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
+            result_recipes = {"events": apply_events(conn, profiles=recipes_cfg["execution_profiles"]), "outbox": deliver_outbox(), "root_collectors": reconcile_root_collectors(conn)}
+    except (ImportError, FileNotFoundError, OSError, FactoryConfigError):
+        # Existing Factory installations without a seats file retain the old
+        # dispatch behavior; a configured recipe board is always fail-closed.
+        result_recipes = None
+    dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board, **dispatch_kwargs)
     reaped = reap_finished()
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
+    if result_recipes is not None:
+        result["recipes"] = result_recipes
     # Lane C modules are deliberately optional at plugin import time.
     try:
         from factory import watchdog

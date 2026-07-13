@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 AGENT_ROLES = frozenset({"ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"})
 EXECUTORS = frozenset({"hermes", "codex", "claude"})
 
@@ -38,6 +40,7 @@ class FactoryConfig:
     company: str
     seats: dict[str, Seat]
     hierarchy_gates: dict
+    recipes: dict[str, Any] | None = None
 
 
 def _scalar(text: str) -> Any:
@@ -67,6 +70,12 @@ def _parse_yaml(text: str) -> dict[str, Any]:
             return value
     except json.JSONDecodeError:
         pass
+    try:
+        parsed = yaml.safe_load(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except yaml.YAMLError as exc:
+        raise FactoryConfigError(f"invalid YAML: {exc}") from exc
     root: dict[str, Any] = {}
     stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
     for number, raw in enumerate(text.splitlines(), 1):
@@ -110,7 +119,10 @@ def load_seats(path=None) -> FactoryConfig:
         seats = {name: Seat(name=name, **(values or {})) for name, values in seats_raw.items()}
     except (TypeError, ValueError) as exc:
         raise FactoryConfigError(f"invalid seat: {exc}") from exc
-    cfg = FactoryConfig(str(raw.get("company", "")), seats, raw.get("hierarchy_gates", {}) or {})
+    recipes = raw.get("recipes", {}) or {}
+    if not isinstance(recipes, dict):
+        raise FactoryConfigError("recipes must be a mapping")
+    cfg = FactoryConfig(str(raw.get("company", "")), seats, raw.get("hierarchy_gates", {}) or {}, recipes)
     validate(cfg)
     return cfg
 
@@ -150,6 +162,19 @@ def validate(cfg) -> None:
         unknown = [name for name in values if name not in cfg.seats]
         if unknown:
             raise FactoryConfigError(f"hierarchy_gates.{gate} contains unknown seat {unknown[0]!r}")
+    recipes = cfg.recipes or {}
+    if recipes and not isinstance(recipes.get("enabled", False), bool):
+        raise FactoryConfigError("recipes.enabled must be boolean")
+    if recipes.get("enabled"):
+        for field in ("library_path", "bare_task_recipe", "notify_target", "board_day_token_ceiling", "dispatcher_max_in_progress", "execution_profiles"):
+            if field not in recipes:
+                raise FactoryConfigError(f"recipes.{field} is required when enabled")
+        profiles = recipes["execution_profiles"]
+        if not isinstance(profiles, dict) or not profiles:
+            raise FactoryConfigError("recipes.execution_profiles must be nonempty mapping")
+        for name, profile in profiles.items():
+            if not isinstance(profile, dict) or set(profile) != {"max_runtime_seconds", "max_retries", "token_allowance"} or any(not isinstance(profile[x], int) or profile[x] < 1 for x in profile):
+                raise FactoryConfigError(f"invalid execution profile {name!r}")
 
 
 __all__ = ["FactoryConfig", "FactoryConfigError", "Seat", "load_seats", "validate"]

@@ -1,0 +1,50 @@
+schema: factory.recipe/v1
+id: aheli-po-intake
+version: 1
+status: active
+description: Simulated purchasing intake with human/event waits only.
+intent_tags: [purchase-order, aheli]
+supersedes: null
+parameters:
+  request: {type: string, required: true, default: null}
+  notify_target: {type: string, required: false, default: telegram:home}
+  booking_due_at: {type: datetime, required: false, default: null}
+  delivery_due_at: {type: datetime, required: false, default: null}
+budgets: {max_activations: 6, max_step_activations: 2, max_tokens: 150000}
+steps:
+  - id: intake
+    primitive: agent_task
+    title: Capture PO intake
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: "Simulate intake only for ${request}; do not purchase.", execution_profile: standard, workspace: worktree}
+  - id: docs
+    primitive: agent_task
+    title: Prepare simulated documents
+    needs: [intake]
+    optional: false
+    params: {seat: dev-backend, instructions: "Prepare simulated PO documentation only.", execution_profile: standard, workspace: worktree}
+  - id: notify
+    primitive: notify
+    title: Notify simulated PO ready
+    needs: [docs]
+    optional: false
+    params: {target: "${notify_target}", message: "Simulated PO ready; no booking or payment was made."}
+  - id: booking
+    primitive: wait_for_event
+    title: Wait for simulated booking
+    needs: [notify]
+    optional: false
+    params: {event: booking_confirmed, due_at: "${booking_due_at}"}
+  - id: delivery
+    primitive: wait_for_event
+    title: Wait for simulated delivery
+    needs: [booking]
+    optional: false
+    params: {event: delivery_confirmed, due_at: "${delivery_due_at}"}
+  - id: closeout
+    primitive: notify
+    title: Close simulated PO
+    needs: [delivery]
+    optional: false
+    params: {target: "${notify_target}", message: "Simulated PO closeout complete; no real-world side effect occurred."}

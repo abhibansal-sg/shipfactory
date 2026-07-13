@@ -169,6 +169,15 @@ def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[s
     """Apply the policy after worker completion and reopen when stages remain."""
 
     store = _module("factory.store")
+    # Recipes are the exclusive flow authority.  This lookup is intentionally
+    # best-effort so the frozen lightweight policy-module tests remain usable.
+    if hasattr(store, "_connect"):
+        try:
+            with store._connect() as conn:
+                if conn.execute("SELECT 1 FROM recipe_steps WHERE kanban_task_id=?", (task_id,)).fetchone():
+                    return {"action": "recipe", "next_stage": None}
+        except Exception:
+            pass
     policy = store.get_policy(task_id)
     if policy is None:
         return {"action": "allow", "next_stage": None}

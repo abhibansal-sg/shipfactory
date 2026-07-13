@@ -179,6 +179,65 @@ def _pause(args: argparse.Namespace) -> Any:
     return _emit({"seat": args.seat, "paused": paused})
 
 
+def _recipe(args: argparse.Namespace) -> Any:
+    """Thin CLI facade: commands enqueue/reconcile through the recipe service."""
+    from factory import store
+    from factory.recipes import advancer
+    from hermes_cli import kanban_db
+    command = args.recipe_command
+    if command in {"show", "waiting", "list"}:
+        with store._connect() as db:
+            if command == "show":
+                row = db.execute("SELECT * FROM recipe_instances WHERE id=?", (args.instance,)).fetchone()
+                if not row: raise ValueError("unknown recipe instance")
+                answer = dict(row); answer["steps"] = [dict(r) for r in db.execute("SELECT * FROM recipe_steps WHERE instance_id=? ORDER BY step_id,activation", (args.instance,))]
+            elif command == "waiting":
+                answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances WHERE status IN ('waiting_gate','waiting_event','blocked') ORDER BY updated_at")]
+            else:
+                answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances ORDER BY created_at DESC")]
+        return _emit(answer)
+    conn = kanban_db.connect(board=getattr(args, "board", None))
+    try:
+        if command == "event": return _emit({"key": advancer.event(args.instance, args.step, json.loads(args.payload))})
+        if command == "cancel": return _emit(advancer.cancel(conn, args.instance, dry_run=args.dry_run))
+        if command in {"approve", "reject"}:
+            return _emit(_recipe_gate(conn, args.instance, args.step, command, getattr(args, "reason", "")))
+        if command == "reroute": return _emit(_reroute(conn, args))
+    finally:
+        conn.close()
+
+
+def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reason: str) -> dict[str, Any]:
+    from factory import store
+    from hermes_cli import kanban_db
+    with store._connect() as db:
+        instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
+        step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance_id, step_id)).fetchone()
+        if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting": raise ValueError("approval gate is not waiting")
+        if decision == "reject":
+            db.execute("UPDATE recipe_steps SET state='blocked',blocked_reason=?,updated_at=? WHERE instance_id=? AND step_id=? AND activation=?", (reason or "operator_rejected", store._now(), instance_id, step_id, step["activation"]))
+            db.execute("UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?", (reason or "operator_rejected", store._now(), instance_id)); return {"instance_id": instance_id, "status": "blocked"}
+        kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved")
+    from factory.recipes.advancer import reconcile
+    return reconcile(conn, instance_id)
+
+
+def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
+    from factory import store
+    from factory.recipes.loader import load_library
+    from factory.recipes.instantiate import instantiate
+    from factory.recipes.advancer import cancel
+    with store._connect() as db:
+        old = dict(db.execute("SELECT * FROM recipe_instances WHERE id=?", (args.instance,)).fetchone() or {})
+        if not old: raise ValueError("unknown recipe instance")
+        activated = db.execute("SELECT 1 FROM recipe_steps WHERE instance_id=? AND kanban_task_id IS NOT NULL LIMIT 1", (args.instance,)).fetchone()
+    if activated: cancel(conn, args.instance)
+    library = load_library(args.library)
+    recipe = library.get(args.recipe)
+    result = instantiate(conn, board=old["board"], recipe=recipe, parameters=json.loads(args.parameters), parent_tasks=[])
+    return {"old_instance": args.instance, "activated": bool(activated), "replacement": result}
+
+
 def _handler(parser: argparse.ArgumentParser, name: str, help_text: str,
              function: Callable[[argparse.Namespace], Any]) -> argparse.ArgumentParser:
     command = parser.add_parser(name, help=help_text)
@@ -208,6 +267,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p = _handler(verbs, "sync", "synchronize GitHub Issues", _sync); p.add_argument("--board"); p.add_argument("--repo", required=True)
     p = _handler(verbs, "dashboard", "serve the local operator dashboard", _dashboard); p.add_argument("--port", type=int, default=18820)
     p = _handler(verbs, "runs", "list or inspect harness runs", _runs); p.add_argument("id", nargs="?", type=int)
+    p = _handler(verbs, "recipe", "operate recipe instances", _recipe); subs = p.add_subparsers(dest="recipe_command", required=True)
+    q = subs.add_parser("show"); q.add_argument("instance")
+    subs.add_parser("waiting"); subs.add_parser("list")
+    for name in ("approve", "reject"):
+        q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--board")
+    q = subs.add_parser("event"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("payload"); q.add_argument("--board")
+    q = subs.add_parser("cancel"); q.add_argument("instance"); q.add_argument("--dry-run", action="store_true"); q.add_argument("--board")
+    q = subs.add_parser("reroute"); q.add_argument("instance"); q.add_argument("recipe"); q.add_argument("--parameters", default="{}"); q.add_argument("--library", required=True); q.add_argument("--board")
     for name in ("pause", "resume"):
         p = _handler(verbs, name, f"{name} a seat", _pause); p.add_argument("seat")
 

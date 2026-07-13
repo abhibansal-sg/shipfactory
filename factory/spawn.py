@@ -14,6 +14,7 @@ from typing import Any
 from factory.executors import get_executor
 
 _RESULT_RE = re.compile(r"^FACTORY_RESULT:\s*(done|blocked)\s+(.+?)\s*$", re.I)
+_VERDICT_RE = re.compile(r"^FACTORY_VERDICT:\s*\{.*\}\s*$")
 _RUNNING: dict[int, dict[str, Any]] = {}
 
 
@@ -139,6 +140,10 @@ def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
     match = _RESULT_RE.match(lines[-1]) if lines else None
     if match:
         return match.group(1).lower(), match.group(2)
+    # Recipe review gates use the stronger structured verdict sentinel in
+    # place of FACTORY_RESULT.  The advancer validates the JSON and citation.
+    if lines and _VERDICT_RE.fullmatch(lines[-1]):
+        return "done", lines[-1]
     if exit_code == 0:
         return "blocked", "no result sentinel"
     return "blocked", f"harness exited with code {exit_code}"
@@ -169,7 +174,10 @@ def reap_finished() -> list[dict]:
             conn = kanban_db.connect(board=record["board"])
             try:
                 if result == "done":
-                    kanban_db.complete_task(conn, record["task_id"], summary=summary)
+                    try:
+                        kanban_db.complete_task(conn, record["task_id"], result=summary, summary=summary)
+                    except TypeError:  # frozen older/stub callback contract
+                        kanban_db.complete_task(conn, record["task_id"], summary=summary)
                 else:
                     kanban_db.block_task(conn, record["task_id"], reason=summary)
             finally:

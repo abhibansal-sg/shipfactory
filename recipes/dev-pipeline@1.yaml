@@ -1,0 +1,36 @@
+schema: factory.recipe/v1
+id: dev-pipeline
+version: 1
+status: active
+description: Build, verify, review, approve, and land a change.
+intent_tags: [software-change]
+supersedes: null
+parameters:
+  request: {type: string, required: true, default: null}
+  notify_target: {type: string, required: false, default: telegram:home}
+budgets: {max_activations: 12, max_step_activations: 3, max_tokens: 300000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build the change
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: "Implement ${request}", execution_profile: standard, workspace: worktree}
+  - id: review
+    primitive: review_gate
+    title: Review the change
+    needs: [build]
+    optional: false
+    params: {seat: verifier, instructions: "Review with evidence and finish with FACTORY_VERDICT JSON.", execution_profile: standard, workspace: worktree}
+  - id: approval
+    primitive: approval_gate
+    title: Approve the change
+    needs: [review]
+    optional: false
+    params: {approvers: [architect], instructions: "Approve or reject the reviewed revision."}
+  - id: notify
+    primitive: notify
+    title: Notify completion
+    needs: [approval]
+    optional: false
+    params: {target: "${notify_target}", message: "Development pipeline complete."}

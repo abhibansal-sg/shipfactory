@@ -10,7 +10,7 @@ import types
 from factory import cli
 
 
-VERBS = {"init", "seats", "org", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume"}
+VERBS = {"init", "seats", "org", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
 
 
 def parser() -> argparse.ArgumentParser:
