@@ -740,3 +740,44 @@ expressibility were verified GO with worked examples. Amendments:
    execution returns in v2 as an executor access-mode contract.
 7. BUILD-1 SCOPE grows by: the two kanban APIs (2b) + their tests +
    capability probe; root-collector completion; leaf-first cancel ordering.
+
+#### 17.15 Artifact Discipline (GSD/Spec-Kit harvest)
+
+Factory adopts the donor systems' artifact content while retaining §17's
+deterministic runtime and sole-state rules.
+
+**Adopt:** substantive step summaries with dependency frontmatter; bounded
+executor deviation authority; adversarial goal-backward verification;
+four-level artifact checks (exists, substantive, wired, real data flow);
+pre-execution plan scoring; requirements-as-unit-tests checklists; bounded
+clarification markers; and ephemeral continue-here handoffs.
+
+**Adapt:** donor phase, plan, Claude, and filesystem vocabulary becomes recipe
+instances, step activations, seats, kanban tasks, and kanban comments. Human
+gate handoffs are comments consumed by a `RESUMED` marker. Selector output
+records informed-default assumptions and at most three prioritized
+clarifications. GSD's revision-loop lesson becomes one persisted finding count
+per review activation and deterministic stall escalation.
+
+**Ignore:** donor disk state machines, constitution mechanisms, nested model
+orchestrators, scheduler/retry machinery, package auto-install behavior, and
+additional gate or primitive types. `factory.db` remains sole recipe state,
+kanban remains the scheduler, §17 remains the constitution, and the five
+primitives remain exhaustive.
+
+The harvest authorizes exactly two engine deltas: (1) review-stall detection
+and audited operator release, and (2) continue-here comments on human-gate
+park/resume. Future artifact-discipline work SHALL land as recipe content,
+templates, selector contract content, tests, or documentation unless a new
+operator-ratified §17 amendment explicitly changes this cap.
+
+Files under `recipes/templates/` are canonical. Recipe instructions SHALL
+reference the canonical path and inline only a five-to-eight-line executable
+summary so a seat can act without guessing. Content changes begin in the
+template and then propagate to every referencing recipe; inline summaries do
+not silently redefine the canon.
+
+Every future §17 amendment commit body SHALL include a `Sync-Impact` section
+listing each affected template and recipe. Each entry SHALL carry `✅` when
+propagated in that commit or `⚠` with the explicit pending reason. Omitting an
+affected artifact from that list is a spec violation.

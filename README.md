@@ -51,6 +51,27 @@ hermes factory dashboard
 
 The dashboard prints its localhost URL with the required token. Its default port is 18820.
 
+## Recipe artifact quick reference
+
+`recipes/dev-pipeline@2.yaml` is the artifact-disciplined software-change flow:
+plan-check → build → verify → operator approval → notify. Version 1 remains
+published and immutable. The canonical agent contracts live under
+`recipes/templates/`; recipe instructions reference those files and inline a
+short executable summary.
+
+Review loops park as `review_stall` when two consecutive parseable rejection
+counts do not shrink. An operator can authorize one more bounded revision with
+an audited reason:
+
+```sh
+hermes factory recipe release INSTANCE VERIFY_STEP --reason "operator rationale" --board BOARD
+```
+
+Approval gates and event waits carry a `CONTINUE-HERE` kanban comment and gain
+a `RESUMED <timestamp>` marker when consumed. Selector output with unresolved
+clarifications parks the source task for input and never instantiates marked
+work.
+
 ## GitHub webhook wake-up
 
 Explicit synchronization is available through `hermes factory sync --board straits-lab-eng --repo OWNER/REPO`. To let Hermes wake targeted syncs for GitHub activity, add an Issues/Issue Comment/Pull Request subscription:
