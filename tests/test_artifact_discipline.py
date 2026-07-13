@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from factory import store
@@ -23,6 +24,9 @@ PROFILES = {
         "token_allowance": 50_000,
     }
 }
+
+ROOT = Path(__file__).resolve().parents[1]
+DEV_PIPELINE_V1_SHA256 = "a5911fd612ca25a50d3d0af066fc6d3b6d11f991dd9c423f55ed27d843a180c1"
 
 
 def _review_loop_recipe(tmp_path: Path):
@@ -55,6 +59,24 @@ steps:
         encoding="utf-8",
     )
     return load_library(library).get("review-loop@1")
+
+
+def test_dev_pipeline_v2_loads_in_order_and_v1_bytes_are_immutable():
+    v1 = ROOT / "recipes" / "dev-pipeline@1.yaml"
+    assert hashlib.sha256(v1.read_bytes()).hexdigest() == DEV_PIPELINE_V1_SHA256
+
+    recipe = load_library(ROOT / "recipes", persist=False).get("dev-pipeline@2").document
+    assert recipe["budgets"] == {
+        "max_activations": 12,
+        "max_step_activations": 3,
+        "max_tokens": 300_000,
+    }
+    assert [step["id"] for step in recipe["steps"]] == [
+        "plan-check", "build", "verify", "approval", "notify",
+    ]
+    assert [step["needs"] for step in recipe["steps"]] == [
+        [], ["plan-check"], ["build"], ["verify"], ["approval"],
+    ]
 
 
 def _step(instance_id: str, step_id: str, activation: int | None = None) -> dict | None:
