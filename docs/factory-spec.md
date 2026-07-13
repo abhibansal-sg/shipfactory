@@ -214,17 +214,31 @@ issue-execution-policy.d.ts) onto kanban:
   at write time (the PR#138 lane-breach class, enforced in code).
 - org chart: `hermes factory org` prints the tree ASCII.
 
-## 10. Dashboard (dashboard/)
+## 10. Dashboard — HERMES DASHBOARD TAB (§10-v2, operator law 2026-07-13)
 
-Minimal, stdlib-only (http.server, single process, localhost bind,
-token query param reusing kanban dashboard's pattern):
-- GET / -> board columns (todo/ready/in_progress/review/done) per company.
-- GET /seats -> seat table: executor, model, running (live pids), today's
-  runs, today's tokens, ledger of last 5 outcomes.
-- GET /runs/<id> -> run log tail + usage + task link.
-- GET /costs -> telemetry rollup (by seat/day).
-- POST /pause?seat=X -> sets seat.paused in factory.db (spawn skips paused).
-Launch: `hermes factory dashboard [--port 18820]`.
+SUPERSEDED DECISION, said out loud: the standalone dashboard server
+(factory/dashboard/, port 18820) was built to the original §10 and is now
+RETIRED. Abhi ruled (twice — 2nd time 2026-07-13, first during an earlier
+session): factory UI lives INSIDE the Hermes dashboard via the first-class
+plugin-dashboard extension system. No second server, port, token, or
+maintenance surface. LAW FOR ALL FUTURE LANES: any factory UI work targets
+plugins/factory/dashboard/{manifest.json,plugin_api.py,dist/} —
+the same mechanism the kanban plugin tab uses. The standalone server code
+may be deleted on sight after the tab ships; hermes factory dashboard CLI
+verb prints a pointer to the dashboard URL instead of serving.
+
+Tab spec (v1 views, priority order):
+1. WAITING GATES inbox — every blocked(needs_input) gate across instances,
+   approve/reject buttons wired to the same advancer event path as the CLI.
+   This is the operator's daily surface; it ships first.
+2. INSTANCES — recipe id@version, per-step states/activations, tokens
+   charged vs budgets, blocked reasons, cancel(--dry-run)/reroute actions.
+3. SEATS + COSTS — ported from the standalone views, reading factory.db.
+4. Board views are NOT duplicated — link to the existing kanban tab.
+manifest: {"name":"factory","label":"Factory","tab":{"path":"/factory",
+"position":"after:kanban"},"entry":"dist/index.js","api":"plugin_api.py"}.
+plugin_api.py = FastAPI router reading factory.db + recipe tables (same
+data layer the CLI verbs read; no new state).
 
 ## 11. CLI (cli.py) — registered via ctx.register_cli_command
 
