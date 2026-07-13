@@ -225,16 +225,24 @@ def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reaso
 def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
     from factory import store
     from factory.recipes.loader import load_library
-    from factory.recipes.instantiate import instantiate
+    from factory.recipes.instantiate import instantiate, replace_unactivated
     from factory.recipes.advancer import cancel
     with store._connect() as db:
         old = dict(db.execute("SELECT * FROM recipe_instances WHERE id=?", (args.instance,)).fetchone() or {})
         if not old: raise ValueError("unknown recipe instance")
-        activated = db.execute("SELECT 1 FROM recipe_steps WHERE instance_id=? AND kanban_task_id IS NOT NULL LIMIT 1", (args.instance,)).fetchone()
-    if activated: cancel(conn, args.instance)
+        activated = db.execute(
+            "SELECT 1 FROM recipe_steps WHERE instance_id=? "
+            "AND (kanban_task_id IS NOT NULL OR state NOT IN ('pending','skipped')) LIMIT 1",
+            (args.instance,),
+        ).fetchone()
     library = load_library(args.library)
     recipe = library.get(args.recipe)
-    result = instantiate(conn, board=old["board"], recipe=recipe, parameters=json.loads(args.parameters), parent_tasks=[])
+    parameters = json.loads(args.parameters)
+    if activated:
+        cancel(conn, args.instance)
+        result = instantiate(conn, board=old["board"], recipe=recipe, parameters=parameters, parent_tasks=[])
+    else:
+        result = replace_unactivated(instance_id=args.instance, recipe=recipe, parameters=parameters)
     return {"old_instance": args.instance, "activated": bool(activated), "replacement": result}
 
 

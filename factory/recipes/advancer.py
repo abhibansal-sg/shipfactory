@@ -49,7 +49,21 @@ def _transition(db: Any, instance: dict[str, Any], step: dict[str, Any], state: 
     existing = db.execute("SELECT state FROM advance_events WHERE key=?", (key,)).fetchone()
     if existing and existing["state"] == "applied": return False
     db.execute("INSERT OR IGNORE INTO advance_events(key,instance_id,source,payload_json,state,created_at) VALUES(?,?,?,?, 'pending',?)", (key, instance["id"], source, "{}", store._now()))
-    db.execute("UPDATE recipe_steps SET state=?,blocked_reason=?,kanban_task_id=COALESCE(?,kanban_task_id),updated_at=? WHERE instance_id=? AND step_id=? AND activation=?", (state, reason, task, store._now(), instance["id"], step["step_id"], step["activation"]))
+    output_revision = None
+    if state == "done" and step["primitive"] == "agent_task":
+        output_revision = int(db.execute(
+            "SELECT COALESCE(MAX(output_revision),0)+1 FROM recipe_steps WHERE instance_id=?",
+            (instance["id"],),
+        ).fetchone()[0])
+    db.execute(
+        "UPDATE recipe_steps SET state=?,blocked_reason=?,kanban_task_id=COALESCE(?,kanban_task_id),"
+        "output_revision=COALESCE(output_revision,?),updated_at=? "
+        "WHERE instance_id=? AND step_id=? AND activation=?",
+        (
+            state, reason, task, output_revision, store._now(), instance["id"],
+            step["step_id"], step["activation"],
+        ),
+    )
     db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), key))
     return True
 
@@ -108,61 +122,93 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
         current = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], node)).fetchone()
         if not current: continue
         activation = int(current["activation"]) + 1
-        db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,input_revision_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (instance["id"], node, activation, defs[node]["primitive"], "pending", revision_vector(db, instance["id"], dict(current)), now, now))
+        db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance["id"], node, activation, defs[node]["primitive"], "pending", now, now))
 
 def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Idempotently reconcile every nonterminal activation with kanban/outbox."""
     from hermes_cli import kanban_db
     profiles = profiles or {"standard": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 50000}}
     with store._connect() as db:
-        instance = _instance(db, instance_id)
-        if not instance: raise ValueError("unknown recipe instance")
-        if instance["status"] in {"cancelling", "cancelled"}: return {"instance_id": instance_id, "status": instance["status"]}
-        recipe_obj = recipe_for_instance(instance); recipe = recipe_obj.document; params = json.loads(instance["parameters_json"]); defs = {x["id"]: x for x in recipe["steps"]}
-        latest = {x["step_id"]: x for x in _latest(db, instance_id)}
-        for step_id, step in list(latest.items()):
-            if step["state"] != "pending": continue
-            needs = defs[step_id]["needs"]
-            if all(latest[n]["state"] in {"done", "skipped"} for n in needs):
-                _transition(db, instance, step, "ready", "reconcile")
-        db.commit()
-    # Kanban writes are kept outside factory transaction and are idempotent by task key.
-    with store._connect() as db:
-        instance = _instance(db, instance_id); recipe = recipe_for_instance(instance).document; params = json.loads(instance["parameters_json"]); defs = {x["id"]: x for x in recipe["steps"]}; latest = {x["step_id"]: x for x in _latest(db, instance_id)}
-        for sid, step in latest.items():
-            if step["state"] != "ready": continue
-            definition = defs[sid]; primitive = definition["primitive"]
-            if primitive in {"agent_task", "review_gate"}:
-                profile = profiles.get(definition["params"]["execution_profile"])
-                if not profile: _transition(db, instance, step, "failed", "profile", reason="missing execution profile"); continue
-                fuse = _admit(db, instance, recipe, step, profile)
-                if fuse: _transition(db, instance, step, "blocked", "fuse", reason=fuse); db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id)); continue
-            parents = [latest[n]["kanban_task_id"] for n in definition["needs"] if latest[n]["kanban_task_id"]]
-            task = activate(conn, instance, recipe, definition, step, params, parents)
-            state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
-            _transition(db, instance, step, state, "activate", task=task)
-        db.commit()
-    with store._connect() as db:
-        instance = _instance(db, instance_id); latest = _latest(db, instance_id); defs = {x["id"]: x for x in recipe_for_instance(instance).document["steps"]}
-        for step in latest:
-            if step["state"] not in {"running", "waiting"} or not step["kanban_task_id"]: continue
-            task = kanban_db.get_task(conn, step["kanban_task_id"])
-            if task and task.status == "done":
-                if step["primitive"] == "review_gate":
-                    try:
-                        verdict = parse_verdict(task.result or "")
-                        if verdict["outcome"] == "request_changes":
-                            _invalidate_cone(db, instance, recipe_for_instance(instance).document, verdict["target_step"], step["step_id"], f"kanban:{task.id}")
-                            _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="changes_requested")
+        initial = _instance(db, instance_id)
+        if not initial: raise ValueError("unknown recipe instance")
+        max_passes = max(4, 4 * len(recipe_for_instance(initial).document["steps"]))
+    # Reach a local fixpoint so one restart pass can observe a completion and
+    # activate its dependent. Kanban mutations remain idempotent by task key.
+    status = "running"
+    for _ in range(max_passes):
+        changed = False
+        with store._connect() as db:
+            instance = _instance(db, instance_id)
+            if not instance: raise ValueError("unknown recipe instance")
+            if instance["status"] in {"cancelling", "cancelled"}:
+                return {"instance_id": instance_id, "status": instance["status"]}
+            recipe = recipe_for_instance(instance).document
+            params = json.loads(instance["parameters_json"])
+            defs = {x["id"]: x for x in recipe["steps"]}
+
+            # Observe external task state before dependency readiness.
+            for step in _latest(db, instance_id):
+                if step["state"] not in {"running", "waiting"} or not step["kanban_task_id"]:
+                    continue
+                task = kanban_db.get_task(conn, step["kanban_task_id"])
+                if task and task.status == "done":
+                    if step["primitive"] == "review_gate":
+                        try:
+                            verdict = parse_verdict(task.result or "")
+                            if verdict["outcome"] == "request_changes":
+                                _invalidate_cone(db, instance, recipe, verdict["target_step"], step["step_id"], f"kanban:{task.id}")
+                                changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="changes_requested")
+                                continue
+                        except ValueError as exc:
+                            changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason=str(exc))
                             continue
-                    except ValueError as exc:
-                        _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason=str(exc)); continue
-                _transition(db, instance, step, "done", f"kanban:{task.id}")
-            elif task and task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}: _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="worker_blocked")
-        instance = _instance(db, instance_id); status = _summary(db, instance); db.execute("UPDATE recipe_instances SET status=?,updated_at=? WHERE id=?", (status, store._now(), instance_id));
-        if status == "done":
-            kanban_db.complete_task(conn, instance["collector_task_id"], summary="recipe complete")
-        db.commit()
+                    changed |= _transition(db, instance, step, "done", f"kanban:{task.id}")
+                elif task and task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}:
+                    changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="worker_blocked")
+
+            latest = {x["step_id"]: x for x in _latest(db, instance_id)}
+            for step_id, step in list(latest.items()):
+                if step["state"] != "pending": continue
+                if all(latest[parent]["state"] in {"done", "skipped"} for parent in defs[step_id]["needs"]):
+                    if step["primitive"] in {"review_gate", "approval_gate"}:
+                        vector = revision_vector(db, instance_id, step, recipe)
+                        db.execute(
+                            "UPDATE recipe_steps SET input_revision_hash=? WHERE instance_id=? AND step_id=? AND activation=?",
+                            (vector, instance_id, step_id, step["activation"]),
+                        )
+                        step["input_revision_hash"] = vector
+                    changed |= _transition(db, instance, step, "ready", "reconcile")
+
+            latest = {x["step_id"]: x for x in _latest(db, instance_id)}
+            for sid, step in latest.items():
+                if step["state"] != "ready": continue
+                definition = defs[sid]; primitive = definition["primitive"]
+                instance = _instance(db, instance_id)
+                if primitive in {"agent_task", "review_gate"}:
+                    profile = profiles.get(definition["params"]["execution_profile"])
+                    if not profile:
+                        changed |= _transition(db, instance, step, "failed", "profile", reason="missing execution profile")
+                        continue
+                    fuse = _admit(db, instance, recipe, step, profile)
+                    if fuse:
+                        changed |= _transition(db, instance, step, "blocked", "fuse", reason=fuse)
+                        db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
+                        continue
+                parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
+                task = activate(conn, instance, recipe, definition, step, params, parents)
+                state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
+                changed |= _transition(db, instance, step, state, "activate", task=task)
+
+            instance = _instance(db, instance_id)
+            status = _summary(db, instance)
+            db.execute("UPDATE recipe_instances SET status=?,updated_at=? WHERE id=?", (status, store._now(), instance_id))
+            if status == "done":
+                kanban_db.complete_task(conn, instance["collector_task_id"], summary="recipe complete")
+            db.commit()
+        if not changed:
+            break
+    else:
+        raise RuntimeError("recipe reconciliation did not reach a fixpoint")
     return {"instance_id": instance_id, "status": status}
 
 def deliver_outbox(*, now: str | None = None) -> int:
