@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,9 @@ from .instantiate import recipe_for_instance, revision_vector
 from .primitives import activate, parse_verdict
 
 TERMINAL = {"done", "skipped", "cancelled", "failed"}
+
+_FINDING_COUNT = re.compile(r"(?im)^\s*(?:finding_count|findings)\s*[:=]\s*(\d+)\s*$")
+_FINDING_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:BLOCKER|WARNING)\b")
 
 def advance_key(instance_id: str, recipe_hash: str, step_id: str, activation: int, transition: str, source_id: str) -> str:
     return hashlib.sha256("|".join(map(str, (instance_id, recipe_hash, step_id, activation, transition, source_id))).encode()).hexdigest()
@@ -94,6 +98,35 @@ def _summary(db: Any, instance: dict[str, Any]) -> str:
     if all(x in {"done", "skipped"} for x in states): return "done"
     return "running"
 
+def _verdict_finding_count(body: str) -> int:
+    """Extract a deterministic finding total, or -1 when the body has none."""
+    text = str(body or "").strip()
+    try:
+        structured = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        structured = None
+    if isinstance(structured, dict):
+        explicit = structured.get("finding_count")
+        if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+            return explicit
+        findings = structured.get("findings")
+        if isinstance(findings, list):
+            return len(findings)
+    match = _FINDING_COUNT.search(text)
+    if match:
+        return int(match.group(1))
+    fallback = len(_FINDING_LINE.findall(text))
+    return fallback if fallback else -1
+
+def _review_stalled(db: Any, instance_id: str, step: dict[str, Any], count: int) -> bool:
+    previous = db.execute(
+        "SELECT finding_count FROM recipe_steps WHERE instance_id=? AND step_id=? "
+        "AND activation<? ORDER BY activation DESC LIMIT 1",
+        (instance_id, step["step_id"], step["activation"]),
+    ).fetchone()
+    return bool(previous and previous["finding_count"] is not None and count >= 0
+                and int(previous["finding_count"]) >= 0 and count >= int(previous["finding_count"]))
+
 def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
@@ -156,6 +189,22 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         try:
                             verdict = parse_verdict(task.result or "")
                             if verdict["outcome"] == "request_changes":
+                                finding_count = _verdict_finding_count(verdict["body"])
+                                db.execute(
+                                    "UPDATE recipe_steps SET finding_count=?,updated_at=? "
+                                    "WHERE instance_id=? AND step_id=? AND activation=?",
+                                    (finding_count, store._now(), instance_id, step["step_id"], step["activation"]),
+                                )
+                                if _review_stalled(db, instance_id, step, finding_count):
+                                    changed |= _transition(
+                                        db, instance, step, "blocked", f"kanban:{task.id}",
+                                        reason="review_stall",
+                                    )
+                                    db.execute(
+                                        "UPDATE recipe_instances SET status='blocked',blocked_reason='review_stall',updated_at=? WHERE id=?",
+                                        (store._now(), instance_id),
+                                    )
+                                    continue
                                 _invalidate_cone(db, instance, recipe, verdict["target_step"], step["step_id"], f"kanban:{task.id}")
                                 changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="changes_requested")
                                 continue
@@ -267,6 +316,16 @@ def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "
         {"step_id": step_id, "decision": decision, "reason": reason},
     )
 
+def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
+    """Queue an audited operator release for a parked review-stall gate."""
+    if not str(reason).strip():
+        raise ValueError("operator release requires a reason")
+    return enqueue(
+        instance_id,
+        "operator_release",
+        {"step_id": step_id, "reason": str(reason).strip()},
+    )
+
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None) -> int:
     """Claim queued events, apply only matching waits, then reconcile all instances."""
     from hermes_cli import kanban_db
@@ -292,6 +351,30 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                         reason = str(payload.get("reason") or "operator_rejected")
                         _transition(db, instance, dict(step), "blocked", "operator_rejected", reason=reason)
                         db.execute("UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?", (reason, store._now(), instance["id"]))
+            elif row["source"] == "operator_release":
+                step = db.execute(
+                    "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
+                    (instance["id"], payload.get("step_id")),
+                ).fetchone()
+                if (step and step["primitive"] == "review_gate" and step["state"] == "blocked"
+                        and step["blocked_reason"] == "review_stall"):
+                    task = kanban_db.get_task(conn, step["kanban_task_id"])
+                    verdict = parse_verdict(task.result if task else "")
+                    if verdict["outcome"] != "request_changes":
+                        raise ValueError("review stall has no rejecting verdict")
+                    recipe = recipe_for_instance(instance).document
+                    _invalidate_cone(
+                        db, instance, recipe, verdict["target_step"], step["step_id"],
+                        f"operator_release:{row['key']}",
+                    )
+                    _transition(
+                        db, instance, dict(step), "blocked", f"operator_release:{row['key']}",
+                        reason="changes_requested",
+                    )
+                    db.execute(
+                        "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
+                        (store._now(), instance["id"]),
+                    )
             db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); count += 1
         ids = [r[0] for r in db.execute("SELECT id FROM recipe_instances WHERE status NOT IN ('done','failed','cancelled')").fetchall()]; db.commit()
     for ident in ids: reconcile(conn, ident, profiles=profiles)

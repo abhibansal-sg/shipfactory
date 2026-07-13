@@ -202,6 +202,8 @@ def _recipe(args: argparse.Namespace) -> Any:
         if command == "cancel": return _emit(advancer.cancel(conn, args.instance, dry_run=args.dry_run))
         if command in {"approve", "reject"}:
             return _emit(_recipe_gate(conn, args.instance, args.step, command, getattr(args, "reason", "")))
+        if command == "release":
+            return _emit(_recipe_release(conn, args.instance, args.step, args.reason))
         if command == "reroute": return _emit(_reroute(conn, args))
     finally:
         conn.close()
@@ -219,6 +221,23 @@ def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reaso
     with store._connect() as db:
         updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
     return {"instance_id": instance_id, "status": updated["status"] if updated else "unknown"}
+
+
+def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> dict[str, Any]:
+    from factory import store
+    from factory.recipes import advancer
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
+            (instance_id, step_id),
+        ).fetchone()
+        if not step or step["primitive"] != "review_gate" or step["state"] != "blocked" or step["blocked_reason"] != "review_stall":
+            raise ValueError("review step is not parked for review_stall")
+    key = advancer.release_review_stall(instance_id, step_id, reason)
+    advancer.apply_events(conn)
+    with store._connect() as db:
+        updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
+    return {"instance_id": instance_id, "status": updated["status"] if updated else "unknown", "key": key}
 
 
 def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
@@ -279,6 +298,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     subs.add_parser("waiting"); subs.add_parser("list")
     for name in ("approve", "reject"):
         q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--board")
+    q = subs.add_parser("release"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", required=True); q.add_argument("--board")
     q = subs.add_parser("event"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("payload"); q.add_argument("--board")
     q = subs.add_parser("cancel"); q.add_argument("instance"); q.add_argument("--dry-run", action="store_true"); q.add_argument("--board")
     q = subs.add_parser("reroute"); q.add_argument("instance"); q.add_argument("recipe"); q.add_argument("--parameters", default="{}"); q.add_argument("--library", required=True); q.add_argument("--board")

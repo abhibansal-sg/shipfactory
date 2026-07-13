@@ -72,7 +72,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS recipe_steps (
           instance_id TEXT NOT NULL, step_id TEXT NOT NULL, activation INTEGER NOT NULL,
           primitive TEXT NOT NULL, state TEXT NOT NULL, kanban_task_id TEXT UNIQUE,
-          input_revision_hash TEXT, output_revision INTEGER, blocked_reason TEXT,
+          input_revision_hash TEXT, output_revision INTEGER, finding_count INTEGER, blocked_reason TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           PRIMARY KEY(instance_id, step_id, activation),
           FOREIGN KEY(instance_id) REFERENCES recipe_instances(id));
@@ -99,6 +99,11 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE monitors ADD COLUMN interval_seconds INTEGER NOT NULL DEFAULT 300"
             )
+        recipe_step_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(recipe_steps)")
+        }
+        if "finding_count" not in recipe_step_columns:
+            conn.execute("ALTER TABLE recipe_steps ADD COLUMN finding_count INTEGER")
 
 
 def record_run_start(task_id, seat, executor, model, pid) -> int:
