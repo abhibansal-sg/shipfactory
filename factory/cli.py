@@ -209,17 +209,16 @@ def _recipe(args: argparse.Namespace) -> Any:
 
 def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reason: str) -> dict[str, Any]:
     from factory import store
-    from hermes_cli import kanban_db
+    from factory.recipes import advancer
     with store._connect() as db:
         instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
         step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance_id, step_id)).fetchone()
         if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting": raise ValueError("approval gate is not waiting")
-        if decision == "reject":
-            db.execute("UPDATE recipe_steps SET state='blocked',blocked_reason=?,updated_at=? WHERE instance_id=? AND step_id=? AND activation=?", (reason or "operator_rejected", store._now(), instance_id, step_id, step["activation"]))
-            db.execute("UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?", (reason or "operator_rejected", store._now(), instance_id)); return {"instance_id": instance_id, "status": "blocked"}
-        kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved")
-    from factory.recipes.advancer import reconcile
-    return reconcile(conn, instance_id)
+    advancer.gate_decision(instance_id, step_id, decision, reason)
+    advancer.apply_events(conn)
+    with store._connect() as db:
+        updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
+    return {"instance_id": instance_id, "status": updated["status"] if updated else "unknown"}
 
 
 def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:

@@ -257,8 +257,19 @@ def event(instance_id: str, step_id: str, payload: dict[str, Any]) -> str:
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not isinstance(payload.get("type"), str): raise ValueError("event payload requires string id and type")
     return enqueue(instance_id, "external_event", {"step_id": step_id, "payload": payload}, key=hashlib.sha256(f"{instance_id}|{step_id}|{payload['id']}".encode()).hexdigest())
 
+def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "") -> str:
+    """Queue a human gate decision for the recipe engine's single writer."""
+    if decision not in {"approve", "reject"}:
+        raise ValueError("gate decision must be approve or reject")
+    return enqueue(
+        instance_id,
+        "gate_decision",
+        {"step_id": step_id, "decision": decision, "reason": reason},
+    )
+
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None) -> int:
     """Claim queued events, apply only matching waits, then reconcile all instances."""
+    from hermes_cli import kanban_db
     count = 0
     with store._connect() as db:
         events = [dict(r) for r in db.execute("SELECT * FROM advance_events WHERE state='pending' ORDER BY created_at LIMIT 100").fetchall()]
@@ -270,6 +281,17 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                 defs = {x["id"]: x for x in recipe_for_instance(instance).document["steps"]}
                 if step and step["state"] == "waiting" and defs[payload["step_id"]]["primitive"] == "wait_for_event" and defs[payload["step_id"]]["params"]["event"] == payload["payload"]["type"]:
                     _transition(db, instance, dict(step), "done", payload["payload"]["id"])
+            elif row["source"] == "gate_decision":
+                step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], payload.get("step_id"))).fetchone()
+                if step and step["primitive"] == "approval_gate" and step["state"] == "waiting":
+                    if payload.get("decision") == "approve":
+                        # The blocked kanban task is the canonical approval
+                        # signal; reconciliation observes its completion.
+                        kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved")
+                    elif payload.get("decision") == "reject":
+                        reason = str(payload.get("reason") or "operator_rejected")
+                        _transition(db, instance, dict(step), "blocked", "operator_rejected", reason=reason)
+                        db.execute("UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?", (reason, store._now(), instance["id"]))
             db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); count += 1
         ids = [r[0] for r in db.execute("SELECT id FROM recipe_instances WHERE status NOT IN ('done','failed','cancelled')").fetchall()]; db.commit()
     for ident in ids: reconcile(conn, ident, profiles=profiles)
