@@ -466,7 +466,7 @@ steps:
       instructions: |
         Review correctness, regressions, and evidence.
       execution_profile: standard
-      workspace: readonly
+      workspace: worktree
 ```
 
 Top-level keys SHALL be exactly `schema`, `id`, `version`, `status`, `description`, `intent_tags`, `supersedes`, `parameters`, `budgets`, and `steps`. Unknown keys SHALL fail validation.
@@ -687,3 +687,42 @@ Recipe code MUST NOT merge before both fixes are independently committed and tes
 2. Double-governance fix:
 
    Legacy `policy.on_complete` SHALL return without mutation when no explicit task policy exists. It SHALL never manufacture `_default_policy`. Recipe-bound tasks SHALL bypass legacy policy flow. After recipe cutover, `_default_policy`, `_reopen`, and legacy flow authority SHALL be removed; citation, hierarchy, participant, and decision validation SHALL remain reusable gate-library code.
+
+#### 17.14 Fresh-pass amendments (terra round-3, 2026-07-13 — operator-adjudicated)
+
+Round-3 fresh-eyes (different model, zero prior involvement) found 2 BLOCKER
++ 4 MAJOR items both prior rounds missed; budget-fuse arithmetic and Aheli
+expressibility were verified GO with worked examples. Amendments:
+
+1. ROOT-COLLECTOR COMPLETION (was BLOCKER): the triage parent collector is
+   completed EXPLICITLY by the advancer when all sibling instance collectors
+   are done — same mechanism as instance collectors, selection-scoped
+   idempotency key (sha256(selection_id|transition|source)). A selection row
+   already persists (17.5); it gains root_collector_task_id. No unassigned
+   task is ever left to rot in ready.
+2. CANCELLATION ATOMICITY (was BLOCKER): plugin-side ordering PLUS one
+   additive kanban API. (a) Archive strictly LEAF-FIRST (reverse topological)
+   so no archive ever satisfies a live dependent. (b) NAMED EXCEPTION to the
+   zero-core rule (operator-ratified): TWO additive kanban APIs land as
+   normal fork commits with tests, usable beyond factory and upstream-
+   candidates: `create_blocked_task(..., block_kind, reason)` (atomic
+   insert-as-sticky-blocked; kills the create-ready-then-block dispatch
+   race) and `cancel_subtree(task_ids, keep_blocked=[collector])` (verify
+   worker exit, archive without per-task recompute, single recompute at
+   end). Factory startup MUST verify both APIs exist (capability probe) and
+   refuse recipes on older kanban.
+3. running -> cancelled IS a legal step transition, permitted only after
+   confirmed process-group exit (17.6 amended).
+4. NOTIFY STATE: a pending/retrying notify step summarizes as instance
+   `running` — no new instance state. Outbox backoff is invisible to the
+   state machine.
+5. HUMAN-GATE CREATION uses create_blocked_task (amendment 2b) — the
+   blocked(kind=needs_input) SHALLs in 17.4/17.9 bind to it.
+6. WORKSPACE readonly DELETED from v1 schema (was unenforceable:
+   VALID_WORKSPACE_KINDS has no readonly; codex executor hardcodes
+   workspace-write). v1 rule: parallel steps REQUIRE separate worktrees;
+   `shared` workspace steps MUST be totally ordered via needs. The 17.3
+   example's `workspace: worktree` is corrected to `worktree`. Read-only
+   execution returns in v2 as an executor access-mode contract.
+7. BUILD-1 SCOPE grows by: the two kanban APIs (2b) + their tests +
+   capability probe; root-collector completion; leaf-first cancel ordering.
