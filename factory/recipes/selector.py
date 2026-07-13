@@ -503,21 +503,38 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 # Recipe selector service ---------------------------------------------------
 # The donor's public LLM transport is intentionally retained above.  Recipe
 # routing has a distinct, stricter contract and does not use its repair paths.
+from .loader import RecipeError
+
+
+class SelectionNeedsClarification(RecipeError):
+    """Validated nodes that must be parked before any instantiation."""
+
+    def __init__(self, nodes: list[dict], markers: list[str]):
+        super().__init__("selector output requires clarification parking")
+        self.nodes = nodes
+        self.markers = markers
+
+
 def validate_selection(selection: object, library, *, seats: set[str], profiles: set[str]) -> list[dict]:
     """Validate selector nodes exactly; invalid references are rejected, never dropped."""
-    from .loader import RecipeError, bind_parameters, validate
+    from .loader import bind_parameters, validate
     if not isinstance(selection, dict) or set(selection) != {"nodes"} or not isinstance(selection["nodes"], list):
         raise RecipeError("selector output must be {'nodes': [...]}")
     nodes = selection["nodes"]
     ids: set[str] = set()
-    clarification_count = 0
+    clarification_markers: list[str] = []
+    def add_marker(marker: str) -> None:
+        if marker.strip() not in clarification_markers:
+            clarification_markers.append(marker.strip())
     for index, node in enumerate(nodes):
         required = {"id", "title", "body", "needs", "ranked_candidates", "chosen", "parameters", "skip_steps", "assumptions", "needs_clarification"}
         if not isinstance(node, dict) or set(node) != required or not isinstance(node["id"], str) or not node["id"] or node["id"] in ids or not isinstance(node["title"], str) or not isinstance(node["body"], str) or not isinstance(node["needs"], list) or not isinstance(node["ranked_candidates"], list) or not isinstance(node["parameters"], dict) or not isinstance(node["skip_steps"], list) or not isinstance(node["assumptions"], list) or not all(isinstance(item, str) and item.strip() for item in node["assumptions"]) or not isinstance(node["needs_clarification"], list) or not all(isinstance(item, str) and item.strip() for item in node["needs_clarification"]):
             raise RecipeError(f"invalid selector node {index}")
-        clarification_count += len(node["needs_clarification"])
-        clarification_count += len(re.findall(r"\[NEEDS CLARIFICATION:\s*[^\]]+\]", node["body"], re.IGNORECASE))
-        if clarification_count > 3:
+        for marker in node["needs_clarification"]:
+            add_marker(marker)
+        for marker in re.findall(r"\[NEEDS CLARIFICATION:\s*[^\]]+\]", node["body"], re.IGNORECASE):
+            add_marker(marker)
+        if len(clarification_markers) > 3:
             raise RecipeError("selector output exceeds 3 clarification markers")
         ids.add(node["id"])
         for candidate in node["ranked_candidates"]:
@@ -541,28 +558,18 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
             for parent in by_id[node_id]["needs"]: walk(parent)
             active.remove(node_id); seen.add(node_id)
     for node_id in by_id: walk(node_id)
+    if clarification_markers:
+        raise SelectionNeedsClarification(nodes, clarification_markers)
     return nodes
-
-
-def _selection_clarifications(nodes: list[dict]) -> list[str]:
-    markers: list[str] = []
-    for node in nodes:
-        markers.extend(item.strip() for item in node["needs_clarification"])
-        markers.extend(
-            match.group(0) for match in re.finditer(
-                r"\[NEEDS CLARIFICATION:\s*[^\]]+\]", node["body"], re.IGNORECASE,
-            )
-        )
-    return markers
 
 
 def validate_or_park_selection(conn, source_task_id: str, selection: object, library,
                                *, seats: set[str], profiles: set[str]) -> list[dict]:
     """Validate output and park unresolved questions before instantiation."""
-    nodes = validate_selection(selection, library, seats=seats, profiles=profiles)
-    markers = _selection_clarifications(nodes)
-    if not markers:
-        return nodes
+    try:
+        return validate_selection(selection, library, seats=seats, profiles=profiles)
+    except SelectionNeedsClarification as pending:
+        markers = pending.markers
     task = kb.get_task(conn, source_task_id)
     if task is None:
         raise ValueError("unknown selector source task")
