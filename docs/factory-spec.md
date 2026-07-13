@@ -368,54 +368,322 @@ diff, comment with #16-V2 tag).
 Gate: BOTH lanes' suites + the original 37 ALL green together via
 ~/Developer/products/hermes-mobile/.venv/bin/python -m pytest tests/ -q.
 
-## 17. STAGE INSTRUCTIONS (ratified direction 2026-07-13, pre-validation)
+## 17. RECIPE EXECUTION (v2 — CONVERGED LAW, 2026-07-13)
 
-Policy stages gain an optional `instructions` field (3-6 lines, a named
-bar not a playbook). Instructions live on the stage in a NAMED POLICY
-TEMPLATE (git-versioned), never per-task blobs. Empty = model judgment +
-seat skill carry the stage. Injected into the reopen-comment / worker
-context when the stage activates. Rationale: unguided smart-model review
-is the proven failure mode (Nous sweeper adoption; luna F1 'accepted
-risk'); the instruction names which bar applies, the seat skill holds
-procedure.
+Two-round adversarial validation (round 1: NO-GO, ~40 findings, 2 live bugs
+confirmed at source; round 2: 10 operator positions argued, 5 material
+corrections adopted). Operator adjudication of round-2 pushbacks: POS-1
+CONCEDED to validator (auto_decompose defaults True at
+kanban_watchers.py:50 — exclusive ownership + fail-closed startup required);
+POS-3 CONCEDED (recorded-usage ceilings unbounded without cap wiring;
+admission-debit model adopted; validator honestly could not prove the PC
+burn attribution and it stays OUT of the spec); POS-4 CONCEDED (cancelling
++ blocked states); POS-7 CONCEDED (completion collectors — entry-root
+linking releases parents at start not finish); POS-9 CONCEDED (grow build-1
+with the proven prerequisites). POS-2/5/6/8/10 converged as argued.
 
-## 18. RECIPE SYSTEM (ratified direction 2026-07-13, pre-validation)
+### §17-v2 Recipe execution
 
-A recipe = pure data (YAML in git, versioned; running instances pin their
-version): ordered/parallel steps, each {id, executor, model, instructions,
-gate: review|approval|mechanical, needs[], concurrency, optional: skip
-conditions}. UNIFIES policy stages and org flow: both become steps.
-Runtime = the existing kanban dispatcher — each step instantiates as a
-kanban task (parent/child links = graph, blockedByIssueIds = ordering,
-claims/TTL/circuit-breaker/notify inherited). Recipe engine = template
-instantiator + step-advancer hook ONLY. HARD LINE: no custom scheduler,
-no DAG engine, no retry semantics beyond kanban's. Domain-general:
-proof = dev-pipeline recipe + one Aheli workflow recipe. Kanban's own
-workflow_template_id / current_step_key / step_key columns (documented
-'v2 workflow routing', currently unused) are the designed-for seams.
+#### 17.1 Authority and deployment
 
-## 19. TRIAGE RECIPE-ROUTING + DRAFT VALVE (ratified direction 2026-07-13)
+Kanban SHALL remain the only task scheduler, claimer, dependency gate, TTL owner, and retry engine. Factory SHALL load recipes, instantiate task graphs, advance control steps, reconcile missed events, enforce recipe budgets, and record decisions. Recipe code MUST NOT implement a scheduler or retry loop.
 
-Triage (kanban_decompose pattern: aux-LLM proposes, deterministic code
-validates/instantiates) gains recipe SELECTION: per child node, choose
-from the recipe LIBRARY + parameterize (skip optional steps, seat/model
-overrides). Parent may carry a ship-bearing recipe while a sub-parent
-carries build-verify-only — recipes attach per node, compose via existing
-parent-gating. CREATION is fenced: when nothing in the library fits,
-triage COMPOSES A DRAFT from existing tested step primitives only, files
-it as draft attached to a needs_recipe blocked task; a draft NEVER runs
-without one approval (operator now; strong-lane architect later once
-earned). Approved drafts enter the library versioned. Doctrine: models
-choose and judge; tested code executes.
+Recipes SHALL be the sole flow authority on recipe-enabled boards. Legacy policy templates and the legacy reopen state machine SHALL NOT run there.
 
-## 20. SHAKEDOWN BACKLOG (gaps ratified for fix, 2026-07-13)
+A recipe-enabled deployment MUST set `kanban.auto_decompose: false`. Factory startup MUST refuse recipe triage routing while Hermes auto-decompose is enabled. Factory SHALL lease triage work before invoking any selector.
 
-1. F2 run durability: persist _RUNNING pid map in store, rescan on daemon
-   start (MUST precede first real load).
-2. Budgets/quota-windows ported from PC onto runs data (ceilings, not
-   just recording).
-3. Labels sidecar (task_labels) — Nous-aligned P0-P4 on factory tasks.
-4. Approval-stage chat notification: ping operator when an approval stage
-   becomes READY (not only at terminal states).
-5. Origin fingerprints — lands WITH recipes (dup-suppression for
-   recipe-churned tasks), not after.
+`workflow_template_id` and `current_step_key` MAY be compatibility annotations but SHALL NOT be authoritative. All recipe state SHALL live in `factory.db`.
+
+#### 17.2 Board configuration
+
+`seats.yaml` SHALL contain:
+
+```yaml
+recipes:
+  enabled: true
+  library_path: /absolute/path/to/recipes
+  bare_task_recipe: bare-task-default@1
+  notify_target: telegram:home
+  board_day_token_ceiling: 500000
+  dispatcher_max_in_progress: 4
+  execution_profiles:
+    standard:
+      max_runtime_seconds: 1800
+      max_retries: 2
+      token_allowance: 50000
+```
+
+Every referenced execution profile and seat MUST exist at startup. Factory SHALL pass `dispatcher_max_in_progress` to `dispatch_once`. Recipe YAML SHALL NOT declare concurrency, executor, model, or arbitrary retry values. Seats own executor and model; execution profiles own runtime, retry, and admission bounds.
+
+#### 17.3 Recipe YAML schema
+
+Published recipes SHALL use this exact shape:
+
+```yaml
+schema: factory.recipe/v1
+id: dev-pipeline
+version: 1
+status: active
+description: Build, verify, review, approve, and land a change.
+intent_tags: [software-change]
+supersedes: null
+
+parameters:
+  request:
+    type: string
+    required: true
+  approval_due_at:
+    type: datetime
+    required: false
+    default: null
+
+budgets:
+  max_activations: 12
+  max_step_activations: 3
+  max_tokens: 300000
+
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build the change
+    needs: []
+    optional: false
+    params:
+      seat: dev-backend
+      instructions: |
+        Implement the requested change.
+        Return tested, reviewable work.
+      execution_profile: standard
+      workspace: worktree
+
+  - id: review
+    primitive: review_gate
+    title: Review the change
+    needs: [build]
+    optional: false
+    params:
+      seat: verifier
+      instructions: |
+        Review correctness, regressions, and evidence.
+      execution_profile: standard
+      workspace: readonly
+```
+
+Top-level keys SHALL be exactly `schema`, `id`, `version`, `status`, `description`, `intent_tags`, `supersedes`, `parameters`, `budgets`, and `steps`. Unknown keys SHALL fail validation.
+
+`id` and step IDs MUST match `[a-z][a-z0-9-]{0,63}`. `version` MUST be a positive integer. `status` MUST be `active` or `deprecated`. `supersedes` MUST be null or `id@version`.
+
+Parameter types SHALL be `string`, `integer`, `boolean`, `enum`, or `datetime`. An enum MUST declare `values`. Missing required parameters, unknown parameters, and type mismatches SHALL fail closed.
+
+String fields MAY contain `${parameter_name}` substitutions. Missing substitutions SHALL fail validation. Non-string parameters MAY appear only as a complete scalar substitution.
+
+Every step SHALL contain exactly `id`, `primitive`, `title`, `needs`, `optional`, and `params`. `needs` is the only ordering syntax. Empty `needs` permits parallel execution.
+
+`skip_steps` is an instantiation argument, not an expression language. Only steps with `optional: true` MAY be skipped. `review_gate` and `approval_gate` MUST NOT be optional. Skipped nodes SHALL be dependency-spliced to their effective upstream requirements.
+
+Parallel write-capable `agent_task` steps MUST use separate `worktree` workspaces. Unordered shared-workspace steps MUST all be `readonly`. Validation SHALL reject every other parallel shared-workspace graph.
+
+A published `id@version` SHALL be immutable. Factory SHALL normalize the document, compute SHA-256, and persist the normalized document in `recipe_versions`. Loading different content for an existing `id@version` SHALL fail. Instances SHALL pin `id`, `version`, and hash.
+
+Nested runtime recipes SHALL NOT exist in v1. Every instantiated recipe graph SHALL contain primitive steps only.
+
+#### 17.4 Primitive registry
+
+Exactly five primitives SHALL ship:
+
+1. `agent_task`
+
+   Required params: `seat`, `instructions`, `execution_profile`, `workspace`. `workspace` is `worktree`, `shared`, or `readonly`. Activation creates an assigned kanban task with compiled runtime and retry limits. Successful completion marks the activation done and creates a new output revision. A worker block marks the activation and instance blocked.
+
+2. `review_gate`
+
+   Required params are the same as `agent_task`. The worker’s last line MUST be:
+
+   `FACTORY_VERDICT: {"outcome":"approve","body":"..."}`
+
+   or:
+
+   `FACTORY_VERDICT: {"outcome":"request_changes","target_step":"step-id","body":"..."}`
+
+   The body MUST pass citation validation. A change request MUST name one transitive upstream `agent_task`. The advancer SHALL invalidate the dependency cone from that target through the rejecting gate, insert new activations for affected steps, and bind all later decisions to the new upstream revision vector.
+
+3. `approval_gate`
+
+   Required params: `approvers`, `instructions`. Activation creates an unassigned kanban task parked as `blocked(kind=needs_input)`, clears all claim/PID state, and writes a notification outbox row. `recipe approve` completes it. `recipe reject` blocks the instance for operator disposition; it SHALL NOT choose a producer or rerun work automatically.
+
+4. `notify`
+
+   Required params: `target`, `message`. Activation writes one uniquely keyed outbox row. The daemon SHALL deliver it with `hermes send --to <target> <message>`. Success completes the step. Failure reschedules the outbox with bounded backoff and no LLM call.
+
+5. `wait_for_event`
+
+   Required param: `event`. Optional param: `due_at`. Activation creates an unassigned task parked as `blocked(kind=needs_input)` with no claim/PID. A matching idempotent event completes it. If `event: timer`, `due_at` is required and the daemon emits the successful timer event. For every other event, expiry at `due_at` blocks the instance with `event_timeout`.
+
+No primitive MAY poll with a model.
+
+#### 17.5 Persistence
+
+Factory SHALL persist:
+
+- `recipe_versions(id, version, hash, status, normalized_yaml)`.
+- `recipe_instances(id, board, collector_task_id, recipe_id, recipe_version, recipe_hash, status, parameters_json, activation_count, tokens_charged, blocked_reason, created_at, updated_at)`.
+- `recipe_steps(instance_id, step_id, activation, primitive, state, kanban_task_id, input_revision_hash, output_revision, blocked_reason, created_at, updated_at)`.
+- `advance_events(key, source, payload_json, state, created_at, applied_at)`.
+- `budget_charges(key, board, utc_day, instance_id, step_id, activation, tokens)`.
+- `outbox(key, target, message, state, attempts, next_attempt_at, delivered_at)`.
+- Triage selection rows containing the source task, ranked candidates, reasons, chosen version, parameters, skips, and reroute outcome.
+
+`recipe_steps` MUST be unique on `(instance_id, step_id, activation)` and on non-null `kanban_task_id`.
+
+#### 17.6 State machines
+
+Instance states SHALL be:
+
+`running | waiting_gate | waiting_event | blocked | cancelling | cancelled | done | failed`
+
+Step-activation states SHALL be:
+
+`pending | ready | running | waiting | blocked | done | skipped | cancelled | failed`
+
+Only the advancer MAY write recipe states. Kanban MAY independently change task state; the advancer SHALL observe and reconcile it.
+
+Allowed step transitions are:
+
+- `pending -> ready` when effective dependencies are done or skipped.
+- `ready -> running` for `agent_task` and `review_gate`.
+- `ready -> waiting` for `approval_gate`, `notify`, and `wait_for_event`.
+- `running -> done | blocked`.
+- `waiting -> done | blocked`.
+- `pending | ready | waiting | blocked -> cancelled`.
+- Any nonterminal state MAY become `failed` only for an invariant or unrecoverable execution error.
+- Reactivation SHALL insert a new activation row; prior done rows SHALL remain immutable.
+
+Instance status is a summary over its latest step activations. `cancelling`, `cancelled`, `failed`, and `done` take precedence; then `blocked`; then active runnable work; then `waiting_gate`; then `waiting_event`.
+
+`blocked` is recoverable by a typed event or audited operator command. `failed` is terminal. Recovery from failed work requires a new or rerouted instance.
+
+#### 17.7 Advancer contract
+
+Hooks, CLI commands, webhooks, timers, and reconciliation SHALL enqueue events. They SHALL NOT perform flow mutations directly.
+
+Every transition SHALL use:
+
+`sha256(instance_id | recipe_hash | step_id | activation | transition | source_id)`
+
+as its unique advance key. `source_id` MUST be a kanban event/run ID, decision ID, external event ID, due timestamp, or operator command UUID.
+
+Every task activation SHALL use kanban idempotency key:
+
+`recipe/<instance_id>/<recipe_hash>/<step_id>/<activation>`
+
+The advancer SHALL claim one unapplied event, verify the instance is not cancelling or cancelled, compare the expected activation/state, persist the intended action, execute the idempotent kanban/outbox mutation, and mark the event applied. Duplicate or stale events SHALL be no-ops.
+
+Only one leased advancer action MAY execute at a time for an instance. CLI and webhook processes SHALL enqueue; the Factory daemon SHALL execute.
+
+Completion hooks are latency hints only. Every daemon tick SHALL reconcile nonterminal recipe steps against kanban tasks, runs, decisions, outbox rows, and due waits. A swallowed hook or daemon restart MUST therefore reproduce the same advance key and finish the missing transition without duplicate tasks.
+
+Each instance SHALL have an inert, unassigned completion collector. Terminal recipe steps SHALL be kanban parents of that collector. The advancer SHALL complete the collector deterministically when the instance reaches done. Collectors MUST never be assigned to a model seat.
+
+#### 17.8 Budget fuse v1
+
+An activation is the launch of `agent_task` or `review_gate`. Kanban retries within one activation and SHALL retain its existing retry semantics.
+
+Before creating an activation task, one Factory transaction SHALL:
+
+- Refuse if instance activation count would exceed `max_activations`.
+- Refuse if that logical step would exceed `max_step_activations`.
+- Read the execution profile’s `token_allowance`.
+- Refuse if instance charged tokens plus allowance would exceed `max_tokens`.
+- Refuse if the UTC board-day charged tokens plus allowance would exceed `board_day_token_ceiling`.
+- Otherwise insert the unique budget charge and increment the counters.
+
+Refusal SHALL set the step and instance to blocked with `activation_fuse`, `instance_budget`, or `board_day_budget`. It SHALL NOT repeatedly probe.
+
+Admission charges are non-refundable in v1. Actual token usage SHALL be recorded separately and SHALL NOT release charges. Unknown actual usage SHALL remain unknown, not zero.
+
+An operator MAY raise a ceiling or reset a blocked fuse only with an audited command containing a reason. Lowering a ceiling below already charged usage SHALL be rejected.
+
+#### 17.9 Events, gates, and notifications
+
+`factory event <instance> <step> <payload-json>` SHALL require payload fields `id` and `type`. `(instance, step, id)` MUST be unique. Authenticated Hermes webhook mappings SHALL invoke the same event service.
+
+Human gates and event waits SHALL always appear in kanban as unassigned `blocked(kind=needs_input)` tasks with no live run, claim, or PID.
+
+Factory SHALL expose `recipe waiting` and `recipe show`. Waiting views SHALL not depend on successful chat delivery.
+
+Gate activation and bounded reminders SHALL use the persistent outbox. Outbox delivery failures SHALL be retried without advancing the gate and without an LLM call.
+
+#### 17.10 Triage selection
+
+The Factory daemon SHALL poll triage tasks only on its configured recipe board and lease each source task before calling the selector.
+
+The selector SHALL receive the active recipe manifest library and validated seat roster. It SHALL return a graph of nodes. Every node SHALL contain a title, body, sibling `needs`, ranked candidates with scores and reasons, one chosen `id@version` or null, parameters, and `skip_steps`.
+
+The validator SHALL reject unknown/deprecated versions, invalid node references, cycles, unknown parameters, required-step skips, missing seats/profiles, unsafe workspace parallelism, and budget/profile violations. It SHALL never delete or sanitize an invalid dependency.
+
+A null or invalid choice SHALL park the source task as `blocked(kind=needs_input)` with `no_recipe_match` and the ranked mismatch reasons. V1 SHALL NOT draft recipes.
+
+Each selected node SHALL instantiate one sibling recipe instance with an inert completion collector. Sibling dependencies SHALL link dependent entry steps below prerequisite completion collectors. The original triage parent SHALL be an unassigned collector linked below all sibling collectors. It SHALL carry no recipe.
+
+`recipe reroute` SHALL replace an unactivated instance in place. After any activation, reroute SHALL cancel the old instance, retain its artifacts and audit history, and instantiate a new version.
+
+#### 17.11 Cancellation
+
+`recipe cancel --dry-run` SHALL list active workers, nonterminal steps, completed external actions that cannot be undone, and all downstream tasks or collectors that will remain suppressed.
+
+Cancellation SHALL first set the instance to `cancelling`. This fence MUST make every advancer event and reconciliation pass refuse new activation.
+
+The cancel reconciler SHALL terminate active process groups and confirm exit. If any worker survives, the instance SHALL remain cancelling and no task dependency SHALL be released.
+
+After workers stop, one kanban transaction SHALL clear assignees and claims and archive all nonterminal internal step tasks. Completed and skipped history SHALL remain unchanged. Recipe step rows SHALL become cancelled and the instance SHALL become cancelled.
+
+The instance completion collector SHALL be parked unassigned in `blocked(kind=needs_input)` with `recipe_cancelled`; it SHALL NOT be archived or completed. Therefore cancellation MUST NOT satisfy an outer kanban dependency. Reroute MAY attach a replacement instance and release that collector only after the replacement finishes.
+
+Cancellation SHALL suppress future actions but SHALL NOT claim to reverse completed payments, messages, bookings, commits, or other external effects.
+
+#### 17.12 Build 1 scope
+
+Build 1 SHALL ship:
+
+- The two prerequisite bug fixes in §17.13 as separate commits.
+- Durable Factory run records and daemon reconstruction before the first dispatch tick.
+- Run accounting for all executors; unknown native usage remains unknown.
+- Dispatcher concurrency-cap wiring.
+- Recipe board configuration and exclusive triage-ownership validation.
+- Immutable recipe loader, validator, and `recipe_versions`.
+- Instance, step-activation, advance-event, budget-charge, outbox, and triage-selection persistence.
+- Flat task-per-step instantiation and inert completion collectors.
+- The idempotent advancer and full daemon reconciliation.
+- All five primitives.
+- Review targeting and revision-vector invalidation.
+- Human-gate parking, waiting queries, notification outbox, events, webhooks, and due-time handling.
+- Activation and token admission fuses.
+- `recipe show`, `waiting`, `approve`, `reject`, `event`, `cancel --dry-run`, `cancel`, and `reroute`.
+- `bare_task_recipe` adoption on recipe-enabled boards.
+- `dev-pipeline@1`.
+- `aheli-po-intake@1` using simulated external events and no real payment or supplier side effects.
+- Restart, duplicate-event, gate-revision, budget, three-day wait, selector-race, reroute, and cancellation regression tests.
+
+Build 1 SHALL NOT ship:
+
+- Recipe drafting or draft approval.
+- Nested recipe includes.
+- Reservation release or actual-cost reconciliation.
+- Arbitrary seat/model overrides.
+- GitHub synchronization of recipe instances.
+- New dashboard pages.
+- Model polling.
+- Fingerprints beyond the prescribed advance and task idempotency keys.
+- Live Aheli purchasing, payment, booking, shipment, or delivery actions.
+
+#### 17.13 Mandatory pre-recipe fixes
+
+Recipe code MUST NOT merge before both fixes are independently committed and tested.
+
+1. Monitor recurrence fix:
+
+   Monitors SHALL add `interval_seconds`. Each recovery attempt SHALL advance exactly one rung. After its action, one transaction SHALL increment the attempt and either set `next_check_at = now + interval_seconds` or delete the row. Reaching `timeout_at`, the top rung, a terminal task, or `max_attempts` SHALL close the monitor. Terminal escalation MUST occur at most once.
+
+2. Double-governance fix:
+
+   Legacy `policy.on_complete` SHALL return without mutation when no explicit task policy exists. It SHALL never manufacture `_default_policy`. Recipe-bound tasks SHALL bypass legacy policy flow. After recipe cutover, `_default_policy`, `_reopen`, and legacy flow authority SHALL be removed; citation, hierarchy, participant, and decision validation SHALL remain reusable gate-library code.
