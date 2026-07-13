@@ -4,6 +4,9 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
+from factory import store
 from factory import watchdog
 
 
@@ -38,8 +41,8 @@ def test_classifier_live_and_pending_verdict_are_not_stopped():
 def test_tick_uses_recovery_ladder_and_kanban_cli(monkeypatch):
     calls = []
     store = types.ModuleType("factory.store")
-    store.due_monitors = lambda now: [{"task_id": "T1", "recovery_policy": "wake_owner", "scheduled_by": "seat", "notes": "ping"}]
-    store.bump_monitor = lambda task_id: calls.append(("bump", task_id))
+    store.due_monitors = lambda now: [{"task_id": "T1", "recovery_policy": "wake_owner", "scheduled_by": "seat", "notes": "ping", "max_attempts": 3}]
+    store.advance_monitor = lambda task_id, now, close=False: calls.append(("advance", task_id, now, close))
     config = types.ModuleType("factory.config")
     config.load_seats = lambda: SimpleNamespace(company="demo")
     hierarchy = types.ModuleType("factory.hierarchy")
@@ -58,4 +61,66 @@ def test_tick_uses_recovery_ladder_and_kanban_cli(monkeypatch):
     result = watchdog.tick("demo", "2026-07-12T00:00:00Z")
     assert result == [{"task_id": "T1", "action": "wake_owner"}]
     assert any("comment" in call for call in calls if isinstance(call, list))
-    assert ("bump", "T1") in calls
+    assert ("advance", "T1", "2026-07-12T00:00:00Z", False) in calls
+
+
+def test_due_monitor_reschedules_after_one_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.add_monitor("T1", "2026-07-12T00:00:00+00:00", None, 3,
+                      "wake_owner", "ping", "seat", 60)
+    monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
+        "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
+    })
+    monkeypatch.setattr(watchdog, "_run_kanban", lambda *args, **kwargs: None)
+
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z") == [
+        {"task_id": "T1", "action": "wake_owner"}
+    ]
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z") == []
+    assert store.due_monitors("2026-07-12T00:00:00Z") == []
+
+
+def test_timeout_closes_monitor_without_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.add_monitor("T1", "2026-07-12T01:00:00+00:00",
+                      "2026-07-12T00:00:00+00:00", 3, "wake_owner", "ping", "seat", 60)
+    monkeypatch.setattr(watchdog, "_task", lambda *args: pytest.fail("timed-out monitor read its task"))
+
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z") == [
+        {"task_id": "T1", "action": "closed", "reason": "timeout"}
+    ]
+    assert store.due_monitors("9999-12-31T00:00:00+00:00") == []
+
+
+def test_max_attempts_closes_monitor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.add_monitor("T1", "2026-07-12T00:00:00+00:00", None, 1,
+                      "wake_owner", "ping", "seat", 60)
+    monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
+        "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
+    })
+    monkeypatch.setattr(watchdog, "_run_kanban", lambda *args, **kwargs: None)
+
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z")[0]["action"] == "wake_owner"
+    assert store.due_monitors("9999-12-31T00:00:00+00:00") == []
+
+
+def test_terminal_escalation_happens_at_most_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.add_monitor("T1", "2026-07-12T00:00:00+00:00", None, 5,
+                      "escalate_to_board", "ping", "seat", 60)
+    monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
+        "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
+    })
+    monkeypatch.setitem(sys.modules, "factory.config", types.SimpleNamespace(
+        load_seats=lambda: SimpleNamespace(company="demo")
+    ))
+    monkeypatch.setitem(sys.modules, "factory.hierarchy", types.SimpleNamespace(
+        escalation_target=lambda cfg, seat: None
+    ))
+    calls = []
+    monkeypatch.setattr(watchdog, "_run_kanban", lambda board, args, **kwargs: calls.append(args))
+
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z")[0]["action"] == "escalate_to_board"
+    assert watchdog.tick("demo", "2026-07-12T01:00:00Z") == []
+    assert sum(any(str(value).startswith("Escalation:") for value in args) for args in calls) == 1

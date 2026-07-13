@@ -139,7 +139,7 @@ def _monitor(args: argparse.Namespace) -> Any:
     if args.monitor_command == "list":
         return _emit(store.due_monitors("9999-12-31T23:59:59+00:00"))
     store.add_monitor(args.task, args.next_check_at, args.timeout_at, args.max_attempts,
-                      args.recovery_policy, args.notes, args.scheduled_by)
+                      args.recovery_policy, args.notes, args.scheduled_by, args.interval_seconds)
     return _emit({"added": args.task})
 
 
@@ -201,7 +201,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     q = subs.add_parser("set"); q.add_argument("task"); source = q.add_mutually_exclusive_group(required=True); source.add_argument("--json"); source.add_argument("--file")
     p = _handler(verbs, "monitor", "add or list recovery monitors", _monitor); subs = p.add_subparsers(dest="monitor_command", required=True)
     subs.add_parser("list")
-    q = subs.add_parser("add"); q.add_argument("task"); q.add_argument("--next-check-at", required=True); q.add_argument("--timeout-at"); q.add_argument("--max-attempts", type=int, default=3); q.add_argument("--recovery-policy", choices=("wake_owner", "create_recovery_task", "escalate_to_board"), default="wake_owner"); q.add_argument("--notes", default=""); q.add_argument("--scheduled-by", default="operator")
+    q = subs.add_parser("add"); q.add_argument("task"); q.add_argument("--next-check-at", required=True); q.add_argument("--timeout-at"); q.add_argument("--max-attempts", type=int, default=3); q.add_argument("--interval-seconds", type=int, default=300); q.add_argument("--recovery-policy", choices=("wake_owner", "create_recovery_task", "escalate_to_board"), default="wake_owner"); q.add_argument("--notes", default=""); q.add_argument("--scheduled-by", default="operator")
     p = _handler(verbs, "watchdog", "add or list subtree watchdogs", _watchdog); subs = p.add_subparsers(dest="watchdog_command", required=True)
     subs.add_parser("list"); q = subs.add_parser("add"); q.add_argument("root_task"); q.add_argument("--agent", required=True); q.add_argument("--instructions", required=True)
     p = _handler(verbs, "costs", "show token-cost rollups", _costs); p.add_argument("--by", choices=("seat", "executor", "task"), default="seat"); p.add_argument("--since", type=_since_days, default=7)

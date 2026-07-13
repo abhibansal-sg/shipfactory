@@ -53,13 +53,21 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS monitors (
           task_id TEXT PRIMARY KEY, next_check_at TEXT NOT NULL, timeout_at TEXT,
           max_attempts INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
-          recovery_policy TEXT NOT NULL, notes TEXT, scheduled_by TEXT);
+          recovery_policy TEXT NOT NULL, notes TEXT, scheduled_by TEXT,
+          interval_seconds INTEGER NOT NULL DEFAULT 300);
         CREATE TABLE IF NOT EXISTS watchdogs (
           root_task_id TEXT PRIMARY KEY, agent TEXT NOT NULL, instructions TEXT NOT NULL, last_fingerprint TEXT);
         CREATE TABLE IF NOT EXISTS seat_state (seat TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sync (
           gh_number INTEGER PRIMARY KEY, task_id TEXT NOT NULL, gh_updated TEXT, k_updated TEXT, last_synced_at TEXT NOT NULL);
         """)
+        monitor_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(monitors)")
+        }
+        if "interval_seconds" not in monitor_columns:
+            conn.execute(
+                "ALTER TABLE monitors ADD COLUMN interval_seconds INTEGER NOT NULL DEFAULT 300"
+            )
 
 
 def record_run_start(task_id, seat, executor, model, pid) -> int:
@@ -111,28 +119,72 @@ def decisions_for(task_id) -> list[dict]:
         return _rows(conn.execute("SELECT task_id,stage_id,stage_type,seat,outcome,body,at FROM decisions WHERE task_id=? ORDER BY id", (task_id,)))
 
 
-def add_monitor(task_id, next_check_at, timeout_at, max_attempts, recovery_policy, notes, scheduled_by) -> None:
+def add_monitor(
+    task_id,
+    next_check_at,
+    timeout_at,
+    max_attempts,
+    recovery_policy,
+    notes,
+    scheduled_by,
+    interval_seconds=300,
+) -> None:
     """Create or replace a task monitor, resetting its attempts."""
     init_db()
+    interval_seconds = int(interval_seconds)
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
     with _connect() as conn:
-        conn.execute("""INSERT INTO monitors VALUES(?,?,?,?,0,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+        conn.execute("""INSERT INTO monitors(
+          task_id,next_check_at,timeout_at,max_attempts,attempt_count,recovery_policy,notes,scheduled_by,interval_seconds
+        ) VALUES(?,?,?,?,0,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
           next_check_at=excluded.next_check_at,timeout_at=excluded.timeout_at,max_attempts=excluded.max_attempts,
-          attempt_count=0,recovery_policy=excluded.recovery_policy,notes=excluded.notes,scheduled_by=excluded.scheduled_by""",
-                     (task_id, next_check_at, timeout_at, max_attempts, recovery_policy, notes, scheduled_by))
+          attempt_count=0,recovery_policy=excluded.recovery_policy,notes=excluded.notes,
+          scheduled_by=excluded.scheduled_by,interval_seconds=excluded.interval_seconds""",
+                     (task_id, next_check_at, timeout_at, max_attempts, recovery_policy, notes,
+                      scheduled_by, interval_seconds))
 
 
 def due_monitors(now_iso) -> list[dict]:
-    """Return monitors whose next check is at or before the UTC timestamp."""
+    """Return monitors whose next check or terminal timeout has arrived."""
     init_db()
     with _connect() as conn:
-        return _rows(conn.execute("SELECT * FROM monitors WHERE next_check_at<=? ORDER BY next_check_at,task_id", (now_iso,)))
+        return _rows(conn.execute(
+            """SELECT * FROM monitors
+               WHERE next_check_at<=? OR (timeout_at IS NOT NULL AND timeout_at<=?)
+               ORDER BY next_check_at,task_id""",
+            (now_iso, now_iso),
+        ))
 
 
-def bump_monitor(task_id) -> None:
-    """Increment a monitor's recovery attempt count."""
+def advance_monitor(task_id, now_iso, *, close=False) -> bool:
+    """Atomically advance one recovery attempt and reschedule or close it."""
+
     init_db()
     with _connect() as conn:
-        conn.execute("UPDATE monitors SET attempt_count=attempt_count+1 WHERE task_id=?", (task_id,))
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT interval_seconds FROM monitors WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE monitors SET attempt_count=attempt_count+1 WHERE task_id=?", (task_id,)
+        )
+        if close:
+            conn.execute("DELETE FROM monitors WHERE task_id=?", (task_id,))
+        else:
+            now = datetime.fromisoformat(str(now_iso).replace("Z", "+00:00"))
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            next_check_at = (now.astimezone(timezone.utc) + timedelta(
+                seconds=int(row["interval_seconds"])
+            )).isoformat()
+            conn.execute(
+                "UPDATE monitors SET next_check_at=? WHERE task_id=?",
+                (next_check_at, task_id),
+            )
+        return True
 
 
 def clear_monitor(task_id) -> None:
@@ -214,4 +266,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_end", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "bump_monitor", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_end", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "sync_get", "sync_upsert"]

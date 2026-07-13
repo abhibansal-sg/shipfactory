@@ -32,7 +32,8 @@ def _monitor_tool(args: dict) -> str:
     """Add a Factory monitor and return a Hermes JSON-string result."""
     from .store import add_monitor
     add_monitor(args["task_id"], args["next_check_at"], args.get("timeout_at"), int(args.get("max_attempts", 3)),
-                args.get("recovery_policy", "wake_owner"), args.get("notes", ""), args.get("scheduled_by", "agent"))
+                args.get("recovery_policy", "wake_owner"), args.get("notes", ""), args.get("scheduled_by", "agent"),
+                int(args.get("interval_seconds", 300)))
     return json.dumps({"ok": True, "task_id": args["task_id"]})
 
 
@@ -60,24 +61,17 @@ def _on_complete(**kwargs) -> None:
     on_complete(kwargs["task_id"], kwargs.get("board") or "", kwargs.get("assignee") or "", kwargs.get("summary") or "")
 
 
-def _on_block(**kwargs) -> None:
-    """Advance an existing task monitor after a blocked event."""
-    from .store import bump_monitor
-    bump_monitor(kwargs["task_id"])
-
-
 def register(ctx) -> None:
     """Register Factory CLI, tools, and kanban lifecycle hooks."""
     ctx.register_cli_command(name="factory", help="Operate Hermes Factory", setup_fn=_setup_cli,
                              handler_fn=_handle_cli, description="Teams, hierarchy, policy, watchdogs, and cost telemetry")
     ctx.register_hook("kanban_task_completed", _on_complete)
-    ctx.register_hook("kanban_task_blocked", _on_block)
     from .telemetry import on_claim
     ctx.register_hook("kanban_task_claimed", on_claim)
     tools = (
         ("factory_verdict", {"type": "object", "properties": {"task_id": {"type": "string"}, "stage_id": {"type": "string"}, "outcome": {"type": "string"}, "body": {"type": "string"}, "seat": {"type": "string"}}, "required": ["task_id", "stage_id", "outcome", "body", "seat"]}, _verdict_tool),
         ("factory_costs", {"type": "object", "properties": {"by": {"type": "string"}, "since_days": {"type": "integer"}}}, _costs_tool),
-        ("factory_monitor_add", {"type": "object", "properties": {"task_id": {"type": "string"}, "next_check_at": {"type": "string"}, "timeout_at": {"type": "string"}, "max_attempts": {"type": "integer"}, "recovery_policy": {"type": "string"}, "notes": {"type": "string"}, "scheduled_by": {"type": "string"}}, "required": ["task_id", "next_check_at"]}, _monitor_tool),
+        ("factory_monitor_add", {"type": "object", "properties": {"task_id": {"type": "string"}, "next_check_at": {"type": "string"}, "timeout_at": {"type": "string"}, "max_attempts": {"type": "integer"}, "interval_seconds": {"type": "integer"}, "recovery_policy": {"type": "string"}, "notes": {"type": "string"}, "scheduled_by": {"type": "string"}}, "required": ["task_id", "next_check_at"]}, _monitor_tool),
     )
     for name, schema, handler in tools:
         ctx.register_tool(name=name, toolset="factory", schema=schema, handler=handler, check_fn=_service_ready,

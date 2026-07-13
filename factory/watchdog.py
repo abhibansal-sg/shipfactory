@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-TERMINAL_STATUSES = {"done", "cancelled"}
+TERMINAL_STATUSES = {"done", "archived", "failed", "cancelled"}
 LIVE_RUN_STATUSES = {"queued", "running", "scheduled_retry", "in_progress"}
 RECOVERY_LADDER = ("wake_owner", "create_recovery_task", "escalate_to_board")
 
@@ -229,29 +229,53 @@ def _task(task_id: str, board: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _next_recovery(policy: str) -> str:
-    """Return the next ladder step, retaining escalation at the top."""
+def _recovery_rung(policy: str, attempts: int) -> str | None:
+    """Return the one ladder rung selected by the completed-attempt count."""
 
-    if policy in RECOVERY_LADDER:
-        index = RECOVERY_LADDER.index(policy)
-        return RECOVERY_LADDER[min(index + 1, len(RECOVERY_LADDER) - 1)]
     if policy == "create_recovery_issue":
-        return "escalate_to_board"
-    return "wake_owner"
+        policy = "create_recovery_task"
+    try:
+        index = RECOVERY_LADDER.index(policy)
+    except ValueError:
+        index = 0
+    index += attempts
+    return RECOVERY_LADDER[index] if index < len(RECOVERY_LADDER) else None
 
 
-def _route_recovery(row: dict[str, Any], board: str) -> dict[str, Any]:
+def _at_or_after(value: Any, boundary: Any) -> bool:
+    """Return whether an ISO timestamp has reached an optional boundary."""
+
+    value_ms = _epoch_ms(value)
+    boundary_ms = _epoch_ms(boundary)
+    return value_ms is not None and boundary_ms is not None and value_ms >= boundary_ms
+
+
+def _route_recovery(row: dict[str, Any], board: str, now: str) -> dict[str, Any]:
     """Execute one monitor recovery action and return an audit result."""
 
     store = _module("factory.store")
     task_id = str(row["task_id"])
-    task = _task(task_id, board)
-    owner = row.get("owner") or row.get("assignee") or task.get("assignee") or task.get("assignee_name")
-    policy = str(row.get("recovery_policy") or "wake_owner")
+    if _at_or_after(now, row.get("timeout_at")):
+        store.advance_monitor(task_id, now, close=True)
+        return {"task_id": task_id, "action": "closed", "reason": "timeout"}
+
     attempts = int(row.get("attempt_count", 0) or 0)
     max_attempts = int(row.get("max_attempts", 1) or 1)
     if attempts >= max_attempts:
-        policy = _next_recovery(policy)
+        store.advance_monitor(task_id, now, close=True)
+        return {"task_id": task_id, "action": "closed", "reason": "max_attempts"}
+
+    task = _task(task_id, board)
+    if str(task.get("status") or "") in TERMINAL_STATUSES:
+        store.advance_monitor(task_id, now, close=True)
+        return {"task_id": task_id, "action": "closed", "reason": "terminal_task"}
+
+    owner = row.get("owner") or row.get("assignee") or task.get("assignee") or task.get("assignee_name")
+    policy = _recovery_rung(str(row.get("recovery_policy") or "wake_owner"), attempts)
+    if policy is None:
+        store.advance_monitor(task_id, now, close=True)
+        return {"task_id": task_id, "action": "closed", "reason": "top_rung"}
+
     notes = str(row.get("notes") or "Monitor check is due.")
     if policy == "wake_owner":
         if owner:
@@ -278,7 +302,8 @@ def _route_recovery(row: dict[str, Any], board: str) -> dict[str, Any]:
                 args += ["--assignee", str(assignee)]
             _run_kanban(board, args)
             action = "escalate_to_board"
-    store.bump_monitor(task_id)
+    close = policy == RECOVERY_LADDER[-1] or attempts + 1 >= max_attempts
+    store.advance_monitor(task_id, now, close=close)
     return {"task_id": task_id, "action": action}
 
 
@@ -300,7 +325,7 @@ def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None)
     rows = store.due_monitors(now)
     if board is None:
         board = getattr(_module("factory.config").load_seats(), "company", "")
-    return [_route_recovery(row, board) for row in rows]
+    return [_route_recovery(row, board, now) for row in rows]
 
 
 def reconcile_watchdog(input: dict[str, Any], board: str | None = None) -> dict[str, Any]:
