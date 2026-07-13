@@ -40,8 +40,26 @@ def test_citation_gate_matches_governor_and_clean_exemption():
     assert not policy.citation_ok("Looks good, but no proof")
 
 
-def test_completion_reopens_and_routes_first_stage(monkeypatch):
+def test_completion_without_stored_policy_is_noop(monkeypatch):
     state = install_fakes(monkeypatch)
+    calls = []
+    monkeypatch.setattr(policy.subprocess, "run", lambda command, **kwargs: calls.append(command))
+
+    result = policy.on_complete("T1", "demo", "dev", "implemented")
+
+    assert result == {"action": "allow", "next_stage": None}
+    assert state["policy"] is None
+    assert state["set"] == []
+    assert state["records"] == []
+    assert calls == []
+
+
+def test_completion_with_stored_policy_reopens_and_routes_first_stage(monkeypatch):
+    policy_data = {
+        "mode": "normal", "commentRequired": True,
+        "stages": [{"id": "review", "type": "review", "approvalsNeeded": 1, "participants": ["verifier"]}],
+    }
+    state = install_fakes(monkeypatch, stored_policy=policy_data)
     calls = []
     monkeypatch.setattr(policy.subprocess, "run", lambda command, **kwargs: calls.append(command) or SimpleNamespace(stdout=""))
 

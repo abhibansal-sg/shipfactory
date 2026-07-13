@@ -171,8 +171,7 @@ def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[s
     store = _module("factory.store")
     policy = store.get_policy(task_id)
     if policy is None:
-        policy = _default_policy()
-        store.set_policy(task_id, policy)
+        return {"action": "allow", "next_stage": None}
     passed, stage = _stage_status(task_id, policy)
     if passed:
         hierarchy = _module("factory.hierarchy")
