@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from typing import Any
@@ -51,18 +52,47 @@ def _latest_steps(db: Any, instance_id: str | None = None) -> list[dict[str, Any
     return [dict(row) for row in rows]
 
 
-def _budget_for(db: Any, instance: dict[str, Any]) -> dict[str, Any]:
+def _recipe_budgets_for(db: Any, instance: dict[str, Any]) -> dict[str, int | None]:
     row = db.execute(
         "SELECT normalized_yaml FROM recipe_versions WHERE id=? AND version=?",
         (instance["recipe_id"], instance["recipe_version"]),
     ).fetchone()
-    budget: int | None = None
+    budgets: dict[str, int | None] = {
+        "max_activations": None,
+        "max_step_activations": None,
+        "max_tokens": None,
+    }
     if row:
         try:
-            budget_value = (yaml.safe_load(row["normalized_yaml"]) or {}).get("budgets", {}).get("max_tokens")
-            budget = int(budget_value) if budget_value is not None else None
+            raw = (yaml.safe_load(row["normalized_yaml"]) or {}).get("budgets", {})
+            for key in budgets:
+                value = raw.get(key)
+                budgets[key] = int(value) if value is not None else None
         except (TypeError, ValueError, yaml.YAMLError):
             pass
+    return budgets
+
+
+def _recipe_step_order_for(db: Any, recipe_id: str, recipe_version: int) -> list[str]:
+    row = db.execute(
+        "SELECT normalized_yaml FROM recipe_versions WHERE id=? AND version=?",
+        (recipe_id, recipe_version),
+    ).fetchone()
+    if not row:
+        return []
+    try:
+        document = yaml.safe_load(row["normalized_yaml"]) or {}
+        return [
+            str(step["id"])
+            for step in document.get("steps", [])
+            if isinstance(step, dict) and step.get("id")
+        ]
+    except (TypeError, yaml.YAMLError):
+        return []
+
+
+def _budget_for(db: Any, instance: dict[str, Any]) -> dict[str, Any]:
+    budget = _recipe_budgets_for(db, instance)["max_tokens"]
     charged = instance["tokens_charged"]
     return {"charged": charged, "budget": budget, "remaining": max(budget - charged, 0) if budget is not None else None}
 
@@ -78,6 +108,7 @@ def _instance_summary(db: Any, instance: dict[str, Any]) -> dict[str, Any]:
         "latest_steps": latest,
         "step_states": dict(states),
         "tokens": _budget_for(db, instance),
+        "budgets": _recipe_budgets_for(db, instance),
     }
 
 
@@ -109,6 +140,20 @@ def get_instance(instance_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="unknown recipe instance")
         instance = _instance_summary(db, dict(row))
         steps = [dict(item) for item in db.execute("SELECT * FROM recipe_steps WHERE instance_id=? ORDER BY step_id,activation", (instance_id,)).fetchall()]
+        recipe_order = _recipe_step_order_for(
+            db, instance["recipe_id"], instance["recipe_version"]
+        )
+        positions = {step_id: index + 1 for index, step_id in enumerate(recipe_order)}
+        fallback_position = len(positions) + 1
+        steps.sort(
+            key=lambda step: (
+                positions.get(step["step_id"], fallback_position),
+                step["step_id"],
+                step["activation"],
+            )
+        )
+        for step in steps:
+            step["step_position"] = positions.get(step["step_id"])
         activations: dict[str, list[dict[str, Any]]] = defaultdict(list)
         task_ids: list[str] = []
         for step in steps:
@@ -144,7 +189,26 @@ def waiting_gates() -> list[dict[str, Any]]:
             ORDER BY i.updated_at DESC,s.step_id
             """
         ).fetchall()
-        return [dict(row) for row in rows]
+        gates = [dict(row) for row in rows]
+        positions: dict[str, dict[str, int]] = {}
+        totals: dict[str, int] = {}
+        for gate in gates:
+            instance_id = gate["instance_id"]
+            if instance_id not in positions:
+                ordered_ids = _recipe_step_order_for(
+                    db, gate["recipe_id"], gate["recipe_version"]
+                )
+                if not ordered_ids:
+                    ordered_ids = [
+                        step["step_id"] for step in _latest_steps(db, instance_id)
+                    ]
+                positions[instance_id] = {
+                    step_id: index + 1 for index, step_id in enumerate(ordered_ids)
+                }
+                totals[instance_id] = len(ordered_ids)
+            gate["step_position"] = positions[instance_id].get(gate["step_id"])
+            gate["step_total"] = totals[instance_id]
+        return gates
 
 
 @router.get("/seats")
@@ -158,8 +222,38 @@ def seats() -> list[dict[str, Any]]:
 
 
 @router.get("/costs")
-def costs(by: str = Query("seat", pattern="^(seat|executor|task)$"), since_days: int = Query(1, ge=0, le=3650)) -> list[dict[str, Any]]:
-    return store.costs_rollup(by, since_days)
+def costs(
+    by: str = Query("seat", pattern="^(seat|executor|task|day|instance)$"),
+    since_days: int = Query(1, ge=0, le=3650),
+) -> list[dict[str, Any]]:
+    if by in {"seat", "executor", "task"}:
+        return store.costs_rollup(by, since_days)
+
+    store.init_db()
+    since = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    with store._connect() as db:
+        if by == "day":
+            rows = db.execute(
+                """SELECT utc_day AS day, COUNT(*) AS charges,
+                          COALESCE(SUM(tokens), 0) AS tokens_total
+                   FROM budget_charges WHERE created_at>=?
+                   GROUP BY utc_day ORDER BY utc_day DESC""",
+                (since,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT c.instance_id AS instance, i.board,
+                          i.recipe_id || '@' || i.recipe_version AS recipe,
+                          COUNT(*) AS charges,
+                          COALESCE(SUM(c.tokens), 0) AS tokens_total
+                   FROM budget_charges AS c
+                   LEFT JOIN recipe_instances AS i ON i.id=c.instance_id
+                   WHERE c.created_at>=?
+                   GROUP BY c.instance_id, i.board, i.recipe_id, i.recipe_version
+                   ORDER BY tokens_total DESC, c.instance_id""",
+                (since,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 @router.post("/approve")
