@@ -127,6 +127,102 @@ def _review_stalled(db: Any, instance_id: str, step: dict[str, Any], count: int)
     return bool(previous and previous["finding_count"] is not None and count >= 0
                 and int(previous["finding_count"]) >= 0 and count >= int(previous["finding_count"]))
 
+def _result_one_liner(value: str | None) -> str | None:
+    in_frontmatter = False
+    saw_frontmatter = False
+    for raw in str(value or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "---":
+            in_frontmatter = not in_frontmatter if not saw_frontmatter or in_frontmatter else False
+            saw_frontmatter = True
+            continue
+        if in_frontmatter or line.startswith(("#", "```", "FACTORY_VERDICT:")):
+            continue
+        return line.strip("* ")[:240]
+    return None
+
+def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str, Any],
+                 definition: dict[str, Any], task_id: str) -> None:
+    """Attach one ephemeral continue-here comment to a newly parked gate."""
+    from hermes_cli import kanban_db
+    if conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'CONTINUE-HERE%' LIMIT 1",
+        (task_id,),
+    ).fetchone():
+        return
+    defs = {item["id"]: item for item in recipe["steps"]}
+    ancestors: set[str] = set()
+    def collect(node: str) -> None:
+        for parent in defs[node]["needs"]:
+            if parent not in ancestors:
+                ancestors.add(parent)
+                collect(parent)
+    collect(definition["id"])
+    summaries: list[str] = []
+    for upstream_id in sorted(ancestors):
+        row = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND state='done' "
+            "ORDER BY activation DESC LIMIT 1",
+            (instance["id"], upstream_id),
+        ).fetchone()
+        if row and row["kanban_task_id"]:
+            task = kanban_db.get_task(conn, row["kanban_task_id"])
+            one_liner = _result_one_liner(task.result if task else None)
+            if one_liner:
+                summaries.append(f"- {upstream_id}: {one_liner}")
+    children = sorted(item["id"] for item in recipe["steps"] if definition["id"] in item["needs"])
+    unblocks = ", ".join(children) if children else "recipe completion"
+    if definition["primitive"] == "approval_gate":
+        awaited = f"Approval required: {definition['params']['instructions']} This unblocks {unblocks}."
+        next_action = f"Record approve or reject for instance {instance['id']} step {definition['id']}."
+    else:
+        awaited = f"Event required: {definition['params']['event']}. This unblocks {unblocks}."
+        next_action = f"Emit the matching {definition['params']['event']} event for instance {instance['id']} step {definition['id']}."
+    body = "\n".join([
+        "CONTINUE-HERE",
+        f"Instance: {instance['id']}",
+        f"Step: {definition['id']}",
+        "Status: blocked / needs_input",
+        f"Updated: {store._now()}",
+        "",
+        "## Where We Are",
+        f"The recipe is parked at {definition['id']} pending operator input.",
+        "",
+        "## Done",
+        *(summaries or ["- No completed upstream summary was available."]),
+        "",
+        "## Left",
+        f"- Resume {unblocks} after this gate is consumed.",
+        "",
+        "## Decisions and Why",
+        "None recorded in this gate note.",
+        "",
+        "## Blockers",
+        awaited,
+        "",
+        "## Next Action",
+        next_action,
+    ])
+    kanban_db.add_comment(conn, task_id, "factory", body)
+
+def _consume_resume_note(conn: Any, task_id: str | None) -> None:
+    """Mark one parked note consumed without adding a Factory table."""
+    from hermes_cli import kanban_db
+    if not task_id:
+        return
+    has_note = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'CONTINUE-HERE%' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    consumed = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'RESUMED %' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if has_note and not consumed:
+        kanban_db.add_comment(conn, task_id, "factory", f"RESUMED {store._now()}")
+
 def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
@@ -211,6 +307,8 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         except ValueError as exc:
                             changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason=str(exc))
                             continue
+                    if step["primitive"] in {"approval_gate", "wait_for_event"}:
+                        _consume_resume_note(conn, step["kanban_task_id"])
                     changed |= _transition(db, instance, step, "done", f"kanban:{task.id}")
                 elif task and task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}:
                     changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="worker_blocked")
@@ -246,6 +344,8 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
                 task = activate(conn, instance, recipe, definition, step, params, parents)
                 state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
+                if primitive in {"approval_gate", "wait_for_event"} and task:
+                    _resume_note(db, conn, instance, recipe, definition, task)
                 changed |= _transition(db, instance, step, state, "activate", task=task)
 
             instance = _instance(db, instance_id)
@@ -339,6 +439,7 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                 step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], payload["step_id"])).fetchone()
                 defs = {x["id"]: x for x in recipe_for_instance(instance).document["steps"]}
                 if step and step["state"] == "waiting" and defs[payload["step_id"]]["primitive"] == "wait_for_event" and defs[payload["step_id"]]["params"]["event"] == payload["payload"]["type"]:
+                    _consume_resume_note(conn, step["kanban_task_id"])
                     _transition(db, instance, dict(step), "done", payload["payload"]["id"])
             elif row["source"] == "gate_decision":
                 step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], payload.get("step_id"))).fetchone()

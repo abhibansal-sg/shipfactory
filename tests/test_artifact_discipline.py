@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 
 from factory import store
-from factory.recipes.advancer import apply_events, reconcile, release_review_stall
+from factory.recipes.advancer import (
+    apply_events,
+    event,
+    gate_decision,
+    reconcile,
+    release_review_stall,
+)
 from factory.recipes.instantiate import instantiate
 from factory.recipes.loader import load_library
 
@@ -147,3 +153,93 @@ def test_unparseable_rejection_counts_never_stall_and_existing_cap_wins(tmp_path
 
     assert _step("unknown-count", "build", 4)["blocked_reason"] == "activation_fuse"
     assert _instance("unknown-count")["blocked_reason"] == "activation_fuse"
+
+
+def _human_gate_recipe(tmp_path: Path, primitive: str):
+    recipe_id = "approval-note" if primitive == "approval_gate" else "event-note"
+    gate_params = (
+        "{approvers: [operator], instructions: Approve the verified artifact.}"
+        if primitive == "approval_gate"
+        else "{event: artifact_ready}"
+    )
+    library = tmp_path / f"{recipe_id}-library"
+    library.mkdir()
+    (library / f"{recipe_id}@1.yaml").write_text(
+        f"""schema: factory.recipe/v1
+id: {recipe_id}
+version: 1
+status: active
+description: resume-note gate test
+intent_tags: [test]
+supersedes: null
+parameters: {{}}
+budgets: {{max_activations: 2, max_step_activations: 1, max_tokens: 100000}}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {{seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}}
+  - id: gate
+    primitive: {primitive}
+    title: Human gate
+    needs: [build]
+    optional: false
+    params: {gate_params}
+""",
+        encoding="utf-8",
+    )
+    return load_library(library).get(f"{recipe_id}@1")
+
+
+def _park_human_gate(tmp_path: Path, kanban_conn, primitive: str, instance_id: str) -> dict:
+    from hermes_cli import kanban_db
+
+    recipe = _human_gate_recipe(tmp_path, primitive)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id=instance_id)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    build = _step(instance_id, "build")
+    assert kanban_db.complete_task(
+        kanban_conn,
+        build["kanban_task_id"],
+        result="JWT auth with refresh rotation using jose",
+    )
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    gate = _step(instance_id, "gate")
+    assert gate and gate["state"] == "waiting"
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len(comments) == 1
+    note = comments[0].body
+    assert "CONTINUE-HERE" in note
+    assert f"Instance: {instance_id}" in note and "Step: gate" in note
+    assert "build: JWT auth with refresh rotation using jose" in note
+    assert "## Done" in note and "## Left" in note and "## Decisions and Why" in note
+    assert "## Blockers" in note and "## Next Action" in note
+    return gate
+
+
+def test_approval_gate_resume_note_is_written_and_consumed(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+
+    gate = _park_human_gate(tmp_path, kanban_conn, "approval_gate", "approval-resume")
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert "Approval required: Approve the verified artifact." in comments[0].body
+
+    gate_decision("approval-resume", "gate", "approve")
+    apply_events(kanban_conn, profiles=PROFILES)
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len([comment for comment in comments if comment.body.startswith("RESUMED ")]) == 1
+
+
+def test_wait_for_event_resume_note_is_written_and_consumed(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+
+    gate = _park_human_gate(tmp_path, kanban_conn, "wait_for_event", "event-resume")
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert "Event required: artifact_ready." in comments[0].body
+
+    event("event-resume", "gate", {"id": "artifact-1", "type": "artifact_ready"})
+    apply_events(kanban_conn, profiles=PROFILES)
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len([comment for comment in comments if comment.body.startswith("RESUMED ")]) == 1
