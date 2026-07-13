@@ -332,3 +332,57 @@ def test_selector_clarification_parks_source_and_instantiates_nothing(kanban_con
     assert "Which tenant owns the data?" in blocked[-1].payload["reason"]
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM recipe_instances").fetchone()[0] == 0
+
+
+def test_dev_pipeline_v2_flat_findings_e2e_parks_review_stall(kanban_conn):
+    """Instantiate the published graph and drive its real build/review loop."""
+    from hermes_cli import kanban_db
+
+    recipe = load_library(ROOT / "recipes").get("dev-pipeline@2")
+    instantiate(
+        kanban_conn,
+        board="test",
+        recipe=recipe,
+        parameters={"request": "Build the hermetic smoke artifact."},
+        instance_id="pipeline-v2-e2e",
+    )
+    reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    plan_check = _step("pipeline-v2-e2e", "plan-check", 1)
+    approval = {
+        "outcome": "approve",
+        "body": "APPROVE: clean pass; no findings",
+    }
+    assert kanban_db.complete_task(
+        kanban_conn,
+        plan_check["kanban_task_id"],
+        result="FACTORY_VERDICT: " + json.dumps(approval, separators=(",", ":")),
+    )
+    reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    for activation in (1, 2):
+        build = _step("pipeline-v2-e2e", "build", activation)
+        assert build and build["state"] == "running"
+        assert kanban_db.complete_task(
+            kanban_conn,
+            build["kanban_task_id"],
+            result=f"Hermetic artifact revision {activation}",
+        )
+        reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+        verify = _step("pipeline-v2-e2e", "verify", activation)
+        rejection = {
+            "outcome": "request_changes",
+            "target_step": "build",
+            "body": "finding_count: 2\nBLOCKER tests/test_artifact_discipline.py:1 — stubbed flat finding\nWARNING recipes/dev-pipeline@2.yaml:1 — stubbed flat finding",
+        }
+        assert kanban_db.complete_task(
+            kanban_conn,
+            verify["kanban_task_id"],
+            result="FACTORY_VERDICT: " + json.dumps(rejection, separators=(",", ":")),
+        )
+        reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    instance = _instance("pipeline-v2-e2e")
+    assert (instance["status"], instance["blocked_reason"]) == ("blocked", "review_stall")
+    assert _step("pipeline-v2-e2e", "verify", 2)["blocked_reason"] == "review_stall"
+    assert _step("pipeline-v2-e2e", "build", 3) is None
