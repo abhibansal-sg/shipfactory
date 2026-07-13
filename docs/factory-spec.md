@@ -367,3 +367,55 @@ diff, comment with #16-V2 tag).
 
 Gate: BOTH lanes' suites + the original 37 ALL green together via
 ~/Developer/products/hermes-mobile/.venv/bin/python -m pytest tests/ -q.
+
+## 17. STAGE INSTRUCTIONS (ratified direction 2026-07-13, pre-validation)
+
+Policy stages gain an optional `instructions` field (3-6 lines, a named
+bar not a playbook). Instructions live on the stage in a NAMED POLICY
+TEMPLATE (git-versioned), never per-task blobs. Empty = model judgment +
+seat skill carry the stage. Injected into the reopen-comment / worker
+context when the stage activates. Rationale: unguided smart-model review
+is the proven failure mode (Nous sweeper adoption; luna F1 'accepted
+risk'); the instruction names which bar applies, the seat skill holds
+procedure.
+
+## 18. RECIPE SYSTEM (ratified direction 2026-07-13, pre-validation)
+
+A recipe = pure data (YAML in git, versioned; running instances pin their
+version): ordered/parallel steps, each {id, executor, model, instructions,
+gate: review|approval|mechanical, needs[], concurrency, optional: skip
+conditions}. UNIFIES policy stages and org flow: both become steps.
+Runtime = the existing kanban dispatcher — each step instantiates as a
+kanban task (parent/child links = graph, blockedByIssueIds = ordering,
+claims/TTL/circuit-breaker/notify inherited). Recipe engine = template
+instantiator + step-advancer hook ONLY. HARD LINE: no custom scheduler,
+no DAG engine, no retry semantics beyond kanban's. Domain-general:
+proof = dev-pipeline recipe + one Aheli workflow recipe. Kanban's own
+workflow_template_id / current_step_key / step_key columns (documented
+'v2 workflow routing', currently unused) are the designed-for seams.
+
+## 19. TRIAGE RECIPE-ROUTING + DRAFT VALVE (ratified direction 2026-07-13)
+
+Triage (kanban_decompose pattern: aux-LLM proposes, deterministic code
+validates/instantiates) gains recipe SELECTION: per child node, choose
+from the recipe LIBRARY + parameterize (skip optional steps, seat/model
+overrides). Parent may carry a ship-bearing recipe while a sub-parent
+carries build-verify-only — recipes attach per node, compose via existing
+parent-gating. CREATION is fenced: when nothing in the library fits,
+triage COMPOSES A DRAFT from existing tested step primitives only, files
+it as draft attached to a needs_recipe blocked task; a draft NEVER runs
+without one approval (operator now; strong-lane architect later once
+earned). Approved drafts enter the library versioned. Doctrine: models
+choose and judge; tested code executes.
+
+## 20. SHAKEDOWN BACKLOG (gaps ratified for fix, 2026-07-13)
+
+1. F2 run durability: persist _RUNNING pid map in store, rescan on daemon
+   start (MUST precede first real load).
+2. Budgets/quota-windows ported from PC onto runs data (ceilings, not
+   just recording).
+3. Labels sidecar (task_labels) — Nous-aligned P0-P4 on factory tasks.
+4. Approval-stage chat notification: ping operator when an approval stage
+   becomes READY (not only at terminal states).
+5. Origin fingerprints — lands WITH recipes (dup-suppression for
+   recipe-churned tasks), not after.
