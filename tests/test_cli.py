@@ -10,7 +10,7 @@ import types
 from factory import cli
 
 
-VERBS = {"init", "seats", "org", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
+VERBS = {"init", "seats", "seat-create", "seat-update", "seat-list", "org", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -67,3 +67,10 @@ def test_sync_delegates_explicitly(monkeypatch):
     monkeypatch.setattr("factory.github_sync.sync", lambda **kw: calls.append(kw) or {})
     cli.main(["sync", "--board", "acme", "--repo", "o/r"])
     assert calls == [{"board": "acme", "repo": "o/r"}]
+
+
+def test_seat_create_uses_shared_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "profiles" / "builder").mkdir(parents=True)
+    result = cli.main(["seat-create", "builder", "--profile", "builder", "--executor", "codex", "--model", "gpt", "--role", "engineer"])
+    assert result["name"] == "builder"

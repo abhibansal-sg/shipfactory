@@ -112,9 +112,9 @@ const waiting = [
 ];
 
 const seats = [
-  { name: "architect", role: "cto", profile: "architect", executor: "codex", model: "gpt-5.4", reasoning: "high", reports_to: "operator", max_concurrent: 2, paused: false },
-  { name: "builder", role: "engineer", profile: "dev-backend-codex", executor: "codex", model: "gpt-5.4", reasoning: "medium", reports_to: "architect", max_concurrent: 3, paused: false },
-  { name: "verifier", role: "qa", profile: "verifier", executor: "claude", model: "opus-4.6", reasoning: "high", reports_to: "operator", max_concurrent: 1, paused: true },
+  { name: "architect", role: "cto", profile: "architect", executor: "codex", model: "gpt-5.4", profile_model: "gpt-5.4", reasoning: "high", reports_to: "operator", max_concurrent: 2, paused: false },
+  { name: "builder", role: "engineer", profile: "dev-backend-codex", executor: "hermes", model: "claude-sonnet-5", profile_model: "claude-sonnet-5", provider_config: { provider: "hermes-anthropic-proxy", base_url: "http://127.0.0.1:18808", model: "claude-sonnet-5" }, reasoning: "medium", reports_to: "architect", max_concurrent: 3, paused: false },
+  { name: "verifier", role: "qa", profile: "verifier", executor: "claude", model: "opus-4.6", profile_model: "claude-sonnet-5", model_mismatch: true, reasoning: "high", reports_to: "operator", max_concurrent: 1, paused: true },
 ];
 
 const dailyCosts = [
@@ -149,6 +149,9 @@ window.__HERMES_PLUGIN_SDK__ = {
   components: { Badge, Button, Card, CardContent },
   utils: {},
   fetchJSON(url, options = {}) {
+    if (url.endsWith("/profiles")) return Promise.resolve(["default", "architect", "dev-backend-codex", "verifier"]);
+    if (options.method === "POST" && url.endsWith("/seats")) return Promise.resolve({ name: JSON.parse(options.body).name });
+    if (options.method === "PUT" && url.includes("/seats/")) return Promise.resolve({ name: decodeURIComponent(url.split("/seats/")[1]) });
     if (options.method === "POST" && url.endsWith("/instances")) return Promise.resolve({ instance_id: "fac_new7c20", recipe: "ship-feature@3" });
     if (options.method === "POST" && url.endsWith("/triage")) return Promise.resolve({ task_id: "t_triage1", status: "triage", board: "hermes-mobile" });
     if (options.method === "POST" && url.endsWith("/reroute")) return Promise.resolve({ activated: false, replacement: { instance_id: "fac_a91d2e7c" } });

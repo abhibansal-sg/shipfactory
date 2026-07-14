@@ -103,3 +103,17 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     # A ready build is not a human gate: both action endpoints fail cleanly.
     assert client.post("/api/plugins/factory/approve", json={"instance": "4d3d10d6", "step": "build"}).status_code == 400
     assert client.post("/api/plugins/factory/reject", json={"instance": "4d3d10d6", "step": "build", "reason": "no"}).status_code == 400
+
+
+def test_seat_endpoints_create_update_and_reject_missing_profile(hermetic_hermes_home: Path):
+    (hermetic_hermes_home / "profiles" / "builder").mkdir(parents=True)
+    client = _client()
+    assert client.get("/api/plugins/factory/profiles").json() == ["default", "builder"]
+    invalid = client.post("/api/plugins/factory/seats", json={"name": "bad", "profile": "missing", "executor": "codex", "model": "gpt", "role": "engineer"})
+    assert invalid.status_code == 400 and "does not exist" in invalid.json()["detail"]
+    created = client.post("/api/plugins/factory/seats", json={"name": "builder", "profile": "builder", "executor": "hermes", "model": "claude-sonnet-5", "role": "engineer", "provider_config": {"provider": "proxy", "base_url": "http://proxy", "model": "claude-sonnet-5"}})
+    assert created.status_code == 201 and created.json()["name"] == "builder"
+    updated = client.put("/api/plugins/factory/seats/builder", json={"max_concurrent": 2})
+    assert updated.status_code == 200 and updated.json()["max_concurrent"] == 2
+    detail = client.get("/api/plugins/factory/seats").json()[0]
+    assert detail["profile_model"] == "claude-sonnet-5" and detail["model_mismatch"] is False

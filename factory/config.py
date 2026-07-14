@@ -149,8 +149,10 @@ def validate(cfg) -> None:
             raise FactoryConfigError(f"seat {name!r}: profile {seat.profile!r} does not exist")
         if seat.executor not in EXECUTORS:
             raise FactoryConfigError(f"seat {name!r}: unknown executor {seat.executor!r}")
-        if seat.role not in AGENT_ROLES:
-            raise FactoryConfigError(f"seat {name!r}: unknown role {seat.role!r}")
+        # Roles are operator-defined job titles.  The dashboard suggests the
+        # common titles but does not turn the seat contract into a closed enum.
+        if not isinstance(seat.role, str) or not seat.role.strip():
+            raise FactoryConfigError(f"seat {name!r}: role is required")
         if not isinstance(seat.max_concurrent, int) or isinstance(seat.max_concurrent, bool) or seat.max_concurrent < 1:
             raise FactoryConfigError(f"seat {name!r}: max_concurrent must be a positive integer")
         if seat.reports_to and seat.reports_to not in cfg.seats:

@@ -55,6 +55,17 @@ class RerouteRecipe(BaseModel):
     parameters: dict[str, object] = Field(default_factory=dict)
 
 
+class SeatWrite(BaseModel):
+    name: str | None = None
+    profile: str | None = None
+    executor: str | None = None
+    model: str | None = None
+    reasoning: str | None = None
+    role: str | None = None
+    max_concurrent: int | None = Field(default=None, ge=1)
+    provider_config: dict[str, object] | None = None
+
+
 def _latest_steps(db: Any, instance_id: str | None = None) -> list[dict[str, Any]]:
     scope = "WHERE instance_id=?" if instance_id else ""
     where = "WHERE s.instance_id=?" if instance_id else ""
@@ -465,10 +476,39 @@ def waiting_gates() -> list[dict[str, Any]]:
 def seats() -> list[dict[str, Any]]:
     store.init_db()
     try:
-        from factory.config import load_seats
-        return [vars(seat) | {"paused": store.seat_paused(seat.name)} for seat in load_seats().seats.values()]
+        from factory.seats_admin import seat_details
+        return [seat | {"paused": store.seat_paused(seat["name"])} for seat in seat_details()]
     except (FileNotFoundError, OSError, ValueError):
         return []
+
+
+@router.get("/profiles")
+def profiles() -> list[str]:
+    from factory.seats_admin import list_profiles
+    return list_profiles()
+
+
+@router.post("/seats", status_code=201)
+def create_seat(seat: SeatWrite) -> dict[str, Any]:
+    """Create through the same writer used by ``hermes factory seat-create``."""
+    if None in (seat.name, seat.profile, seat.executor, seat.model, seat.role):
+        raise HTTPException(status_code=422, detail="name, profile, executor, model, and role are required")
+    try:
+        from factory.seats_admin import create_seat as create
+        return create(seat.name, seat.profile, seat.executor, seat.model, seat.reasoning or "", seat.role,
+                      seat.max_concurrent or 1, seat.provider_config)
+    except (ValueError, TypeError) as exc:
+        raise _request_error(exc) from exc
+
+
+@router.put("/seats/{name}")
+def update_seat(name: str, seat: SeatWrite) -> dict[str, Any]:
+    try:
+        from factory.seats_admin import update_seat as update
+        return update(name, seat.profile, seat.executor, seat.model, seat.reasoning, seat.role,
+                      seat.max_concurrent, seat.provider_config)
+    except (ValueError, TypeError) as exc:
+        raise _request_error(exc) from exc
 
 
 @router.get("/costs")
