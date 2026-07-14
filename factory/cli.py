@@ -138,12 +138,46 @@ def _org(_args: argparse.Namespace) -> str:
 def _daemon(args: argparse.Namespace) -> Any:
     from factory import daemon
     from hermes_cli import kanban_db
-    conn = kanban_db.connect(board=args.board)
-    try:
-        result = daemon.run(conn, board=args.board, interval=args.interval, once=args.once,
-                            sync=bool(args.sync_interval), sync_interval=args.sync_interval)
-    finally:
-        conn.close()
+    def argument_values(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        return list(value) if isinstance(value, (list, tuple)) else [value]
+
+    values = [
+        *argument_values(getattr(args, "board", None)),
+        *argument_values(getattr(args, "boards", None)),
+    ]
+    boards = list(dict.fromkeys(
+        board.strip()
+        for value in values
+        for board in str(value).split(",")
+        if board.strip()
+    ))
+    if len(boards) <= 1:
+        # Preserve the original connection ownership and result shape for the
+        # no-board and single --board forms.
+        board = boards[0] if boards else None
+        conn = kanban_db.connect(board=board)
+        try:
+            result = daemon.run(
+                conn,
+                board=board,
+                interval=args.interval,
+                once=args.once,
+                sync=bool(args.sync_interval),
+                sync_interval=args.sync_interval,
+            )
+        finally:
+            conn.close()
+    else:
+        result = daemon.run(
+            None,
+            boards=boards,
+            interval=args.interval,
+            once=args.once,
+            sync=bool(args.sync_interval),
+            sync_interval=args.sync_interval,
+        )
     return _emit(result)
 
 
@@ -320,7 +354,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _handler(verbs, "seat-list", "list seats with profile model resolution", _seat_list)
     _handler(verbs, "org", "print the reporting tree", _org)
     p = _handler(verbs, "daemon", "run dispatch and watchdog ticks", _daemon)
-    p.add_argument("--board"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float)
+    p.add_argument("--board", action="append"); p.add_argument("--boards", action="append"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float)
     p = _handler(verbs, "verdict", "record a policy-stage verdict", _verdict)
     p.add_argument("task"); p.add_argument("--stage", required=True); p.add_argument("--outcome", choices=("approve", "request_changes"), required=True); p.add_argument("--body", required=True); p.add_argument("--seat", required=True)
     p = _handler(verbs, "policy", "show or set task policy", _policy); subs = p.add_subparsers(dest="policy_command", required=True)
