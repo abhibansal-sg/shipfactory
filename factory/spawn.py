@@ -137,13 +137,19 @@ def factory_spawn(task, workspace: str, *, board=None) -> int | None:
 def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
     """Apply the strict final-line sentinel protocol to a completed harness."""
     lines = [line.strip() for line in log_text.splitlines() if line.strip()]
+    # Recipe review gates use the stronger structured verdict sentinel; the
+    # executor-discipline template ALSO demands a trailing FACTORY_RESULT, so
+    # disciplined review workers emit BOTH (verdict, then result). The verdict
+    # must win whenever present — storing the RESULT prose as task.result
+    # destroys the JSON the advancer's parse_verdict requires and fused every
+    # review gate as "review final line must be FACTORY_VERDICT JSON"
+    # (finding #25, t_10fdf585). Scan from the end so the latest verdict wins.
+    for line in reversed(lines):
+        if _VERDICT_RE.fullmatch(line):
+            return "done", line
     match = _RESULT_RE.match(lines[-1]) if lines else None
     if match:
         return match.group(1).lower(), match.group(2)
-    # Recipe review gates use the stronger structured verdict sentinel in
-    # place of FACTORY_RESULT.  The advancer validates the JSON and citation.
-    if lines and _VERDICT_RE.fullmatch(lines[-1]):
-        return "done", lines[-1]
     if exit_code == 0:
         return "blocked", "no result sentinel"
     return "blocked", f"harness exited with code {exit_code}"

@@ -113,6 +113,30 @@ def test_factory_result_parser_is_malformed_and_last_line_safe(log_text, result,
     assert spawn._parse_result(log_text, 0) == (result, summary)
 
 
+@pytest.mark.parametrize(
+    ("log_text", "result", "summary"),
+    [
+        # Verdict alone on the final line (the pre-#25 happy path).
+        ('FACTORY_VERDICT: {"outcome":"approve","body":"ok"}',
+         "done", 'FACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
+        # Finding #25: disciplined review workers emit BOTH sentinels —
+        # verdict first, FACTORY_RESULT last. The verdict must win or the
+        # advancer's parse_verdict fuses the review gate.
+        ('FACTORY_VERDICT: {"outcome":"approve","body":"ok"}\nFACTORY_RESULT: done review complete',
+         "done", 'FACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
+        # Two verdicts: the LATEST wins (retry-within-run semantics).
+        ('FACTORY_VERDICT: {"outcome":"approve","body":"old"}\nFACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}\nFACTORY_RESULT: done wrapped up',
+         "done", 'FACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}'),
+        # A verdict buried mid-log still wins over trailing prose.
+        ('FACTORY_VERDICT: {"outcome":"approve","body":"ok"}\ntrailing chatter',
+         "done", 'FACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
+    ],
+)
+def test_verdict_sentinel_beats_factory_result(log_text, result, summary):
+    """FACTORY_VERDICT anywhere in the log outranks the final-line RESULT."""
+    assert spawn._parse_result(log_text, 0) == (result, summary)
+
+
 def test_store_concurrent_writers_use_wal_and_do_not_leak_locked_errors(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     store.init_db()
