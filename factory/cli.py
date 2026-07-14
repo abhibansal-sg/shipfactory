@@ -88,6 +88,36 @@ def _seats(_args: argparse.Namespace) -> list[dict[str, Any]]:
     return _emit(rows)
 
 
+def _seat_create(args: argparse.Namespace) -> dict[str, Any]:
+    from factory.seats_admin import create_seat
+    return _emit(create_seat(
+        args.name, args.profile, args.executor, args.model, args.reasoning,
+        args.role, args.max_concurrent, _provider_config_from_args(args),
+    ))
+
+
+def _seat_update(args: argparse.Namespace) -> dict[str, Any]:
+    from factory.seats_admin import update_seat
+    return _emit(update_seat(
+        args.name, args.profile, args.executor, args.model, args.reasoning,
+        args.role, args.max_concurrent, _provider_config_from_args(args),
+    ))
+
+
+def _seat_list(_args: argparse.Namespace) -> list[dict[str, Any]]:
+    from factory.seats_admin import seat_details
+    return _emit(seat_details())
+
+
+def _provider_config_from_args(args: argparse.Namespace) -> dict[str, Any] | None:
+    supplied = [getattr(args, field, None) for field in ("provider", "base_url", "provider_model")]
+    if not any(value is not None for value in supplied):
+        return None
+    if not all(value is not None for value in supplied):
+        raise ValueError("--provider, --base-url, and --provider-model must be supplied together")
+    return {"provider": args.provider, "base_url": args.base_url, "model": args.provider_model}
+
+
 def _org(_args: argparse.Namespace) -> str:
     from factory.config import load_seats
     cfg = load_seats()
@@ -283,6 +313,11 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     verbs = parser.add_subparsers(dest="factory_verb", required=True)
     p = _handler(verbs, "init", "initialize Factory state", _init); p.add_argument("--force", action="store_true")
     _handler(verbs, "seats", "list configured seats", _seats)
+    p = _handler(verbs, "seat-create", "create a Factory employment contract", _seat_create)
+    p.add_argument("name"); p.add_argument("--profile", required=True); p.add_argument("--executor", required=True, choices=("hermes", "codex", "claude")); p.add_argument("--model", required=True); p.add_argument("--reasoning", default="medium"); p.add_argument("--role", required=True); p.add_argument("--max-concurrent", type=int, default=1); p.add_argument("--provider"); p.add_argument("--base-url"); p.add_argument("--provider-model")
+    p = _handler(verbs, "seat-update", "update a Factory employment contract", _seat_update)
+    p.add_argument("name"); p.add_argument("--profile"); p.add_argument("--executor", choices=("hermes", "codex", "claude")); p.add_argument("--model"); p.add_argument("--reasoning"); p.add_argument("--role"); p.add_argument("--max-concurrent", type=int); p.add_argument("--provider"); p.add_argument("--base-url"); p.add_argument("--provider-model")
+    _handler(verbs, "seat-list", "list seats with profile model resolution", _seat_list)
     _handler(verbs, "org", "print the reporting tree", _org)
     p = _handler(verbs, "daemon", "run dispatch and watchdog ticks", _daemon)
     p.add_argument("--board"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float)

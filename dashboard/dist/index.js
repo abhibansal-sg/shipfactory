@@ -781,13 +781,75 @@
     );
   }
 
+  function SeatDialog(props) {
+    var empty = { name: "", profile: "default", executor: "hermes", model: "", reasoning: "medium", role: "engineer", max_concurrent: 1, provider: "", base_url: "", provider_model: "" };
+    var _a = useState(empty), values = _a[0], setValues = _a[1];
+    var _b = useState(""), error = _b[0], setError = _b[1];
+    var _c = useState(false), busy = _c[0], setBusy = _c[1];
+    useEffect(function () {
+      if (!props.open) return;
+      var seat = props.seat || {};
+      var template = seat.provider_config || props.providerTemplate || {};
+      setValues({
+        name: seat.name || "", profile: seat.profile || ((props.profiles || [])[0] || "default"),
+        executor: seat.executor || "hermes", model: seat.model || template.model || "",
+        reasoning: seat.reasoning || "medium", role: seat.role || "engineer",
+        max_concurrent: seat.max_concurrent || 1, provider: template.provider || "",
+        base_url: template.base_url || "", provider_model: template.model || seat.model || "",
+      });
+      setError("");
+    }, [props.open, props.seat && props.seat.name, (props.profiles || []).join("|"), props.providerTemplate && props.providerTemplate.model]);
+    function set(field, value) { setValues(function (current) { var next = Object.assign({}, current); next[field] = value; return next; }); }
+    function submit(event) {
+      event.preventDefault(); setBusy(true); setError("");
+      var payload = { name: values.name, profile: values.profile, executor: values.executor, model: values.model, reasoning: values.reasoning, role: values.role, max_concurrent: Number(values.max_concurrent) };
+      if (values.executor === "hermes") payload.provider_config = { provider: values.provider, base_url: values.base_url, model: values.provider_model || values.model };
+      var path = props.seat ? "/seats/" + encodeURIComponent(props.seat.name) : "/seats";
+      request(path, { method: props.seat ? "PUT" : "POST", body: JSON.stringify(payload) })
+        .then(props.onSaved).catch(function (err) { setError(errorText(err)); }).finally(function () { setBusy(false); });
+    }
+    var profileOptions = (props.profiles || []).length ? props.profiles : ["default"];
+    return h(DialogFrame, { open: props.open, busy: busy, onClose: props.onClose, labelledBy: "seat-contract-title", title: props.seat ? "Edit seat" : "Create seat", description: "A seat is an employment contract: profile, model, reasoning, role, and capacity." },
+      h("form", { className: "grid gap-4", onSubmit: submit },
+        error ? h("div", { className: "border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive", role: "alert" }, error) : null,
+        h("div", { className: "grid gap-4 sm:grid-cols-2" },
+          h(FieldLabel, { htmlFor: "seat-name", required: true, control: h("input", { id: "seat-name", className: FIELD_CLASS, required: true, disabled: !!props.seat, value: values.name, onChange: function (event) { set("name", event.target.value); } }) }, "Seat name"),
+          h(FieldLabel, { htmlFor: "seat-profile", required: true, control: h("select", { id: "seat-profile", className: FIELD_CLASS, required: true, value: values.profile, onChange: function (event) { set("profile", event.target.value); } }, profileOptions.map(function (profile) { return h("option", { key: profile, value: profile }, profile); })) }, "Profile · labor pool"),
+          h(FieldLabel, { htmlFor: "seat-executor", required: true, control: h("select", { id: "seat-executor", className: FIELD_CLASS, value: values.executor, onChange: function (event) { set("executor", event.target.value); } }, ["hermes", "codex", "claude"].map(function (executor) { return h("option", { key: executor, value: executor }, executor); })) }, "Executor"),
+          h(FieldLabel, { htmlFor: "seat-model", required: true, control: h("input", { id: "seat-model", className: FIELD_CLASS, required: true, value: values.model, onChange: function (event) { set("model", event.target.value); } }) }, "Seat model")
+        ),
+        values.executor === "hermes" ? h("fieldset", { className: "grid gap-3 border border-border p-3" },
+          h("legend", { className: "px-1 text-xs text-text-secondary" }, "Provider lane · required to prevent finding #12 default-model inheritance"),
+          h("div", { className: "grid gap-3 sm:grid-cols-3" },
+            h(FieldLabel, { htmlFor: "seat-provider", required: true, control: h("input", { id: "seat-provider", className: FIELD_CLASS, required: true, value: values.provider, onChange: function (event) { set("provider", event.target.value); }, placeholder: "hermes-anthropic-proxy" }) }, "Provider name"),
+            h(FieldLabel, { htmlFor: "seat-base-url", required: true, control: h("input", { id: "seat-base-url", className: FIELD_CLASS, required: true, value: values.base_url, onChange: function (event) { set("base_url", event.target.value); }, placeholder: "http://127.0.0.1:18808" }) }, "Base URL"),
+            h(FieldLabel, { htmlFor: "seat-provider-model", required: true, control: h("input", { id: "seat-provider-model", className: FIELD_CLASS, required: true, value: values.provider_model, onChange: function (event) { set("provider_model", event.target.value); set("model", event.target.value); } }) }, "Provider model")
+          )
+        ) : null,
+        h("div", { className: "grid gap-4 sm:grid-cols-3" },
+          h(FieldLabel, { htmlFor: "seat-reasoning", required: true, control: h("select", { id: "seat-reasoning", className: FIELD_CLASS, value: values.reasoning, onChange: function (event) { set("reasoning", event.target.value); } }, ["low", "medium", "high"].map(function (reasoning) { return h("option", { key: reasoning, value: reasoning }, reasoning); })) }, "Reasoning"),
+          h(FieldLabel, { htmlFor: "seat-role", required: true, control: h("input", { id: "seat-role", className: FIELD_CLASS, required: true, list: "seat-role-suggestions", value: values.role, onChange: function (event) { set("role", event.target.value); } }) }, "Role"),
+          h(FieldLabel, { htmlFor: "seat-concurrency", required: true, control: h("input", { id: "seat-concurrency", className: FIELD_CLASS, required: true, min: 1, type: "number", value: values.max_concurrent, onChange: function (event) { set("max_concurrent", event.target.value); } }) }, "Max concurrent")
+        ),
+        h("datalist", { id: "seat-role-suggestions" }, ["engineer", "qa", "designer"].map(function (role) { return h("option", { key: role, value: role }); })),
+        h("div", { className: "flex justify-end gap-2 border-t border-border pt-4" },
+          h(Button, { type: "button", size: "sm", ghost: true, disabled: busy, onClick: props.onClose }, "Cancel"),
+          h(Button, { type: "submit", size: "sm", disabled: busy }, busy ? h(Spinner, { label: "Saving" }) : props.seat ? "Save seat" : "Create seat")
+        )
+      )
+    );
+  }
+
   function SeatCard(props) {
     var seat = props.seat;
     return h(Card, { className: "factory-seat-card" },
       h(CardContent, { className: "flex flex-col gap-3 p-4" },
         h("div", { className: "flex items-start justify-between gap-3" },
           h("div", null, h("span", { className: "font-mondwest text-display text-xs tracking-[0.12em] text-text-tertiary" }, seat.role || "operator"), h("h3", { className: "mt-1 font-mondwest normal-case text-sm font-medium text-foreground" }, seat.name)),
-          h(StatePill, { value: seat.paused ? "paused" : "ready" }, seat.paused ? "paused" : "active")
+          h("div", { className: "flex items-center gap-2" },
+            seat.model_mismatch ? h(Badge, { className: "factory-pill text-xs", tone: "destructive", title: "seats.yaml model and profile config model disagree" }, "MISMATCH") : null,
+            h(StatePill, { value: seat.paused ? "paused" : "ready" }, seat.paused ? "paused" : "active")
+          )
         ),
         h("div", { className: "flex flex-wrap items-center gap-2" },
           h(MonoChip, { title: "Executor" }, seat.executor || "default executor"),
@@ -796,24 +858,32 @@
         ),
         h("dl", { className: "grid gap-2 text-xs" },
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Profile"), h("dd", { className: "font-mono-ui text-right text-foreground" }, seat.profile || "—")),
+          h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Profile model"), h("dd", { className: "font-mono-ui text-right text-foreground" }, seat.profile_model || "not explicit")),
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Reports to"), h("dd", { className: "text-right text-foreground" }, seat.reports_to || "—")),
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Concurrency"), h("dd", { className: "font-mono-ui text-right text-foreground" }, formatNumber(seat.max_concurrent)))
-        )
+        ),
+        h("div", { className: "flex justify-end border-t border-border pt-3" }, h(Button, { type: "button", size: "sm", ghost: true, onClick: function () { props.onEdit(seat); } }, "Edit seat"))
       )
     );
   }
 
   function SeatsView(props) {
     var resource = usePollingResource("/seats", props.refreshKey);
+    var profiles = usePollingResource("/profiles", props.refreshKey);
+    var _a = useState(null), editing = _a[0], setEditing = _a[1];
+    var _b = useState(null), toast = _b[0], setToast = _b[1];
     var seats = resource.data || [];
+    var template = seats.map(function (seat) { return seat.provider_config; }).find(function (config) { return config && config.provider && config.base_url && config.model; }) || null;
     useReportViewMeta(props, resource, []);
     return h("section", { className: "factory-view flex min-w-0 flex-col gap-4" },
-      h(ViewHeading, { title: "Seats", description: "Configured Factory operators, execution profiles, and pause state." }),
+      h(ViewHeading, { title: "Seats", description: "Who is hired: profile, model, reasoning, role, and capacity.", action: h(Button, { size: "sm", onClick: function () { setEditing({}); } }, "Create seat") }),
+      h(Toast, { toast: toast, onClose: function () { setToast(null); } }),
       resource.error && resource.data !== null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) : null,
       resource.loading && resource.data === null ? h(LoadingState, { label: "Loading seats…" }) :
       resource.error && resource.data === null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) :
-      seats.length === 0 ? h(EmptyState, { title: "No seats configured", description: "Add operators to the Factory seats configuration to populate this view." }) :
-      h("div", { className: "factory-card-grid" }, seats.map(function (seat) { return h(SeatCard, { key: seat.name, seat: seat }); }))
+      seats.length === 0 ? h(EmptyState, { title: "No seats configured", description: "Hire the first operator by creating a seat contract." }) :
+      h("div", { className: "factory-card-grid" }, seats.map(function (seat) { return h(SeatCard, { key: seat.name, seat: seat, onEdit: setEditing }); })),
+      h(SeatDialog, { open: editing !== null, seat: editing && editing.name ? editing : null, profiles: profiles.data || [], providerTemplate: template, onClose: function () { setEditing(null); }, onSaved: function (result) { setEditing(null); setToast({ ok: true, text: "Saved seat " + result.name + "." }); resource.reload().catch(function () {}); profiles.reload().catch(function () {}); } })
     );
   }
 
