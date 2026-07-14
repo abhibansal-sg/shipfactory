@@ -15,6 +15,7 @@ from .instantiate import task_key
 from .primitives import activate, parse_verdict
 
 TERMINAL = {"done", "skipped", "cancelled", "failed"}
+KANBAN_TERMINAL = {"done", "archived", "failed", "cancelled"}
 
 _FINDING_COUNT = re.compile(r"(?im)^\s*(?:finding_count|findings)\s*[:=]\s*(\d+)\s*$")
 _FINDING_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:BLOCKER|WARNING)\b")
@@ -144,12 +145,102 @@ def _result_one_liner(value: str | None) -> str | None:
         return line.strip("* ")[:240]
     return None
 
+
+def _bind_text(value: str, parameters: dict[str, Any]) -> str:
+    for name, item in parameters.items():
+        value = value.replace("${" + name + "}", "" if item is None else str(item))
+    return value
+
+def _evidence_text(value: Any, limit: int = 1000) -> str | None:
+    if value in (None, "", {}, []):
+        return None
+    if not isinstance(value, str):
+        value = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return " ".join(value.split())[:limit] or None
+
+
+def _commit_hash(*values: Any) -> str | None:
+    def explicit(value: Any) -> str | None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if "commit" in str(key).lower() and isinstance(item, str):
+                    match = re.search(r"\b[0-9a-fA-F]{7,40}\b", item)
+                    if match:
+                        return match.group(0)
+            for item in value.values():
+                found = explicit(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = explicit(item)
+                if found:
+                    return found
+        return None
+    for value in values:
+        found = explicit(value)
+        if found:
+            return found
+    for value in values:
+        text = _evidence_text(value) or ""
+        match = re.search(r"(?i)\b(?:commit|revision|sha)\s*[:#@=]?\s*([0-9a-f]{7,40})\b", text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _test_counts(*values: Any) -> list[str]:
+    found: list[str] = []
+    labels = {"passed", "failed", "skipped", "xfailed", "xpassed", "error", "errors"}
+
+    def add(item: str) -> None:
+        if item not in found:
+            found.append(item)
+
+    def structured(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                label = str(key).lower().replace("tests_", "").replace("test_", "")
+                if label in labels and isinstance(item, int) and not isinstance(item, bool):
+                    add(f"{item} {label}")
+                else:
+                    structured(item)
+        elif isinstance(value, list):
+            for item in value:
+                structured(item)
+
+    for value in values:
+        structured(value)
+        text = _evidence_text(value, limit=5000) or ""
+        for count, label in re.findall(
+            r"(?i)\b(\d+)\s+(passed|failed|skipped|xfailed|xpassed|errors?)\b", text
+        ):
+            add(f"{count} {label.lower()}")
+    return found
+
+
+def _verdict_text(result: str | None, metadata: Any) -> str | None:
+    if isinstance(metadata, dict):
+        for key in ("verdict", "outcome", "body"):
+            if key in metadata and _evidence_text(metadata[key]):
+                return _evidence_text(metadata[key])
+    lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
+    if lines and lines[-1].startswith("FACTORY_VERDICT:"):
+        try:
+            payload = json.loads(lines[-1].split(":", 1)[1].strip())
+        except (ValueError, json.JSONDecodeError):
+            return _evidence_text(lines[-1])
+        return _evidence_text(payload.get("body") or payload.get("outcome"))
+    return _evidence_text(result)
+
+
 def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str, Any],
                  definition: dict[str, Any], task_id: str) -> None:
-    """Attach one ephemeral continue-here comment to a newly parked gate."""
+    """Refresh one parked gate with its task-run evidence case file."""
     from hermes_cli import kanban_db
     if conn.execute(
-        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'CONTINUE-HERE%' LIMIT 1",
+        "SELECT 1 FROM task_comments WHERE task_id=? "
+        "AND body LIKE 'CONTINUE-HERE%Evidence-Bundle: v2%' LIMIT 1",
         (task_id,),
     ).fetchone():
         return
@@ -162,7 +253,7 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
                 collect(parent)
     collect(definition["id"])
     summaries: list[str] = []
-    for upstream_id in sorted(ancestors):
+    for upstream_id in [item["id"] for item in recipe["steps"] if item["id"] in ancestors]:
         row = db.execute(
             "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND state='done' "
             "ORDER BY activation DESC LIMIT 1",
@@ -170,9 +261,32 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
         ).fetchone()
         if row and row["kanban_task_id"]:
             task = kanban_db.get_task(conn, row["kanban_task_id"])
-            one_liner = _result_one_liner(task.result if task else None)
-            if one_liner:
-                summaries.append(f"- {upstream_id}: {one_liner}")
+            run = conn.execute(
+                "SELECT summary,metadata FROM task_runs WHERE task_id=? "
+                "ORDER BY COALESCE(ended_at,started_at) DESC,id DESC LIMIT 1",
+                (row["kanban_task_id"],),
+            ).fetchone()
+            summary = run["summary"] if run else None
+            try:
+                metadata = json.loads(run["metadata"]) if run and run["metadata"] else None
+            except (TypeError, json.JSONDecodeError):
+                metadata = run["metadata"] if run else None
+            result = task.result if task else None
+            one_liner = _result_one_liner(summary) or _result_one_liner(result)
+            summaries.append(f"- {upstream_id}: {one_liner or 'completed; no prose summary'}")
+            commit = _commit_hash(metadata, summary, result)
+            if commit:
+                summaries.append(f"  Commit: {commit}")
+            tests = _test_counts(metadata, summary, result)
+            if tests:
+                summaries.append(f"  Tests: {', '.join(tests)}")
+            if defs[upstream_id]["primitive"] == "review_gate":
+                verdict = _verdict_text(result, metadata)
+                if verdict:
+                    summaries.append(f"  Verdict: {verdict}")
+            metadata_text = _evidence_text(metadata)
+            if metadata_text:
+                summaries.append(f"  Run metadata: {metadata_text}")
     children = sorted(item["id"] for item in recipe["steps"] if definition["id"] in item["needs"])
     unblocks = ", ".join(children) if children else "recipe completion"
     if definition["primitive"] == "approval_gate":
@@ -181,8 +295,13 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
     else:
         awaited = f"Event required: {definition['params']['event']}. This unblocks {unblocks}."
         next_action = f"Emit the matching {definition['params']['event']} event for instance {instance['id']} step {definition['id']}."
+    latest = {item["step_id"]: item for item in _latest(db, instance["id"])}
+    chain = " -> ".join(
+        f"{item['id']} ({latest[item['id']]['state']})" for item in recipe["steps"]
+    )
     body = "\n".join([
         "CONTINUE-HERE",
+        "Evidence-Bundle: v2",
         f"Instance: {instance['id']}",
         f"Step: {definition['id']}",
         "Status: blocked / needs_input",
@@ -193,6 +312,12 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
         "",
         "## Done",
         *(summaries or ["- No completed upstream summary was available."]),
+        "",
+        "## Step Chain",
+        chain,
+        "",
+        "## Budget",
+        f"Tokens charged: {instance['tokens_charged']} / {recipe['budgets']['max_tokens']}",
         "",
         "## Left",
         f"- Resume {unblocks} after this gate is consumed.",
@@ -206,6 +331,15 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
         "## Next Action",
         next_action,
     ])
+    task = kanban_db.get_task(conn, task_id)
+    task_body = task.body if task else definition["params"].get("instructions", "")
+    marker = "\n\n---\n\nCONTINUE-HERE\nEvidence-Bundle: v2"
+    task_body = task_body.split(marker, 1)[0]
+    with kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET body=? WHERE id=?",
+            (f"{task_body.rstrip()}\n\n---\n\n{body}", task_id),
+        )
     kanban_db.add_comment(conn, task_id, "factory", body)
 
 def _consume_resume_note(conn: Any, task_id: str | None) -> None:
@@ -254,6 +388,38 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
         activation = int(current["activation"]) + 1
         db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance["id"], node, activation, defs[node]["primitive"], "pending", now, now))
 
+
+def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, Any],
+                      step: dict[str, Any], source: str) -> bool:
+    """Insert one clean activation after a missing/mismatched board task."""
+    key = advance_key(
+        instance["id"], instance["recipe_hash"], step["step_id"],
+        step["activation"], "reactivate", source,
+    )
+    if db.execute(
+        "SELECT 1 FROM advance_events WHERE key=? AND state='applied'", (key,)
+    ).fetchone():
+        return False
+    db.execute(
+        "INSERT OR IGNORE INTO advance_events"
+        "(key,instance_id,source,payload_json,state,created_at) VALUES(?,?,?,?, 'pending',?)",
+        (key, instance["id"], source, "{}", store._now()),
+    )
+    activation = int(step["activation"]) + 1
+    now = store._now()
+    db.execute(
+        "INSERT OR IGNORE INTO recipe_steps"
+        "(instance_id,step_id,activation,primitive,state,created_at,updated_at) "
+        "VALUES(?,?,?,?, 'pending',?,?)",
+        (instance["id"], step["step_id"], activation, definition["primitive"], now, now),
+    )
+    inserted = bool(db.execute("SELECT changes()").fetchone()[0])
+    db.execute(
+        "UPDATE advance_events SET state='applied',applied_at=? WHERE key=?",
+        (store._now(), key),
+    )
+    return inserted
+
 def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Idempotently reconcile every nonterminal activation with kanban/outbox."""
     from hermes_cli import kanban_db
@@ -289,10 +455,18 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     elif row and row["state"] == "failed":
                         changed |= _transition(db, instance, dict(step), "blocked", f"outbox:{okey[-12:]}", reason="notify_delivery_failed")
                     continue
-                if step["state"] not in {"running", "waiting"} or not step["kanban_task_id"]:
+                if step["state"] not in {"pending", "ready", "running", "waiting", "blocked"} or not step["kanban_task_id"]:
                     continue
+                definition = defs[step["step_id"]]
+                if step["state"] == "waiting" and step["primitive"] in {"approval_gate", "wait_for_event"}:
+                    _resume_note(db, conn, instance, recipe, definition, step["kanban_task_id"])
                 task = kanban_db.get_task(conn, step["kanban_task_id"])
-                if task and task.status == "done":
+                if task is None:
+                    changed |= _fresh_activation(
+                        db, instance, definition, step,
+                        f"kanban:missing:{step['kanban_task_id']}",
+                    )
+                elif task.status == "done":
                     if step["primitive"] == "review_gate":
                         try:
                             verdict = parse_verdict(task.result or "")
@@ -322,8 +496,13 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     if step["primitive"] in {"approval_gate", "wait_for_event"}:
                         _consume_resume_note(conn, step["kanban_task_id"])
                     changed |= _transition(db, instance, step, "done", f"kanban:{task.id}")
-                elif task and task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}:
+                elif task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}:
                     changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="worker_blocked")
+                elif task.status in KANBAN_TERMINAL:
+                    changed |= _fresh_activation(
+                        db, instance, definition, step,
+                        f"kanban:{task.id}:{task.status}",
+                    )
 
             latest = {x["step_id"]: x for x in _latest(db, instance_id)}
             for step_id, step in list(latest.items()):
@@ -344,7 +523,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 definition = defs[sid]; primitive = definition["primitive"]
                 instance = _instance(db, instance_id)
                 if primitive in {"agent_task", "review_gate"}:
-                    profile = profiles.get(definition["params"]["execution_profile"])
+                    profile = profiles.get(_bind_text(definition["params"]["execution_profile"], params))
                     if not profile:
                         changed |= _transition(db, instance, step, "failed", "profile", reason="missing execution profile")
                         continue
@@ -356,9 +535,9 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
                 task = activate(conn, instance, recipe, definition, step, params, parents, db=db)
                 state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
+                changed |= _transition(db, instance, step, state, "activate", task=task)
                 if primitive in {"approval_gate", "wait_for_event"} and task:
                     _resume_note(db, conn, instance, recipe, definition, task)
-                changed |= _transition(db, instance, step, state, "activate", task=task)
 
             instance = _instance(db, instance_id)
             status = _summary(db, instance)
@@ -438,7 +617,8 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
         {"step_id": step_id, "reason": str(reason).strip()},
     )
 
-def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None) -> int:
+def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None,
+                 board: str | None = None) -> int:
     """Claim queued events, apply only matching waits, then reconcile all instances."""
     from hermes_cli import kanban_db
     count = 0
@@ -489,12 +669,20 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                         (store._now(), instance["id"]),
                     )
             db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); count += 1
-        ids = [r[0] for r in db.execute("SELECT id FROM recipe_instances WHERE status NOT IN ('done','failed','cancelled')").fetchall()]; db.commit()
+        query = (
+            "SELECT id FROM recipe_instances WHERE status IN "
+            "('running','waiting_gate','waiting_event','blocked','cancelling')"
+        )
+        args: tuple[Any, ...] = ()
+        if board is not None:
+            query += " AND board=?"
+            args = (board,)
+        ids = [r[0] for r in db.execute(query, args).fetchall()]; db.commit()
     for ident in ids: reconcile(conn, ident, profiles=profiles)
     return count
 
 def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, Any]:
-    """Fence, terminate processes, then atomically archive internal tasks keeping collector blocked."""
+    """Validate, fence, then atomically archive internal tasks keeping collector blocked."""
     from hermes_cli import kanban_db
     with store._connect() as db:
         instance = _instance(db, instance_id)
@@ -502,14 +690,37 @@ def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, A
         steps = _latest(db, instance_id); task_ids = [x["kanban_task_id"] for x in steps if x["kanban_task_id"]]
         report = {"instance_id": instance_id, "workers": [], "nonterminal_steps": [x["step_id"] for x in steps if x["state"] not in TERMINAL], "suppressed": task_ids, "collector": instance["collector_task_id"]}
         if dry_run: return report
-        db.execute("UPDATE recipe_instances SET status='cancelling',updated_at=? WHERE id=?", (store._now(), instance_id)); db.commit()
+        prior_status = instance["status"]
+    selected = task_ids + [instance["collector_task_id"]]
+    placeholders = ",".join("?" for _ in selected)
+    rows = conn.execute(
+        f"SELECT id FROM tasks WHERE id IN ({placeholders})", selected,
+    ).fetchall()
+    present = {row["id"] for row in rows}
+    missing = [task_id for task_id in selected if task_id not in present]
+    if missing:
+        refused = f"unknown task id(s): {', '.join(missing)}"
+        return {**report, "status": prior_status, "refused": refused}
+    # Re-read and fence in one Factory transaction after every validation that
+    # can reject the command. A later live-worker refusal is cancellation
+    # progress and intentionally leaves this fence in place.
+    with store._connect() as db:
+        current = _instance(db, instance_id)
+        current_steps = _latest(db, instance_id)
+        current_ids = [x["kanban_task_id"] for x in current_steps if x["kanban_task_id"]]
+        if not current or current["collector_task_id"] != instance["collector_task_id"] or current_ids != task_ids:
+            return {**report, "status": prior_status, "refused": "recipe instance changed during cancel validation"}
+        db.execute(
+            "UPDATE recipe_instances SET status='cancelling',updated_at=? WHERE id=?",
+            (store._now(), instance_id),
+        )
     # Factory-owned workers have their own process group and can be signalled by reap records.
     from factory.spawn import _RUNNING
     for record in list(_RUNNING.values()):
         if record["task_id"] in task_ids:
             try: os.killpg(record["proc"].pid, 15)
             except ProcessLookupError: pass
-    result = kanban_db.cancel_subtree(conn, task_ids + [instance["collector_task_id"]], keep_blocked=[instance["collector_task_id"]])
+    result = kanban_db.cancel_subtree(conn, selected, keep_blocked=[instance["collector_task_id"]])
     if result.get("refused"): return {**report, "status": "cancelling", "refused": result["refused"]}
     with store._connect() as db:
         db.execute("UPDATE recipe_steps SET state='cancelled',updated_at=? WHERE instance_id=? AND state NOT IN ('done','skipped','failed')", (store._now(), instance_id)); db.execute("UPDATE recipe_instances SET status='cancelled',blocked_reason='recipe_cancelled',updated_at=? WHERE id=?", (store._now(), instance_id))

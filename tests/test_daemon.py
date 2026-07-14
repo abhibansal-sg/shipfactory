@@ -54,7 +54,7 @@ def test_tick_runs_selector_after_advancer_stages(monkeypatch):
     config.selector_config = lambda recipes: {"enabled": True}
     advancer = types.ModuleType("factory.recipes.advancer")
     advancer.startup_guard = lambda config: calls.append("guard")
-    advancer.apply_events = lambda conn, profiles: calls.append("events") or 1
+    advancer.apply_events = lambda conn, profiles, board=None: calls.append("events") or 1
     advancer.deliver_outbox = lambda: calls.append("outbox") or 2
     advancer.reconcile_root_collectors = lambda conn: calls.append("roots") or 3
     selector = types.ModuleType("factory.recipes.selector_stage")

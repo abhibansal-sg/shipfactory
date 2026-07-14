@@ -3,8 +3,45 @@
 from __future__ import annotations
 
 import os
+import logging
 import time
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+
+# Low-cadence board-database maintenance. Tests may lower the cadence without
+# changing the public daemon interface.
+_DB_HEALTH_EVERY_TICKS = 60
+_db_health_tick = 0
+
+
+def _board_db_health_pass(conn, board: str | None) -> None:
+    """Best-effort WAL checkpoint and integrity probe for the live board."""
+    global _db_health_tick
+    _db_health_tick += 1
+    if _db_health_tick % _DB_HEALTH_EVERY_TICKS:
+        return
+    try:
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and int(checkpoint[0] or 0):
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+        failures = [str(row[0]) for row in rows if str(row[0]).lower() != "ok"]
+        if failures:
+            raise RuntimeError("PRAGMA quick_check: " + "; ".join(failures[:10]))
+    except Exception as exc:
+        logger.critical("Factory board database health pass failed for %s: %s", board, exc, exc_info=True)
+        try:
+            from factory.telemetry import append_jsonl
+            append_jsonl({
+                "event": "database_health_failure",
+                "at": time.time(),
+                "board": board,
+                "error": str(exc),
+            })
+        except Exception:
+            logger.exception("Factory could not emit database-health telemetry")
 
 
 def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any]:
@@ -23,7 +60,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
             from factory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
             startup_guard(cfg)
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
-            result_recipes = {"events": apply_events(conn, profiles=recipes_cfg["execution_profiles"]), "outbox": deliver_outbox(), "root_collectors": reconcile_root_collectors(conn)}
+            result_recipes = {"events": apply_events(conn, profiles=recipes_cfg["execution_profiles"], board=board or cfg.company), "outbox": deliver_outbox(), "root_collectors": reconcile_root_collectors(conn)}
             from factory.config import selector_config
             if selector_config(recipes_cfg)["enabled"]:
                 from factory.recipes.selector_stage import run_stage
@@ -36,6 +73,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
         result_recipes = None
     dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board, **dispatch_kwargs)
     reaped = reap_finished()
+    _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
     if result_recipes is not None:
         result["recipes"] = result_recipes
