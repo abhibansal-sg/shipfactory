@@ -4,9 +4,9 @@ description: "Production teams, hierarchy, policy gates, watchdogs, and cost tel
 author: Hermes Factory
 kind: general
 provides_tools:
-  - headframe_verdict
-  - headframe_costs
-  - headframe_monitor_add
+  - shipfactory_verdict
+  - shipfactory_costs
+  - shipfactory_monitor_add
 hooks:
   - kanban_task_claimed
   - kanban_task_completed

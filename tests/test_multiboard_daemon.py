@@ -7,9 +7,9 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
-from headframe import cli, daemon, store
-from headframe.recipes.instantiate import instantiate
-from headframe.recipes.loader import load_library
+from shipfactory import cli, daemon, store
+from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.loader import load_library
 
 
 PROFILES = {
@@ -24,7 +24,7 @@ PROFILES = {
 def _recipe(path: Path):
     path.mkdir()
     (path / "multiboard@1.yaml").write_text(
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: multiboard
 version: 1
 status: active
@@ -55,9 +55,9 @@ def _step_state(instance_id: str) -> str:
 
 
 def _configure_tick(monkeypatch) -> None:
-    from headframe import config as factory_config
-    from headframe import watchdog
-    from headframe.recipes import advancer
+    from shipfactory import config as factory_config
+    from shipfactory import watchdog
+    from shipfactory.recipes import advancer
     from hermes_cli import kanban_db
 
     cfg = SimpleNamespace(
@@ -72,7 +72,7 @@ def _configure_tick(monkeypatch) -> None:
     monkeypatch.setattr(factory_config, "load_seats", lambda: cfg)
     monkeypatch.setattr(advancer, "startup_guard", lambda config: None)
     monkeypatch.setattr(kanban_db, "dispatch_once", lambda *args, **kwargs: 0)
-    monkeypatch.setattr("headframe.spawn.reap_finished", lambda: [])
+    monkeypatch.setattr("shipfactory.spawn.reap_finished", lambda: [])
     monkeypatch.setattr(watchdog, "tick", lambda *args, **kwargs: None)
 
 
@@ -132,7 +132,7 @@ def test_poisoned_board_is_telemetry_logged_while_other_board_advances(
     )
     _configure_tick(monkeypatch)
     telemetry = []
-    monkeypatch.setattr("headframe.telemetry.append_jsonl", telemetry.append)
+    monkeypatch.setattr("shipfactory.telemetry.append_jsonl", telemetry.append)
 
     class PoisonedConnection:
         def execute(self, *_args, **_kwargs):

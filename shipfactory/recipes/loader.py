@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from headframe import store
+from shipfactory import store
 
 _ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _TOP = {"schema", "id", "version", "status", "description", "intent_tags", "supersedes", "parameters", "budgets", "steps"}
@@ -88,8 +88,8 @@ def _render(value: Any, parameters: dict[str, Any]) -> Any:
 def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str] | None = None) -> dict[str, Any]:
     """Validate exactly the v1 schema; no repair or permissive coercion occurs."""
     if not isinstance(document, dict) or set(document) != _TOP:
-        _error("recipe top-level keys must exactly match headframe.recipe/v1")
-    if document["schema"] != "headframe.recipe/v1": _error("unsupported recipe schema")
+        _error("recipe top-level keys must exactly match shipfactory.recipe/v1")
+    if document["schema"] != "shipfactory.recipe/v1": _error("unsupported recipe schema")
     if not isinstance(document["id"], str) or not _ID.fullmatch(document["id"]): _error("invalid recipe id")
     if not isinstance(document["version"], int) or isinstance(document["version"], bool) or document["version"] < 1: _error("version must be positive integer")
     if document["status"] not in {"active", "deprecated"}: _error("invalid recipe status")

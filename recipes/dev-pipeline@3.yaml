@@ -1,4 +1,4 @@
-schema: headframe.recipe/v1
+schema: shipfactory.recipe/v1
 id: dev-pipeline
 version: 3
 status: active
@@ -28,7 +28,7 @@ steps:
         (4) scope fits the budget. Tag findings BLOCKER or WARNING with
         path:line evidence for repository claims.
         Approve when the request maps to executable, verifiable work.
-        Finish with the exact HEADFRAME_VERDICT JSON sentinel per
+        Finish with the exact SHIPFACTORY_VERDICT JSON sentinel per
         recipes/templates/plan-check.md (outcome/body schema, final line).
       execution_profile: standard
       workspace: worktree
@@ -65,7 +65,7 @@ steps:
         Classify each actionable issue BLOCKER or WARNING and cite path/to/file.ext:line.
         Report finding_count plus one finding per line on request_changes and target the upstream build step.
         Approve only with explicit APPROVE and clean-pass/no-findings wording when there is nothing to cite.
-        Finish with the exact HEADFRAME_VERDICT JSON sentinel required by the canonical contract.
+        Finish with the exact SHIPFACTORY_VERDICT JSON sentinel required by the canonical contract.
       execution_profile: standard
       workspace: worktree
   - id: approval

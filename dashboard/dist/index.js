@@ -1,5 +1,5 @@
 /**
- * Headframe dashboard plugin.
+ * ShipFactory dashboard plugin.
  *
  * Plain IIFE like the Kanban dashboard bundle. The host owns React, design
  * system primitives, authenticated fetchJSON, theme tokens, and routing.
@@ -22,7 +22,7 @@
   var Badge = components.Badge || function (props) { return h("span", props, props.children); };
   var Card = components.Card || function (props) { return h("div", props, props.children); };
   var CardContent = components.CardContent || function (props) { return h("div", props, props.children); };
-  var API = "/api/plugins/headframe";
+  var API = "/api/plugins/shipfactory";
   var POLL_MS = 20000;
 
   function request(path, options) {
@@ -156,7 +156,7 @@
   function ErrorState(props) {
     return h("div", { className: "flex flex-col gap-3 border border-destructive/30 bg-destructive/10 p-4 text-sm sm:flex-row sm:items-center sm:justify-between", role: "alert" },
       h("div", null,
-        h("strong", { className: "font-mondwest normal-case text-sm font-medium text-destructive" }, props.title || "Headframe data could not be loaded"),
+        h("strong", { className: "font-mondwest normal-case text-sm font-medium text-destructive" }, props.title || "ShipFactory data could not be loaded"),
         h("p", { className: "mt-1 text-xs text-text-secondary" }, props.message)
       ),
       h(Button, { size: "sm", ghost: true, onClick: props.onRetry }, "Retry")
@@ -356,7 +356,7 @@
       h("form", { className: "grid gap-4", onSubmit: submit },
         h("div", { className: "flex items-start gap-2 border p-3 text-xs " + (props.daemon && props.daemon.running ? "border-success/30 bg-success/10 text-text-secondary" : "border-destructive/30 bg-destructive/10 text-destructive") },
           h(StatePill, { value: props.daemon && props.daemon.running ? "running" : "stopped" }, props.daemon && props.daemon.running ? "Daemon running" : "Daemon stopped"),
-          h("span", null, props.daemon && props.daemon.running ? "Headframe can route this task on its next tick." : "Triage routing only happens while the Factory daemon is running.")
+          h("span", null, props.daemon && props.daemon.running ? "ShipFactory can route this task on its next tick." : "Triage routing only happens while the Factory daemon is running.")
         ),
         error ? h("div", { className: "border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive", role: "alert" }, error) : null,
         h(FieldLabel, { htmlFor: "triage-title", required: true, control: h("input", { id: "triage-title", className: FIELD_CLASS, required: true, value: title, onChange: function (event) { setTitle(event.target.value); }, placeholder: "What needs triage?" }) }, "Title"),

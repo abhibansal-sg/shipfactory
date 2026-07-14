@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from headframe import store
+from shipfactory import store
 
 
 PLUGIN_API = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
@@ -22,7 +22,7 @@ def _client() -> TestClient:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     app = FastAPI()
-    app.include_router(module.router, prefix="/api/plugins/headframe")
+    app.include_router(module.router, prefix="/api/plugins/shipfactory")
     return TestClient(app)
 
 
@@ -66,13 +66,13 @@ def _seed() -> None:
 
 def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     _seed()
-    import headframe.config
+    import shipfactory.config
 
     seat = SimpleNamespace(name="builder", profile="standard", executor="codex", model="gpt", reasoning="", reports_to=None, role="engineer", max_concurrent=1)
-    monkeypatch.setattr(headframe.config, "load_seats", lambda: SimpleNamespace(seats={"builder": seat}))
+    monkeypatch.setattr(shipfactory.config, "load_seats", lambda: SimpleNamespace(seats={"builder": seat}))
     client = _client()
 
-    instances = client.get("/api/plugins/headframe/instances")
+    instances = client.get("/api/plugins/shipfactory/instances")
     assert instances.status_code == 200
     item = instances.json()[0]
     assert item["id"] == "4d3d10d6"
@@ -80,19 +80,19 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     assert item["step_states"] == {"ready": 1, "waiting": 1}
     assert item["tokens"] == {"charged": 200, "budget": 1000, "remaining": 800}
 
-    detail = client.get("/api/plugins/headframe/instances/4d3d10d6")
+    detail = client.get("/api/plugins/shipfactory/instances/4d3d10d6")
     assert detail.status_code == 200
     assert len(detail.json()["steps"]) == 2
     assert detail.json()["activations"]["approve"][0]["state"] == "waiting"
     assert detail.json()["decisions"][0]["task_id"] == "gate-task"
 
-    waiting = client.get("/api/plugins/headframe/waiting")
+    waiting = client.get("/api/plugins/shipfactory/waiting")
     assert waiting.status_code == 200
     assert waiting.json()[0]["step_id"] == "approve"
-    assert client.get("/api/plugins/headframe/seats").json()[0]["name"] == "builder"
-    assert client.get("/api/plugins/headframe/costs").json()[0]["tokens_total"] == 321
+    assert client.get("/api/plugins/shipfactory/seats").json()[0]["name"] == "builder"
+    assert client.get("/api/plugins/shipfactory/costs").json()[0]["tokens_total"] == 321
 
-    approved = client.post("/api/plugins/headframe/approve", json={"instance": "4d3d10d6", "step": "approve"})
+    approved = client.post("/api/plugins/shipfactory/approve", json={"instance": "4d3d10d6", "step": "approve"})
     assert approved.status_code == 200 and approved.json()["key"]
     with store._connect() as db:
         event = db.execute("SELECT source,payload_json,state FROM advance_events").fetchone()
@@ -101,19 +101,19 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     assert tuple(event)[2] == "pending"
 
     # A ready build is not a human gate: both action endpoints fail cleanly.
-    assert client.post("/api/plugins/headframe/approve", json={"instance": "4d3d10d6", "step": "build"}).status_code == 400
-    assert client.post("/api/plugins/headframe/reject", json={"instance": "4d3d10d6", "step": "build", "reason": "no"}).status_code == 400
+    assert client.post("/api/plugins/shipfactory/approve", json={"instance": "4d3d10d6", "step": "build"}).status_code == 400
+    assert client.post("/api/plugins/shipfactory/reject", json={"instance": "4d3d10d6", "step": "build", "reason": "no"}).status_code == 400
 
 
 def test_seat_endpoints_create_update_and_reject_missing_profile(hermetic_hermes_home: Path):
     (hermetic_hermes_home / "profiles" / "builder").mkdir(parents=True)
     client = _client()
-    assert client.get("/api/plugins/headframe/profiles").json() == ["default", "builder"]
-    invalid = client.post("/api/plugins/headframe/seats", json={"name": "bad", "profile": "missing", "executor": "codex", "model": "gpt", "role": "engineer"})
+    assert client.get("/api/plugins/shipfactory/profiles").json() == ["default", "builder"]
+    invalid = client.post("/api/plugins/shipfactory/seats", json={"name": "bad", "profile": "missing", "executor": "codex", "model": "gpt", "role": "engineer"})
     assert invalid.status_code == 400 and "does not exist" in invalid.json()["detail"]
-    created = client.post("/api/plugins/headframe/seats", json={"name": "builder", "profile": "builder", "executor": "hermes", "model": "claude-sonnet-5", "role": "engineer", "provider_config": {"provider": "proxy", "base_url": "http://proxy", "model": "claude-sonnet-5"}})
+    created = client.post("/api/plugins/shipfactory/seats", json={"name": "builder", "profile": "builder", "executor": "hermes", "model": "claude-sonnet-5", "role": "engineer", "provider_config": {"provider": "proxy", "base_url": "http://proxy", "model": "claude-sonnet-5"}})
     assert created.status_code == 201 and created.json()["name"] == "builder"
-    updated = client.put("/api/plugins/headframe/seats/builder", json={"max_concurrent": 2})
+    updated = client.put("/api/plugins/shipfactory/seats/builder", json={"max_concurrent": 2})
     assert updated.status_code == 200 and updated.json()["max_concurrent"] == 2
-    detail = client.get("/api/plugins/headframe/seats").json()[0]
+    detail = client.get("/api/plugins/shipfactory/seats").json()[0]
     assert detail["profile_model"] == "claude-sonnet-5" and detail["model_mismatch"] is False

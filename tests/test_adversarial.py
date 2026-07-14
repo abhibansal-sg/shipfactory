@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from headframe import github_sync, store
-import headframe.daemon as daemon
-import headframe.spawn as spawn
-from headframe.policy import citation_ok
+from shipfactory import github_sync, store
+import shipfactory.daemon as daemon
+import shipfactory.spawn as spawn
+from shipfactory.policy import citation_ok
 
 
 def _install_tick_stubs(monkeypatch):
@@ -25,19 +25,19 @@ def _install_tick_stubs(monkeypatch):
     kanban.dispatch_once = lambda conn, **kw: calls.append(("dispatch", kw)) or "dispatched"
     hermes = types.ModuleType("hermes_cli")
     hermes.kanban_db = kanban
-    child_spawn = types.ModuleType("headframe.spawn")
-    child_spawn.headframe_spawn = object()
+    child_spawn = types.ModuleType("shipfactory.spawn")
+    child_spawn.shipfactory_spawn = object()
     child_spawn.reap_finished = lambda: []
     watchdog = types.ModuleType("factory.watchdog")
     watchdog.tick = lambda conn, board=None: "watched"
     for name, module in (
         ("hermes_cli", hermes),
         ("hermes_cli.kanban_db", kanban),
-        ("headframe.spawn", child_spawn),
+        ("shipfactory.spawn", child_spawn),
         ("factory.watchdog", watchdog),
     ):
         monkeypatch.setitem(sys.modules, name, module)
-    import headframe as factory_package
+    import shipfactory as factory_package
 
     monkeypatch.setattr(factory_package, "spawn", child_spawn, raising=False)
     monkeypatch.setattr(factory_package, "watchdog", watchdog, raising=False)
@@ -102,10 +102,10 @@ def test_reap_does_not_wait_for_hung_executor_past_claim_ttl():
 @pytest.mark.parametrize(
     ("log_text", "result", "summary"),
     [
-        ("garbage\nHEADFRAME_RESULT: done mid-log\nmore garbage", "blocked", "no result sentinel"),
-        ("HEADFRAME_RESULT: done first\nHEADFRAME_RESULT: blocked last", "blocked", "last"),
-        ("HEADFRAME_RESULT: blocked first\nHEADFRAME_RESULT: done last", "done", "last"),
-        ("HEADFRAME_RESULT: done valid\nHEADFRAME_RESULT: ??? malformed", "blocked", "no result sentinel"),
+        ("garbage\nSHIPFACTORY_RESULT: done mid-log\nmore garbage", "blocked", "no result sentinel"),
+        ("SHIPFACTORY_RESULT: done first\nSHIPFACTORY_RESULT: blocked last", "blocked", "last"),
+        ("SHIPFACTORY_RESULT: blocked first\nSHIPFACTORY_RESULT: done last", "done", "last"),
+        ("SHIPFACTORY_RESULT: done valid\nSHIPFACTORY_RESULT: ??? malformed", "blocked", "no result sentinel"),
     ],
 )
 def test_factory_result_parser_is_malformed_and_last_line_safe(log_text, result, summary):
@@ -117,23 +117,23 @@ def test_factory_result_parser_is_malformed_and_last_line_safe(log_text, result,
     ("log_text", "result", "summary"),
     [
         # Verdict alone on the final line (the pre-#25 happy path).
-        ('HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}',
-         "done", 'HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}'),
+        ('SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}',
+         "done", 'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
         # Finding #25: disciplined review workers emit BOTH sentinels —
-        # verdict first, HEADFRAME_RESULT last. The verdict must win or the
+        # verdict first, SHIPFACTORY_RESULT last. The verdict must win or the
         # advancer's parse_verdict fuses the review gate.
-        ('HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}\nHEADFRAME_RESULT: done review complete',
-         "done", 'HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}'),
+        ('SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}\nSHIPFACTORY_RESULT: done review complete',
+         "done", 'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
         # Two verdicts: the LATEST wins (retry-within-run semantics).
-        ('HEADFRAME_VERDICT: {"outcome":"approve","body":"old"}\nHEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}\nHEADFRAME_RESULT: done wrapped up',
-         "done", 'HEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}'),
+        ('SHIPFACTORY_VERDICT: {"outcome":"approve","body":"old"}\nSHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}\nSHIPFACTORY_RESULT: done wrapped up',
+         "done", 'SHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"new"}'),
         # A verdict buried mid-log still wins over trailing prose.
-        ('HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}\ntrailing chatter',
-         "done", 'HEADFRAME_VERDICT: {"outcome":"approve","body":"ok"}'),
+        ('SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}\ntrailing chatter',
+         "done", 'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"ok"}'),
     ],
 )
 def test_verdict_sentinel_beats_factory_result(log_text, result, summary):
-    """HEADFRAME_VERDICT anywhere in the log outranks the final-line RESULT."""
+    """SHIPFACTORY_VERDICT anywhere in the log outranks the final-line RESULT."""
     assert spawn._parse_result(log_text, 0) == (result, summary)
 
 
@@ -179,7 +179,7 @@ def test_citation_ok_handles_fuzz_and_ten_megabyte_body():
 
 def test_huge_prompt_to_non_reading_child_does_not_wedge_dispatch(tmp_path, monkeypatch):
     """#16-OPERATOR F1: a >64KB prompt handed to a child that never reads
-    stdin must NOT block headframe_spawn (the dispatch thread). Before the
+    stdin must NOT block shipfactory_spawn (the dispatch thread). Before the
     file-stdin fix, the blocking pipe write wedged the daemon forever with
     no exception — the #62496 sweeper class. Proven live 07-12."""
     import sys as _sys, time, types
@@ -187,8 +187,8 @@ def test_huge_prompt_to_non_reading_child_does_not_wedge_dispatch(tmp_path, monk
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seat = types.SimpleNamespace(executor="codex", model="m", profile="p")
     cfg = types.SimpleNamespace(seats={"s1": seat}, hierarchy_gates={})
-    config = types.ModuleType("headframe.config"); config.load_seats = lambda path=None: cfg
-    store = types.ModuleType("headframe.store")
+    config = types.ModuleType("shipfactory.config"); config.load_seats = lambda path=None: cfg
+    store = types.ModuleType("shipfactory.store")
     store.seat_paused = lambda s: False
     store.record_run_start = lambda *a, **k: 1
     kanban = types.ModuleType("hermes_cli.kanban_db")
@@ -196,20 +196,20 @@ def test_huge_prompt_to_non_reading_child_does_not_wedge_dispatch(tmp_path, monk
     kanban.build_worker_context = lambda conn, tid: "x" * 300_000
     kanban.connect = lambda board=None: types.SimpleNamespace(close=lambda: None)
     hermes = types.ModuleType("hermes_cli"); hermes.kanban_db = kanban
-    for name, mod in (("headframe.config", config), ("headframe.store", store),
+    for name, mod in (("shipfactory.config", config), ("shipfactory.store", store),
                       ("hermes_cli", hermes), ("hermes_cli.kanban_db", kanban)):
         monkeypatch.setitem(_sys.modules, name, mod)
-    import headframe as _pkg
+    import shipfactory as _pkg
     monkeypatch.setattr(_pkg, "config", config, raising=False)
     monkeypatch.setattr(_pkg, "store", store, raising=False)
     # executor command = a child that sleeps WITHOUT reading stdin
     monkeypatch.setenv("FACTORY_EXECUTOR_CMD_CODEX", "/bin/sleep 20")
-    from headframe.spawn import headframe_spawn, _RUNNING
+    from shipfactory.spawn import shipfactory_spawn, _RUNNING
     t0 = time.monotonic()
-    pid = headframe_spawn({"id": "t-f1", "assignee": "s1"}, str(tmp_path / "ws"))
+    pid = shipfactory_spawn({"id": "t-f1", "assignee": "s1"}, str(tmp_path / "ws"))
     elapsed = time.monotonic() - t0
     assert pid is not None
-    assert elapsed < 5, f"headframe_spawn blocked {elapsed:.1f}s on a non-reading child"
+    assert elapsed < 5, f"shipfactory_spawn blocked {elapsed:.1f}s on a non-reading child"
     # cleanup: kill the sleeper
     rec = _RUNNING.pop(pid, None)
     if rec:

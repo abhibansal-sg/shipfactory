@@ -1,12 +1,12 @@
-name: headframe
+name: shipfactory
 version: 1.0.0
-description: "Headframe — governed software factory on Hermes kanban: seats, hierarchy, review/approval gates, watchdogs, cost telemetry."
+description: "ShipFactory — governed software factory on Hermes kanban: seats, hierarchy, review/approval gates, watchdogs, cost telemetry."
 author: Abhinav Bansal
 kind: general
 provides_tools:
-  - headframe_verdict
-  - headframe_costs
-  - headframe_monitor_add
+  - shipfactory_verdict
+  - shipfactory_costs
+  - shipfactory_monitor_add
 hooks:
   - kanban_task_claimed
   - kanban_task_completed

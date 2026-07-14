@@ -1,4 +1,4 @@
-schema: headframe.recipe/v1
+schema: shipfactory.recipe/v1
 id: dev-pipeline
 version: 1
 status: active
@@ -21,7 +21,7 @@ steps:
     title: Review the change
     needs: [build]
     optional: false
-    params: {seat: verifier, instructions: "Review with evidence and finish with HEADFRAME_VERDICT JSON.", execution_profile: standard, workspace: worktree}
+    params: {seat: verifier, instructions: "Review with evidence and finish with SHIPFACTORY_VERDICT JSON.", execution_profile: standard, workspace: worktree}
   - id: approval
     primitive: approval_gate
     title: Approve the change

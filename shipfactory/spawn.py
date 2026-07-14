@@ -11,10 +11,10 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from headframe.executors import get_executor
+from shipfactory.executors import get_executor
 
-_RESULT_RE = re.compile(r"^HEADFRAME_RESULT:\s*(done|blocked)\s+(.+?)\s*$", re.I)
-_VERDICT_RE = re.compile(r"^HEADFRAME_VERDICT:\s*\{.*\}\s*$")
+_RESULT_RE = re.compile(r"^SHIPFACTORY_RESULT:\s*(done|blocked)\s+(.+?)\s*$", re.I)
+_VERDICT_RE = re.compile(r"^SHIPFACTORY_VERDICT:\s*\{.*\}\s*$")
 _RUNNING: dict[int, dict[str, Any]] = {}
 
 
@@ -30,9 +30,9 @@ def _value(task: Any, field: str, default: Any = None) -> Any:
     return getattr(task, field, default)
 
 
-def _headframe_home() -> Path:
+def _shipfactory_home() -> Path:
     """Return Factory's state root under the configured Hermes home."""
-    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "headframe"
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "shipfactory"
 
 
 def _worker_prompt(context: str) -> str:
@@ -41,13 +41,13 @@ def _worker_prompt(context: str) -> str:
         f"{context.rstrip()}\n\n"
         "## Factory completion protocol\n"
         "Complete the assigned work in this workspace. Your LAST output line MUST be exactly "
-        "`HEADFRAME_RESULT: done <one-line summary>` on success, or "
-        "`HEADFRAME_RESULT: blocked <one-line reason>` when blocked. "
+        "`SHIPFACTORY_RESULT: done <one-line summary>` on success, or "
+        "`SHIPFACTORY_RESULT: blocked <one-line reason>` when blocked. "
         "Do not omit this line.\n"
     )
 
 
-def headframe_spawn(task, workspace: str, *, board=None) -> int | None:
+def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     """Spawn the configured harness for a claimed kanban task, or skip unknown seats.
 
     This has the exact ``dispatch_once`` spawn callback signature.  Imports of
@@ -57,8 +57,8 @@ def headframe_spawn(task, workspace: str, *, board=None) -> int | None:
     assignee = _value(task, "assignee")
     if not assignee:
         return None
-    from headframe.config import load_seats
-    from headframe import store
+    from shipfactory.config import load_seats
+    from shipfactory import store
 
     cfg = load_seats()
     seat = cfg.seats.get(assignee)
@@ -90,7 +90,7 @@ def headframe_spawn(task, workspace: str, *, board=None) -> int | None:
         command = shlex.split(override)
         if not command:
             raise ValueError(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()} is empty")
-    logs = _headframe_home() / "runs"
+    logs = _shipfactory_home() / "runs"
     logs.mkdir(parents=True, exist_ok=True)
     log_path = logs / f"{task_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.log"
     env = dict(os.environ)
@@ -138,11 +138,11 @@ def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
     """Apply the strict final-line sentinel protocol to a completed harness."""
     lines = [line.strip() for line in log_text.splitlines() if line.strip()]
     # Recipe review gates use the stronger structured verdict sentinel; the
-    # executor-discipline template ALSO demands a trailing HEADFRAME_RESULT, so
+    # executor-discipline template ALSO demands a trailing SHIPFACTORY_RESULT, so
     # disciplined review workers emit BOTH (verdict, then result). The verdict
     # must win whenever present — storing the RESULT prose as task.result
     # destroys the JSON the advancer's parse_verdict requires and fused every
-    # review gate as "review final line must be HEADFRAME_VERDICT JSON"
+    # review gate as "review final line must be SHIPFACTORY_VERDICT JSON"
     # (finding #25, t_10fdf585). Scan from the end so the latest verdict wins.
     for line in reversed(lines):
         if _VERDICT_RE.fullmatch(line):
@@ -157,7 +157,7 @@ def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
 
 def reap_finished() -> list[dict]:
     """Finalize exited non-Hermes harnesses and transition their kanban tasks."""
-    from headframe import store
+    from shipfactory import store
 
     finished: list[dict] = []
     for pid, record in list(_RUNNING.items()):
@@ -200,4 +200,4 @@ def reap_finished() -> list[dict]:
     return finished
 
 
-__all__ = ["headframe_spawn", "reap_finished"]
+__all__ = ["shipfactory_spawn", "reap_finished"]

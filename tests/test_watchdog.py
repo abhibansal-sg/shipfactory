@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from headframe import store
-from headframe import watchdog
+from shipfactory import store
+from shipfactory import watchdog
 
 
 def issue(issue_id, *, parent=None, status="ready", updated="2026-07-12T00:00:00Z"):
@@ -40,16 +40,16 @@ def test_classifier_live_and_pending_verdict_are_not_stopped():
 
 def test_tick_uses_recovery_ladder_and_kanban_cli(monkeypatch):
     calls = []
-    store = types.ModuleType("headframe.store")
+    store = types.ModuleType("shipfactory.store")
     store.due_monitors = lambda now: [{"task_id": "T1", "recovery_policy": "wake_owner", "scheduled_by": "seat", "notes": "ping", "max_attempts": 3}]
     store.advance_monitor = lambda task_id, now, close=False: calls.append(("advance", task_id, now, close))
-    config = types.ModuleType("headframe.config")
+    config = types.ModuleType("shipfactory.config")
     config.load_seats = lambda: SimpleNamespace(company="demo")
-    hierarchy = types.ModuleType("headframe.hierarchy")
+    hierarchy = types.ModuleType("shipfactory.hierarchy")
     hierarchy.escalation_target = lambda cfg, seat: "manager"
-    monkeypatch.setitem(sys.modules, "headframe.store", store)
-    monkeypatch.setitem(sys.modules, "headframe.config", config)
-    monkeypatch.setitem(sys.modules, "headframe.hierarchy", hierarchy)
+    monkeypatch.setitem(sys.modules, "shipfactory.store", store)
+    monkeypatch.setitem(sys.modules, "shipfactory.config", config)
+    monkeypatch.setitem(sys.modules, "shipfactory.hierarchy", hierarchy)
 
     def run(command, **kwargs):
         calls.append(command)
@@ -112,10 +112,10 @@ def test_terminal_escalation_happens_at_most_once(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
         "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
     })
-    monkeypatch.setitem(sys.modules, "headframe.config", types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "shipfactory.config", types.SimpleNamespace(
         load_seats=lambda: SimpleNamespace(company="demo")
     ))
-    monkeypatch.setitem(sys.modules, "headframe.hierarchy", types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "shipfactory.hierarchy", types.SimpleNamespace(
         escalation_target=lambda cfg, seat: None
     ))
     calls = []

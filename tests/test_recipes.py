@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from headframe import store
-from headframe.cli import _recipe_gate, _reroute
-from headframe.config import FactoryConfig
-from headframe.recipes.advancer import (
+from shipfactory import store
+from shipfactory.cli import _recipe_gate, _reroute
+from shipfactory.config import FactoryConfig
+from shipfactory.recipes.advancer import (
     advance_key,
     cancel,
     event,
@@ -20,8 +20,8 @@ from headframe.recipes.advancer import (
     reconcile_root_collectors,
     startup_guard,
 )
-from headframe.recipes.instantiate import instantiate
-from headframe.recipes.loader import RecipeError, load_library
+from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.loader import RecipeError, load_library
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,7 +72,7 @@ def _complete_review(kanban_db, conn, task_id: str, *, outcome: str, target: str
         verdict["body"] = "factory/recipes/advancer.py:84 requires changes"
     else:
         verdict["body"] = "APPROVE clean pass"
-    result = "HEADFRAME_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+    result = "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
     assert kanban_db.complete_task(conn, task_id, result=result, summary="reviewed")
 
 
@@ -80,7 +80,7 @@ def _one_step_recipe(tmp_path: Path, key: str = "single@1"):
     recipe_id, version = key.split("@")
     return _recipe(
         tmp_path,
-        f"""schema: headframe.recipe/v1
+        f"""schema: shipfactory.recipe/v1
 id: {recipe_id}
 version: {version}
 status: active
@@ -132,7 +132,7 @@ def _selection_with_siblings(conn, tmp_path: Path):
 def test_loader_persists_immutable_normalized_recipe(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     source = tmp_path / "r.yaml"
-    source.write_text("""schema: headframe.recipe/v1
+    source.write_text("""schema: shipfactory.recipe/v1
 id: test
 version: 1
 status: active
@@ -218,7 +218,7 @@ def test_gate_rejection_invalidates_cone_and_rebinds_approvals(tmp_path, kanban_
 
     recipe = _recipe(
         tmp_path,
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: revision-cone
 version: 1
 status: active
@@ -288,7 +288,7 @@ def test_budget_fuse_charges_worked_example_without_refunds(tmp_path, kanban_con
 
     recipe = _recipe(
         tmp_path,
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: budget-loop
 version: 1
 status: active
@@ -360,7 +360,7 @@ def test_three_day_human_gate_is_never_claimed_reclaimed_or_duplicated(tmp_path,
 
     recipe = _recipe(
         tmp_path,
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: human-gate
 version: 1
 status: active
@@ -423,7 +423,7 @@ def test_reroute_replaces_before_activation_and_cancels_after_activation(tmp_pat
     library_path.mkdir()
     for recipe_id, step_id in (("route-a", "old-work"), ("route-b", "new-work")):
         (library_path / f"{recipe_id}.yaml").write_text(
-            f"""schema: headframe.recipe/v1
+            f"""schema: shipfactory.recipe/v1
 id: {recipe_id}
 version: 1
 status: active
@@ -550,7 +550,7 @@ def test_gate_rejection_accepts_kanban_task_id_target(tmp_path, kanban_conn):
 
     recipe = _recipe(
         tmp_path,
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: task-id-target
 version: 1
 status: active
@@ -598,7 +598,7 @@ def test_rework_activation_inherits_rejecting_verdict_as_parent(tmp_path, kanban
 
     recipe = _recipe(
         tmp_path,
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: rework-context
 version: 1
 status: active

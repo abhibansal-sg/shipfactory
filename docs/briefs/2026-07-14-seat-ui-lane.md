@@ -49,7 +49,7 @@ max_concurrent, provider_config=None) -> dict`:
 - All paths must respect HERMES_HOME env override (tests depend on it —
   never touch the real ~/.hermes in tests).
 
-**S2 — CLI verbs.** `hermes headframe seat-create` / `seat-update` /
+**S2 — CLI verbs.** `hermes shipfactory seat-create` / `seat-update` /
 `seat-list` wired to S1 (follow the existing cli.py verb pattern). CLI is
 the single writer; keep business logic in S1, not in the endpoint.
 

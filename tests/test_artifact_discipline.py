@@ -7,17 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from headframe import store
-from headframe.recipes.advancer import (
+from shipfactory import store
+from shipfactory.recipes.advancer import (
     apply_events,
     event,
     gate_decision,
     reconcile,
     release_review_stall,
 )
-from headframe.recipes.instantiate import instantiate
-from headframe.recipes.loader import RecipeError, load_library
-from headframe.recipes.selector import (
+from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.loader import RecipeError, load_library
+from shipfactory.recipes.selector import (
     RECIPE_SELECTOR_PROMPT,
     validate_or_park_selection,
     validate_selection,
@@ -33,14 +33,14 @@ PROFILES = {
 }
 
 ROOT = Path(__file__).resolve().parents[1]
-DEV_PIPELINE_V1_SHA256 = "a05c74f936e000e8757d6a7740e3257367cdd9d58bfbf081993561e6ab203f06"
+DEV_PIPELINE_V1_SHA256 = "fff1275c003037ed84c35e97a38f8c07210b7143f871eb81dcc1b2c11455ab45"
 
 
 def _review_loop_recipe(tmp_path: Path):
     library = tmp_path / "review-loop-library"
     library.mkdir()
     (library / "review-loop@1.yaml").write_text(
-        """schema: headframe.recipe/v1
+        """schema: shipfactory.recipe/v1
 id: review-loop
 version: 1
 status: active
@@ -118,7 +118,7 @@ def _reject_round(kanban_conn, instance_id: str, activation: int, count: int | N
     review = _step(instance_id, "verify", activation)
     assert review and review["state"] == "running"
     if count is None:
-        body = "headframe/recipes/advancer.py:1 requires changes"
+        body = "shipfactory/recipes/advancer.py:1 requires changes"
     else:
         body = f"finding_count: {count}\nfactory/recipes/advancer.py:1 requires changes"
     verdict = {
@@ -126,7 +126,7 @@ def _reject_round(kanban_conn, instance_id: str, activation: int, count: int | N
         "target_step": "build",
         "body": body,
     }
-    result = "HEADFRAME_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+    result = "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
     assert kanban_db.complete_task(kanban_conn, review["kanban_task_id"], result=result)
     reconcile(kanban_conn, instance_id, profiles=PROFILES)
 
@@ -194,7 +194,7 @@ def _human_gate_recipe(tmp_path: Path, primitive: str):
     library = tmp_path / f"{recipe_id}-library"
     library.mkdir()
     (library / f"{recipe_id}@1.yaml").write_text(
-        f"""schema: headframe.recipe/v1
+        f"""schema: shipfactory.recipe/v1
 id: {recipe_id}
 version: 1
 status: active
@@ -356,7 +356,7 @@ def test_dev_pipeline_v2_flat_findings_e2e_parks_review_stall(kanban_conn):
     assert kanban_db.complete_task(
         kanban_conn,
         plan_check["kanban_task_id"],
-        result="HEADFRAME_VERDICT: " + json.dumps(approval, separators=(",", ":")),
+        result="SHIPFACTORY_VERDICT: " + json.dumps(approval, separators=(",", ":")),
     )
     reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
 
@@ -378,7 +378,7 @@ def test_dev_pipeline_v2_flat_findings_e2e_parks_review_stall(kanban_conn):
         assert kanban_db.complete_task(
             kanban_conn,
             verify["kanban_task_id"],
-            result="HEADFRAME_VERDICT: " + json.dumps(rejection, separators=(",", ":")),
+            result="SHIPFACTORY_VERDICT: " + json.dumps(rejection, separators=(",", ":")),
         )
         reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
 

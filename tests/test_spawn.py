@@ -3,18 +3,18 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
-import headframe.spawn as spawn
+import shipfactory.spawn as spawn
 
 
 def _install_stubs(monkeypatch, seat, calls):
-    config = types.ModuleType("headframe.config")
+    config = types.ModuleType("shipfactory.config")
     config.load_seats = lambda: SimpleNamespace(seats={seat.name: seat})
-    store = types.ModuleType("headframe.store")
+    store = types.ModuleType("shipfactory.store")
     store.seat_paused = lambda name: False
     store.record_run_start = lambda *args: calls.append(("start", args)) or 41
     store.record_run_end = lambda *args: calls.append(("end", args))
-    monkeypatch.setitem(sys.modules, "headframe.config", config)
-    monkeypatch.setitem(sys.modules, "headframe.store", store)
+    monkeypatch.setitem(sys.modules, "shipfactory.config", config)
+    monkeypatch.setitem(sys.modules, "shipfactory.store", store)
     kanban = types.ModuleType("hermes_cli.kanban_db")
     kanban.connect = lambda board=None: SimpleNamespace(close=lambda: None)
     kanban.build_worker_context = lambda conn, task_id: f"context for {task_id}"
@@ -47,9 +47,9 @@ def test_spawn_and_reap_done(monkeypatch, tmp_path):
     monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
     spawn._RUNNING.clear()
     task = SimpleNamespace(id="t1", assignee="dev")
-    assert spawn.headframe_spawn(task, str(tmp_path / "work"), board="b") == 1234
+    assert spawn.shipfactory_spawn(task, str(tmp_path / "work"), board="b") == 1234
     record = spawn._RUNNING[1234]
-    Path(record["log_path"]).write_text('{"usage":{"input_tokens":2,"output_tokens":3}}\nHEADFRAME_RESULT: done shipped\n')
+    Path(record["log_path"]).write_text('{"usage":{"input_tokens":2,"output_tokens":3}}\nSHIPFACTORY_RESULT: done shipped\n')
     record["proc"].code = 0
     assert spawn.reap_finished()[0]["result"] == "done"
     assert any(item[0] == "complete" for item in calls)
@@ -62,7 +62,7 @@ def test_exit_zero_without_sentinel_blocks(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
     spawn._RUNNING.clear()
-    spawn.headframe_spawn(SimpleNamespace(id="t2", assignee="dev"), str(tmp_path / "work"))
+    spawn.shipfactory_spawn(SimpleNamespace(id="t2", assignee="dev"), str(tmp_path / "work"))
     record = spawn._RUNNING[1234]
     Path(record["log_path"]).write_text("finished\n")
     record["proc"].code = 0
@@ -72,13 +72,13 @@ def test_exit_zero_without_sentinel_blocks(monkeypatch, tmp_path):
 
 
 def test_unknown_seat_skips(monkeypatch):
-    config = types.ModuleType("headframe.config")
+    config = types.ModuleType("shipfactory.config")
     config.load_seats = lambda: SimpleNamespace(seats={})
-    store = types.ModuleType("headframe.store")
+    store = types.ModuleType("shipfactory.store")
     store.seat_paused = lambda name: False
-    monkeypatch.setitem(sys.modules, "headframe.config", config)
-    monkeypatch.setitem(sys.modules, "headframe.store", store)
-    assert spawn.headframe_spawn(SimpleNamespace(id="t", assignee="nobody"), "/tmp") is None
+    monkeypatch.setitem(sys.modules, "shipfactory.config", config)
+    monkeypatch.setitem(sys.modules, "shipfactory.store", store)
+    assert spawn.shipfactory_spawn(SimpleNamespace(id="t", assignee="nobody"), "/tmp") is None
 
 
 def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
@@ -90,11 +90,11 @@ def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
     spawn._RUNNING.clear()
-    spawn.headframe_spawn(SimpleNamespace(id="t3", assignee="dev"), str(tmp_path / "work"), board="b")
+    spawn.shipfactory_spawn(SimpleNamespace(id="t3", assignee="dev"), str(tmp_path / "work"), board="b")
     record = spawn._RUNNING[1234]
     Path(record["log_path"]).write_text(
         '{"type":"thread.started"}\n'
-        '{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE\\n\\nHEADFRAME_RESULT: done plan approved"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE\\n\\nSHIPFACTORY_RESULT: done plan approved"}}\n'
         '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n'
     )
     record["proc"].code = 0
@@ -104,16 +104,16 @@ def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
 
 
 def test_parse_result_prefers_verdict_over_trailing_result():
-    """Finding #25: disciplined review workers emit HEADFRAME_VERDICT then
-    HEADFRAME_RESULT (both contracts demand 'last line'). The verdict JSON is
+    """Finding #25: disciplined review workers emit SHIPFACTORY_VERDICT then
+    SHIPFACTORY_RESULT (both contracts demand 'last line'). The verdict JSON is
     what parse_verdict needs — it must win over the trailing result line."""
     text = (
         "review done\n"
-        'HEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"build","body":"BLOCKER a.py:1 — x"}\n'
-        "HEADFRAME_RESULT: done Verification requested changes\n"
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"BLOCKER a.py:1 — x"}\n'
+        "SHIPFACTORY_RESULT: done Verification requested changes\n"
     )
     result, summary = spawn._parse_result(text, 0)
-    assert result == "done" and summary.startswith("HEADFRAME_VERDICT:")
+    assert result == "done" and summary.startswith("SHIPFACTORY_VERDICT:")
     # Non-review workers keep the plain result contract.
-    result, summary = spawn._parse_result("work\nHEADFRAME_RESULT: done shipped\n", 0)
+    result, summary = spawn._parse_result("work\nSHIPFACTORY_RESULT: done shipped\n", 0)
     assert (result, summary) == ("done", "shipped")

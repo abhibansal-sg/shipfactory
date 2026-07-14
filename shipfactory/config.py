@@ -107,7 +107,7 @@ def _default_path() -> Path:
     if not home:
         from hermes_constants import get_hermes_home
         home = str(get_hermes_home())
-    return Path(home) / "headframe" / "seats.yaml"
+    return Path(home) / "shipfactory" / "seats.yaml"
 
 
 def load_seats(path=None) -> FactoryConfig:

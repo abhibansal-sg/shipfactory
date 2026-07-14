@@ -26,11 +26,11 @@ Every verdict body must contain `path/to/file.ext:<line>` evidence for findings.
 The final non-empty line must be exactly one valid sentinel:
 
 ```text
-HEADFRAME_VERDICT: {"outcome":"approve","body":"APPROVE: clean pass; no findings"}
+SHIPFACTORY_VERDICT: {"outcome":"approve","body":"APPROVE: clean pass; no findings"}
 ```
 
 or a cited change request naming a transitive upstream `agent_task`:
 
 ```text
-HEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"<step-id>","body":"finding_count: 2\nBLOCKER path/file.py:42 — ...\nWARNING path/file.py:77 — ..."}
+SHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"<step-id>","body":"finding_count: 2\nBLOCKER path/file.py:42 — ...\nWARNING path/file.py:77 — ..."}
 ```

@@ -9,7 +9,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
-from headframe import store
+from shipfactory import store
 from .instantiate import recipe_for_instance, revision_vector
 from .instantiate import task_key
 from .primitives import activate, parse_verdict
@@ -140,7 +140,7 @@ def _result_one_liner(value: str | None) -> str | None:
             in_frontmatter = not in_frontmatter if not saw_frontmatter or in_frontmatter else False
             saw_frontmatter = True
             continue
-        if in_frontmatter or line.startswith(("#", "```", "HEADFRAME_VERDICT:")):
+        if in_frontmatter or line.startswith(("#", "```", "SHIPFACTORY_VERDICT:")):
             continue
         return line.strip("* ")[:240]
     return None
@@ -225,7 +225,7 @@ def _verdict_text(result: str | None, metadata: Any) -> str | None:
             if key in metadata and _evidence_text(metadata[key]):
                 return _evidence_text(metadata[key])
     lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
-    if lines and lines[-1].startswith("HEADFRAME_VERDICT:"):
+    if lines and lines[-1].startswith("SHIPFACTORY_VERDICT:"):
         try:
             payload = json.loads(lines[-1].split(":", 1)[1].strip())
         except (ValueError, json.JSONDecodeError):
@@ -340,7 +340,7 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
             "UPDATE tasks SET body=? WHERE id=?",
             (f"{task_body.rstrip()}\n\n---\n\n{body}", task_id),
         )
-    kanban_db.add_comment(conn, task_id, "headframe", body)
+    kanban_db.add_comment(conn, task_id, "shipfactory", body)
 
 def _consume_resume_note(conn: Any, task_id: str | None) -> None:
     """Mark one parked note consumed without adding a Factory table."""
@@ -356,7 +356,7 @@ def _consume_resume_note(conn: Any, task_id: str | None) -> None:
         (task_id,),
     ).fetchone()
     if has_note and not consumed:
-        kanban_db.add_comment(conn, task_id, "headframe", f"RESUMED {store._now()}")
+        kanban_db.add_comment(conn, task_id, "shipfactory", f"RESUMED {store._now()}")
 
 def _resolve_target_step(db: Any, instance_id: str, recipe: dict[str, Any], target: str) -> str:
     """Map a verdict's target to a recipe step id, accepting kanban task ids.
@@ -806,7 +806,7 @@ def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, A
             (store._now(), instance_id),
         )
     # Factory-owned workers have their own process group and can be signalled by reap records.
-    from headframe.spawn import _RUNNING
+    from shipfactory.spawn import _RUNNING
     for record in list(_RUNNING.values()):
         if record["task_id"] in task_ids:
             try: os.killpg(record["proc"].pid, 15)

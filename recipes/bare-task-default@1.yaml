@@ -1,4 +1,4 @@
-schema: headframe.recipe/v1
+schema: shipfactory.recipe/v1
 id: bare-task-default
 version: 1
 status: active

@@ -1,6 +1,6 @@
 """Durable daemon run-record coverage."""
 
-from headframe import daemon, store
+from shipfactory import daemon, store
 
 
 def test_daemon_run_records_tick_and_clean_stop(monkeypatch):

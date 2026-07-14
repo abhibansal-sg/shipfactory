@@ -14,7 +14,7 @@ HERMES = Path.home() / "Developer/products/hermes-mobile"
 
 def _run(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ | {"HERMES_HOME": str(home), "PYTHONPATH": os.pathsep.join((str(ROOT), str(HERMES)))}
-    return subprocess.run([sys.executable, str(ROOT / "headframe" / "cli.py"), *args], text=True, capture_output=True, env=env)
+    return subprocess.run([sys.executable, str(ROOT / "shipfactory" / "cli.py"), *args], text=True, capture_output=True, env=env)
 
 
 def test_cli_subprocess_verbs_against_real_factory_state(tmp_path):

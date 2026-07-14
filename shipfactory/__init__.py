@@ -13,7 +13,7 @@ def _service_ready() -> bool:
     if not home:
         from hermes_constants import get_hermes_home
         home = str(get_hermes_home())
-    return (Path(home) / "headframe" / "headframe.db").is_file()
+    return (Path(home) / "shipfactory" / "shipfactory.db").is_file()
 
 
 def _verdict_tool(args: dict) -> str:
@@ -42,16 +42,16 @@ def _setup_cli(parser) -> None:
     from . import cli
     setup = getattr(cli, "register_cli", getattr(cli, "setup_parser", None))
     if setup is None:
-        raise AttributeError("headframe.cli must export register_cli or setup_parser")
+        raise AttributeError("shipfactory.cli must export register_cli or setup_parser")
     setup(parser)
 
 
 def _handle_cli(args):
     """Delegate command handling to the optional Factory CLI lane."""
     from . import cli
-    handler = getattr(cli, "headframe_command", getattr(cli, "main", None))
+    handler = getattr(cli, "shipfactory_command", getattr(cli, "main", None))
     if handler is None:
-        raise AttributeError("headframe.cli must export headframe_command or main")
+        raise AttributeError("shipfactory.cli must export shipfactory_command or main")
     return handler(args)
 
 
@@ -63,19 +63,19 @@ def _on_complete(**kwargs) -> None:
 
 def register(ctx) -> None:
     """Register Factory CLI, tools, and kanban lifecycle hooks."""
-    ctx.register_cli_command(name="headframe", help="Operate Headframe", setup_fn=_setup_cli,
+    ctx.register_cli_command(name="shipfactory", help="Operate ShipFactory", setup_fn=_setup_cli,
                              handler_fn=_handle_cli, description="Teams, hierarchy, policy, watchdogs, and cost telemetry")
     ctx.register_hook("kanban_task_completed", _on_complete)
     from .telemetry import on_claim
     ctx.register_hook("kanban_task_claimed", on_claim)
     tools = (
-        ("headframe_verdict", {"type": "object", "properties": {"task_id": {"type": "string"}, "stage_id": {"type": "string"}, "outcome": {"type": "string"}, "body": {"type": "string"}, "seat": {"type": "string"}}, "required": ["task_id", "stage_id", "outcome", "body", "seat"]}, _verdict_tool),
-        ("headframe_costs", {"type": "object", "properties": {"by": {"type": "string"}, "since_days": {"type": "integer"}}}, _costs_tool),
-        ("headframe_monitor_add", {"type": "object", "properties": {"task_id": {"type": "string"}, "next_check_at": {"type": "string"}, "timeout_at": {"type": "string"}, "max_attempts": {"type": "integer"}, "interval_seconds": {"type": "integer"}, "recovery_policy": {"type": "string"}, "notes": {"type": "string"}, "scheduled_by": {"type": "string"}}, "required": ["task_id", "next_check_at"]}, _monitor_tool),
+        ("shipfactory_verdict", {"type": "object", "properties": {"task_id": {"type": "string"}, "stage_id": {"type": "string"}, "outcome": {"type": "string"}, "body": {"type": "string"}, "seat": {"type": "string"}}, "required": ["task_id", "stage_id", "outcome", "body", "seat"]}, _verdict_tool),
+        ("shipfactory_costs", {"type": "object", "properties": {"by": {"type": "string"}, "since_days": {"type": "integer"}}}, _costs_tool),
+        ("shipfactory_monitor_add", {"type": "object", "properties": {"task_id": {"type": "string"}, "next_check_at": {"type": "string"}, "timeout_at": {"type": "string"}, "max_attempts": {"type": "integer"}, "interval_seconds": {"type": "integer"}, "recovery_policy": {"type": "string"}, "notes": {"type": "string"}, "scheduled_by": {"type": "string"}}, "required": ["task_id", "next_check_at"]}, _monitor_tool),
     )
     for name, schema, handler in tools:
-        ctx.register_tool(name=name, toolset="headframe", schema=schema, handler=handler, check_fn=_service_ready,
-                          description=f"Headframe {name.removeprefix('headframe_').replace('_', ' ')}")
+        ctx.register_tool(name=name, toolset="shipfactory", schema=schema, handler=handler, check_fn=_service_ready,
+                          description=f"ShipFactory {name.removeprefix('headframe_').replace('_', ' ')}")
 
 
 __all__ = ["register"]

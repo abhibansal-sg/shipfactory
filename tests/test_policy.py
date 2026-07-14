@@ -6,30 +6,30 @@ from types import SimpleNamespace
 
 import pytest
 
-from headframe import policy
+from shipfactory import policy
 
 
 def install_fakes(monkeypatch, *, stored_policy=None):
     decisions = []
     state = {"policy": stored_policy, "set": [], "records": decisions}
-    store = types.ModuleType("headframe.store")
+    store = types.ModuleType("shipfactory.store")
     store.get_policy = lambda task_id: state["policy"]
     store.set_policy = lambda task_id, value: (state["set"].append(value), state.__setitem__("policy", value))
     store.decisions_for = lambda task_id: list(decisions)
     store.record_decision = lambda *args: decisions.append({
         "task_id": args[0], "stage_id": args[1], "stage_type": args[2], "seat": args[3], "outcome": args[4], "body": args[5]
     })
-    config = types.ModuleType("headframe.config")
+    config = types.ModuleType("shipfactory.config")
     config.load_seats = lambda: SimpleNamespace(
         seats={"verifier": SimpleNamespace(role="qa"), "architect": SimpleNamespace(role="architect"), "release": SimpleNamespace(role="release")},
         hierarchy_gates={"verdicts": ["verifier"], "landers": ["release"]},
         company="demo",
     )
-    hierarchy = types.ModuleType("headframe.hierarchy")
+    hierarchy = types.ModuleType("shipfactory.hierarchy")
     hierarchy.may_verdict = lambda cfg, seat: seat == "verifier"
-    monkeypatch.setitem(sys.modules, "headframe.store", store)
-    monkeypatch.setitem(sys.modules, "headframe.config", config)
-    monkeypatch.setitem(sys.modules, "headframe.hierarchy", hierarchy)
+    monkeypatch.setitem(sys.modules, "shipfactory.store", store)
+    monkeypatch.setitem(sys.modules, "shipfactory.config", config)
+    monkeypatch.setitem(sys.modules, "shipfactory.hierarchy", hierarchy)
     return state
 
 

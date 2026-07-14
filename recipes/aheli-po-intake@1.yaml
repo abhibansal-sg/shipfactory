@@ -1,4 +1,4 @@
-schema: headframe.recipe/v1
+schema: shipfactory.recipe/v1
 id: aheli-po-intake
 version: 1
 status: active

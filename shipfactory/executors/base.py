@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # Keep this lane importable while config.py is being built.
-    from headframe.config import Seat
+    from shipfactory.config import Seat
 
 
 class Executor(ABC):
@@ -33,7 +33,7 @@ class Executor(ABC):
         Plain-text harnesses return the log unchanged. JSONL harnesses
         (codex ``--json``, claude ``stream-json``) MUST override this to
         pull the agent message text out of the event stream — otherwise
-        the HEADFRAME_RESULT / HEADFRAME_VERDICT sentinel protocol can never
+        the SHIPFACTORY_RESULT / SHIPFACTORY_VERDICT sentinel protocol can never
         match, because the raw log's last line is a machine event like
         ``{"type":"turn.completed",...}`` (finding #23, 2026-07-14).
         """

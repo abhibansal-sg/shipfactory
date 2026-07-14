@@ -1,4 +1,4 @@
-schema: headframe.recipe/v1
+schema: shipfactory.recipe/v1
 id: dev-pipeline
 version: 4
 status: active
@@ -48,7 +48,7 @@ steps:
 
       Approve when the request maps to executable, verifiable work.
 
-      Finish with the exact HEADFRAME_VERDICT JSON sentinel per
+      Finish with the exact SHIPFACTORY_VERDICT JSON sentinel per
 
       recipes/templates/plan-check.md (outcome/body schema, final line).
 
@@ -108,7 +108,7 @@ steps:
 
       Approve only with explicit APPROVE and clean-pass/no-findings wording when there is nothing to cite.
 
-      Finish with the exact HEADFRAME_VERDICT JSON sentinel required by the canonical contract.
+      Finish with the exact SHIPFACTORY_VERDICT JSON sentinel required by the canonical contract.
 
       '
     execution_profile: standard

@@ -1,8 +1,8 @@
-# Headframe
+# ShipFactory
 
-> *A headframe is the hoist structure that stands over a mine shaft. Workers extract value below; nothing surfaces without the operator's signal.*
+> *Specs in, shipped code out. Agents build below deck; nothing ships without the operator's signal.*
 
-Headframe is a governed software factory for [Hermes](https://hermes-agent.nousresearch.com) agents. It adds teams, hierarchy, review/approval policy, watchdog recovery, GitHub Issue sync, and cost telemetry on top of Hermes kanban.
+ShipFactory is a governed software factory for [Hermes](https://hermes-agent.nousresearch.com) agents. It adds teams, hierarchy, review/approval policy, watchdog recovery, GitHub Issue sync, and cost telemetry on top of Hermes kanban.
 
 ## Install
 
@@ -10,14 +10,14 @@ Copy this repository into the Hermes plugin directory:
 
 ```sh
 mkdir -p "$HERMES_HOME/plugins"
-cp -R . "$HERMES_HOME/plugins/headframe"
+cp -R . "$HERMES_HOME/plugins/shipfactory"
 ```
 
-If `HERMES_HOME` is unset, Hermes normally uses `~/.hermes`, so the installed path is `~/.hermes/plugins/headframe/`.
+If `HERMES_HOME` is unset, Hermes normally uses `~/.hermes`, so the installed path is `~/.hermes/plugins/shipfactory/`.
 
 ## Seat configuration
 
-`hermes headframe init` creates `$HERMES_HOME/headframe/seats.yaml`. A representative configuration is:
+`hermes shipfactory init` creates `$HERMES_HOME/shipfactory/seats.yaml`. A representative configuration is:
 
 ```yaml
 company: straits-lab-eng
@@ -45,10 +45,10 @@ hierarchy_gates:
 ## Quickstart
 
 ```sh
-hermes headframe init
-hermes headframe seats
-hermes headframe daemon --once
-hermes headframe dashboard
+hermes shipfactory init
+hermes shipfactory seats
+hermes shipfactory daemon --once
+hermes shipfactory dashboard
 ```
 
 The dashboard prints its localhost URL with the required token. Its default port is 18820.
@@ -66,7 +66,7 @@ counts do not shrink. An operator can authorize one more bounded revision with
 an audited reason:
 
 ```sh
-hermes headframe recipe release INSTANCE VERIFY_STEP --reason "operator rationale" --board BOARD
+hermes shipfactory recipe release INSTANCE VERIFY_STEP --reason "operator rationale" --board BOARD
 ```
 
 Approval gates and event waits carry a `CONTINUE-HERE` kanban comment and gain
@@ -76,10 +76,10 @@ work.
 
 ## GitHub webhook wake-up
 
-Explicit synchronization is available through `hermes headframe sync --board straits-lab-eng --repo OWNER/REPO`. To let Hermes wake targeted syncs for GitHub activity, add an Issues/Issue Comment/Pull Request subscription:
+Explicit synchronization is available through `hermes shipfactory sync --board straits-lab-eng --repo OWNER/REPO`. To let Hermes wake targeted syncs for GitHub activity, add an Issues/Issue Comment/Pull Request subscription:
 
 ```sh
-hermes webhook add --repo OWNER/REPO --events issues,issue_comment,pull_request --command "hermes headframe sync --board straits-lab-eng --repo OWNER/REPO"
+hermes webhook add --repo OWNER/REPO --events issues,issue_comment,pull_request --command "hermes shipfactory sync --board straits-lab-eng --repo OWNER/REPO"
 ```
 
 Hermes owns webhook transport and authentication; Factory uses the already-authenticated `gh` CLI and stores no GitHub token.

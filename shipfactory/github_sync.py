@@ -44,7 +44,7 @@ def _board(board: str | None) -> str:
 
     if board:
         return board
-    return str(getattr(_module("headframe.config").load_seats(), "company", ""))
+    return str(getattr(_module("shipfactory.config").load_seats(), "company", ""))
 
 
 def _gh_issues(repo: str) -> list[dict[str, Any]]:
@@ -108,7 +108,7 @@ def _conflict_log(winner: str, loser: str, issue: dict[str, Any], task: dict[str
     home = os.environ.get("HERMES_HOME")
     if not home:
         return
-    path = Path(home) / "headframe" / "sync-conflicts.jsonl"
+    path = Path(home) / "shipfactory" / "sync-conflicts.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "at": _now(),
@@ -188,7 +188,7 @@ def _edit_github(repo: str, issue: dict[str, Any], task: dict[str, Any]) -> None
 def _github_closed_is_allowed(task_id: str) -> bool:
     """Ask the policy engine whether a GitHub close may become kanban done."""
 
-    return bool(_module("headframe.policy").policy_satisfied(task_id))
+    return bool(_module("shipfactory.policy").policy_satisfied(task_id))
 
 
 def _apply_github_to_task(board: str, issue: dict[str, Any], task: dict[str, Any]) -> None:
@@ -209,7 +209,7 @@ def sync_once(board: str | None = None, repo: str | None = None) -> dict[str, in
     board_name = _board(board)
     if not repo:
         raise ValueError("repo is required for GitHub sync")
-    store = _module("headframe.store")
+    store = _module("shipfactory.store")
     issues = _gh_issues(repo)
     tasks = _kanban_tasks(board_name)
     by_task = {str(task.get("id", task.get("task_id"))): task for task in tasks}
