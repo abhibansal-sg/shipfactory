@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 
+DAEMON_RUN_TASK_ID = "__factory_daemon__"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,6 +125,52 @@ def record_run_end(run_id, exit_code, tokens_in, tokens_out, duration_s, result)
     with _connect() as conn:
         conn.execute("UPDATE runs SET ended_at=?,exit_code=?,tokens_in=?,tokens_out=?,tokens_total=?,duration_s=?,result=? WHERE id=?",
                      (_now(), exit_code, tokens_in, tokens_out, tokens_in + tokens_out, duration_s, result, run_id))
+
+
+def record_daemon_start(board: str, pid: int) -> int:
+    """Insert a durable Factory-daemon run record for liveness checks."""
+    return record_run_start(DAEMON_RUN_TASK_ID, board, "factory-daemon", "", pid)
+
+
+def record_daemon_tick(run_id: int, board: str) -> str:
+    """Persist the latest completed daemon tick on its run record."""
+    ticked_at = _now()
+    result = json.dumps(
+        {"kind": "factory_daemon", "board": board, "last_tick_at": ticked_at},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with _connect() as conn:
+        conn.execute("UPDATE runs SET result=? WHERE id=?", (result, run_id))
+    return ticked_at
+
+
+def record_daemon_end(run_id: int) -> None:
+    """Mark a daemon run cleanly stopped without changing its last tick."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE runs SET ended_at=?,exit_code=0 WHERE id=? AND ended_at IS NULL",
+            (_now(), run_id),
+        )
+
+
+def latest_daemon_run(board: str) -> dict[str, Any] | None:
+    """Return the latest durable daemon record for one board."""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE task_id=? AND seat=? ORDER BY id DESC LIMIT 1",
+            (DAEMON_RUN_TASK_ID, board),
+        ).fetchone()
+    if row is None:
+        return None
+    value = dict(row)
+    try:
+        payload = json.loads(value.get("result") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    value["last_tick_at"] = payload.get("last_tick_at")
+    return value
 
 
 def get_policy(task_id) -> dict | None:
@@ -282,7 +331,8 @@ def costs_rollup(by: str, since_days: int) -> list[dict]:
         return _rows(conn.execute(f"""SELECT {column} AS {by}, COUNT(*) AS runs,
           COALESCE(SUM(tokens_in),0) AS tokens_in, COALESCE(SUM(tokens_out),0) AS tokens_out,
           COALESCE(SUM(tokens_total),0) AS tokens_total, COALESCE(SUM(duration_s),0) AS duration_s
-          FROM runs WHERE started_at>=? GROUP BY {column} ORDER BY {column}""", (since,)))
+          FROM runs WHERE started_at>=? AND task_id<>?
+          GROUP BY {column} ORDER BY {column}""", (since, DAEMON_RUN_TASK_ID)))
 
 
 def sync_get(gh_number) -> dict | None:
@@ -302,4 +352,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_end", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_end", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "sync_get", "sync_upsert"]

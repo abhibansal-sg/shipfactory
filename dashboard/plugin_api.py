@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import argparse
+import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -30,6 +33,26 @@ class GateDecision(BaseModel):
     instance: str = Field(min_length=1)
     step: str = Field(min_length=1)
     reason: str = ""
+
+
+class InstantiateRecipe(BaseModel):
+    recipe: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    board: str = Field(min_length=1)
+    parameters: dict[str, object] = Field(default_factory=dict)
+    skip_steps: list[str] = Field(default_factory=list)
+
+
+class TriageTask(BaseModel):
+    title: str = Field(min_length=1)
+    body: str = ""
+    board: str = Field(min_length=1)
+
+
+class RerouteRecipe(BaseModel):
+    recipe: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    parameters: dict[str, object] = Field(default_factory=dict)
 
 
 def _latest_steps(db: Any, instance_id: str | None = None) -> list[dict[str, Any]]:
@@ -121,6 +144,233 @@ def _gate_or_400(instance_id: str, step_id: str) -> None:
         ).fetchone()
     if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting":
         raise HTTPException(status_code=400, detail="approval gate is not waiting")
+
+
+def _recipe_config() -> tuple[Any, dict[str, Any]]:
+    from factory.config import load_seats
+
+    config = load_seats()
+    recipes = config.recipes or {}
+    path = recipes.get("library_path")
+    if not path:
+        raise ValueError("recipes.library_path is not configured")
+    return config, recipes
+
+
+def _library(*, persist: bool = True) -> Any:
+    from factory.recipes.loader import load_library
+
+    config, recipes = _recipe_config()
+    return load_library(
+        recipes["library_path"],
+        seats=set(config.seats),
+        profiles=set((recipes.get("execution_profiles") or {}).keys()),
+        persist=persist,
+    )
+
+
+def _instance_board(instance_id: str) -> str:
+    store.init_db()
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT board FROM recipe_instances WHERE id=?", (instance_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown recipe instance")
+    return str(row["board"])
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _request_error(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+def _cancel_preview(instance_id: str, board: str) -> dict[str, Any]:
+    from factory.spawn import _RUNNING
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=board)
+    try:
+        report = advancer.cancel(conn, instance_id, dry_run=True)
+        suppressed = set(report.get("suppressed") or [])
+        workers_by_task = {
+            record["task_id"]: {
+                "task_id": record["task_id"],
+                "pid": record["proc"].pid,
+                "executor": record.get("executor"),
+            }
+            for record in _RUNNING.values()
+            if record.get("task_id") in suppressed
+        }
+        if suppressed:
+            placeholders = ",".join("?" for _ in suppressed)
+            rows = conn.execute(
+                f"SELECT id,worker_pid,assignee FROM tasks "
+                f"WHERE id IN ({placeholders}) AND worker_pid IS NOT NULL",
+                tuple(suppressed),
+            ).fetchall()
+            for row in rows:
+                workers_by_task.setdefault(
+                    row["id"],
+                    {
+                        "task_id": row["id"],
+                        "pid": row["worker_pid"],
+                        "executor": row["assignee"],
+                    },
+                )
+        report["workers"] = list(workers_by_task.values())
+        return report
+    finally:
+        conn.close()
+
+
+@router.get("/recipes")
+def list_recipes() -> list[dict[str, Any]]:
+    """Describe the configured recipe library without creating API-owned state."""
+    try:
+        library = _library(persist=False)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise _request_error(exc) from exc
+    items = []
+    for recipe in library.recipes.values():
+        document = recipe.document
+        items.append({
+            "id": document["id"],
+            "version": document["version"],
+            "status": document["status"],
+            "description": document["description"],
+            "parameters": document["parameters"],
+            "optional_steps": [
+                {"id": step["id"], "title": step["title"]}
+                for step in document["steps"] if step["optional"]
+            ],
+        })
+    return sorted(items, key=lambda item: (item["id"], item["version"]))
+
+
+@router.post("/instances")
+def create_instance(request: InstantiateRecipe) -> dict[str, Any]:
+    from factory.recipes.instantiate import instantiate
+    from hermes_cli import kanban_db
+
+    conn = None
+    try:
+        recipe = _library().get(f"{request.recipe}@{request.version}")
+        conn = kanban_db.connect(board=request.board)
+        return instantiate(
+            conn,
+            board=request.board,
+            recipe=recipe,
+            parameters=request.parameters,
+            skip_steps=request.skip_steps,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise _request_error(exc) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@router.post("/triage")
+def create_triage_task(request: TriageTask) -> dict[str, Any]:
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=request.board)
+    try:
+        task_id = kanban_db.create_task(
+            conn, title=request.title, body=request.body, triage=True
+        )
+        task = kanban_db.get_task(conn, task_id)
+        return {"task_id": task_id, "status": task.status, "board": request.board}
+    except ValueError as exc:
+        raise _request_error(exc) from exc
+    finally:
+        conn.close()
+
+
+@router.post("/instances/{instance_id}/reroute")
+def reroute_instance(instance_id: str, request: RerouteRecipe) -> dict[str, Any]:
+    from factory.cli import _reroute
+    from hermes_cli import kanban_db
+
+    board = _instance_board(instance_id)
+    conn = kanban_db.connect(board=board)
+    try:
+        _, recipes = _recipe_config()
+        args = argparse.Namespace(
+            instance=instance_id,
+            recipe=f"{request.recipe}@{request.version}",
+            parameters=json.dumps(request.parameters),
+            library=recipes["library_path"],
+            board=board,
+        )
+        return _reroute(conn, args)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise _request_error(exc) from exc
+    finally:
+        conn.close()
+
+
+@router.get("/instances/{instance_id}/cancel")
+def cancel_instance_preview(instance_id: str) -> dict[str, Any]:
+    board = _instance_board(instance_id)
+    try:
+        return _cancel_preview(instance_id, board)
+    except ValueError as exc:
+        raise _request_error(exc) from exc
+
+
+@router.post("/instances/{instance_id}/cancel")
+def cancel_instance(instance_id: str) -> dict[str, Any]:
+    from hermes_cli import kanban_db
+
+    board = _instance_board(instance_id)
+    conn = kanban_db.connect(board=board)
+    try:
+        return advancer.cancel(conn, instance_id)
+    except ValueError as exc:
+        raise _request_error(exc) from exc
+    finally:
+        conn.close()
+
+
+@router.get("/status")
+def factory_status() -> dict[str, Any]:
+    from hermes_cli import kanban_db
+
+    board = kanban_db.get_current_board()
+    try:
+        _, recipes = _recipe_config()
+    except (FileNotFoundError, OSError, ValueError):
+        recipes = {}
+    record = store.latest_daemon_run(board)
+    running = bool(
+        record and record.get("ended_at") is None and _pid_alive(record.get("pid"))
+    )
+    return {
+        "running": running,
+        "pid": record.get("pid") if running and record else None,
+        "last_tick_at": record.get("last_tick_at") if record else None,
+        "board": board,
+        "config": {
+            "recipes_enabled": bool(recipes.get("enabled")),
+            "library_path": recipes.get("library_path"),
+            "bare_task_recipe": recipes.get("bare_task_recipe"),
+        },
+    }
 
 
 @router.get("/instances")

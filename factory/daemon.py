@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -57,16 +58,25 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
 def run(conn, *, board: str | None = None, interval: float = 5.0,
         once: bool = False, sync: bool = False, sync_interval: float | None = None) -> dict[str, Any] | None:
     """Run Factory ticks until interrupted, or return one tick when ``once``."""
+    from factory import store
+    if board is None:
+        from hermes_cli.kanban_db import get_current_board
+        board = get_current_board()
+    run_id = store.record_daemon_start(board, os.getpid())
     last_sync = 0.0
-    while True:
-        now = time.monotonic()
-        do_sync = sync and (sync_interval is None or now - last_sync >= sync_interval)
-        result = tick(conn, board=board, sync=do_sync)
-        if do_sync:
-            last_sync = now
-        if once:
-            return result
-        time.sleep(max(0.01, interval))
+    try:
+        while True:
+            now = time.monotonic()
+            do_sync = sync and (sync_interval is None or now - last_sync >= sync_interval)
+            result = tick(conn, board=board, sync=do_sync)
+            store.record_daemon_tick(run_id, board)
+            if do_sync:
+                last_sync = now
+            if once:
+                return result
+            time.sleep(max(0.01, interval))
+    finally:
+        store.record_daemon_end(run_id)
 
 
 __all__ = ["tick", "run"]
