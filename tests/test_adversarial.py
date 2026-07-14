@@ -16,7 +16,6 @@ import pytest
 from factory import github_sync, store
 import factory.daemon as daemon
 import factory.spawn as spawn
-from factory.dashboard.server import create_server
 from factory.policy import citation_ok
 
 
@@ -95,53 +94,9 @@ def test_reap_does_not_wait_for_hung_executor_past_claim_ttl():
         spawn._RUNNING.clear()
 
 
-def test_dashboard_slow_accessor_does_not_block_other_request():
-    """ThreadingHTTPServer isolates a slow board read from another request."""
-    started = threading.Event()
-    release = threading.Event()
-
-    class SlowStore:
-        def board_tasks(self):
-            started.set()
-            release.wait(2)
-            return []
-
-        def costs_rollup(self, by, since):
-            return [{"seat": "dev", "runs": 0, "tokens_total": 0}]
-
-    try:
-        server = create_server(0, store=SlowStore(), token="secret")
-    except PermissionError:
-        pytest.skip("environment forbids localhost socket binding")
-    serving = threading.Thread(target=server.serve_forever, daemon=True)
-    serving.start()
-
-    def request(path):
-        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=1)
-        connection.request("GET", path)
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        return response.status, body
-
-    board_result = {}
-    board_thread = threading.Thread(
-        target=lambda: board_result.update(status=request("/?token=secret")), daemon=True
-    )
-    board_thread.start()
-    try:
-        assert started.wait(1)
-        begin = time.monotonic()
-        status, _ = request("/costs?token=secret")
-        assert status == 200
-        assert time.monotonic() - begin < 0.50
-    finally:
-        release.set()
-        board_thread.join(1)
-        server.shutdown()
-        server.server_close()
-        serving.join(1)
-    assert board_result["status"][0] == 200
+# NOTE: test_dashboard_slow_accessor removed with the retired standalone
+# dashboard server (§10-v2 delete-on-sight); the plugin tab's API is covered
+# by tests/test_dashboard_plugin.py.
 
 
 @pytest.mark.parametrize(
