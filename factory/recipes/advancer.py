@@ -11,6 +11,7 @@ from typing import Any
 
 from factory import store
 from .instantiate import recipe_for_instance, revision_vector
+from .instantiate import task_key
 from .primitives import activate, parse_verdict
 
 TERMINAL = {"done", "skipped", "cancelled", "failed"}
@@ -277,6 +278,17 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
 
             # Observe external task state before dependency readiness.
             for step in _latest(db, instance_id):
+                # notify steps have no kanban task — observe outbox delivery
+                # instead (shakedown finding #19: notify parked in waiting
+                # forever; nothing transitioned it after delivery).
+                if step["state"] == "waiting" and defs[step["step_id"]]["primitive"] == "notify" and not step["kanban_task_id"]:
+                    okey = task_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"])
+                    row = db.execute("SELECT state FROM outbox WHERE key=?", (okey,)).fetchone()
+                    if row and row["state"] == "delivered":
+                        changed |= _transition(db, instance, dict(step), "done", f"outbox:{okey[-12:]}")
+                    elif row and row["state"] == "failed":
+                        changed |= _transition(db, instance, dict(step), "blocked", f"outbox:{okey[-12:]}", reason="notify_delivery_failed")
+                    continue
                 if step["state"] not in {"running", "waiting"} or not step["kanban_task_id"]:
                     continue
                 task = kanban_db.get_task(conn, step["kanban_task_id"])
