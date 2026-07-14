@@ -69,3 +69,33 @@ def test_claude_extract_text_finds_sentinel_in_stream_json():
 
 def test_hermes_extract_text_passthrough():
     assert get_executor("hermes").extract_text("raw") == "raw"
+
+
+def test_codex_worktree_git_root_added_to_writable_roots(tmp_path):
+    """Finding #24: linked-worktree workspaces need the parent .git granted,
+    or codex's workspace-write sandbox denies index.lock and commits fail."""
+    repo_git = tmp_path / "repo" / ".git" / "worktrees" / "t_x"
+    repo_git.mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".git").write_text(f"gitdir: {repo_git}\n")
+    seat = SimpleNamespace(profile="dev", model="gpt-5", reasoning="")
+    cmd = get_executor("codex").build_cmd(seat, "prompt", str(ws))
+    joined = " ".join(cmd)
+    assert "sandbox_workspace_write.writable_roots" in joined
+    assert str(tmp_path / "repo" / ".git") in joined
+    # Regular checkout (.git is a directory): no extra grant.
+    plain = tmp_path / "plain"
+    (plain / ".git").mkdir(parents=True)
+    assert "writable_roots" not in " ".join(get_executor("codex").build_cmd(seat, "p", str(plain)))
+
+
+def test_worktree_git_root_helper(tmp_path):
+    from factory.executors.base import worktree_git_root
+    assert worktree_git_root(str(tmp_path)) is None  # no .git at all
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".git").write_text("not a pointer")
+    assert worktree_git_root(str(ws)) is None  # malformed pointer
+    (ws / ".git").write_text("gitdir: ../repo/.git/worktrees/t_y")
+    assert worktree_git_root(str(ws)) == str((tmp_path / "repo" / ".git").resolve())

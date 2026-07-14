@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 
-from .base import Executor, token_usage, write_identity
+from .base import Executor, token_usage, worktree_git_root, write_identity
 
 
 class CodexExecutor(Executor):
@@ -16,6 +16,13 @@ class CodexExecutor(Executor):
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build the Paperclip-style ``codex exec --json`` argv."""
         cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "workspace-write"]
+        git_root = worktree_git_root(workspace)
+        if git_root:
+            # Finding #24: kanban workspaces are git WORKTREES — their .git is
+            # a pointer file to <repo>/.git/worktrees/<name>, OUTSIDE the
+            # workspace. Without this, workspace-write blocks index.lock and
+            # every codex worker "completes" with an uncommitted tree.
+            cmd += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps([git_root])}"]
         if seat.model:
             cmd += ["--model", seat.model]
         if getattr(seat, "reasoning", ""):
