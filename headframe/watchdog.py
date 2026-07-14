@@ -253,7 +253,7 @@ def _at_or_after(value: Any, boundary: Any) -> bool:
 def _route_recovery(row: dict[str, Any], board: str, now: str) -> dict[str, Any]:
     """Execute one monitor recovery action and return an audit result."""
 
-    store = _module("factory.store")
+    store = _module("headframe.store")
     task_id = str(row["task_id"])
     if _at_or_after(now, row.get("timeout_at")):
         store.advance_monitor(task_id, now, close=True)
@@ -284,8 +284,8 @@ def _route_recovery(row: dict[str, Any], board: str, now: str) -> dict[str, Any]
             _run_kanban(board, ["assign", task_id, "--assignee", str(owner)])
         action = "wake_owner"
     else:
-        cfg = _module("factory.config").load_seats()
-        hierarchy = _module("factory.hierarchy")
+        cfg = _module("headframe.config").load_seats()
+        hierarchy = _module("headframe.hierarchy")
         seat = str(owner or task.get("assignee") or "")
         target = hierarchy.escalation_target(cfg, seat) if seat else None
         if policy in {"create_recovery_task", "create_recovery_issue"}:
@@ -316,7 +316,7 @@ def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None)
     supported as a compact form.
     """
 
-    store = _module("factory.store")
+    store = _module("headframe.store")
     if isinstance(conn, str) and board is not None and now_iso is None and "T" in board:
         now_iso, board, conn = board, conn, None
     elif isinstance(conn, str) and board is None:
@@ -324,7 +324,7 @@ def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None)
     now = now_iso or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     rows = store.due_monitors(now)
     if board is None:
-        board = getattr(_module("factory.config").load_seats(), "company", "")
+        board = getattr(_module("headframe.config").load_seats(), "company", "")
     return [_route_recovery(row, board, now) for row in rows]
 
 
@@ -333,7 +333,7 @@ def reconcile_watchdog(input: dict[str, Any], board: str | None = None) -> dict[
 
     result = classify_task_watchdog_subtree(input)
     if result.get("state") == "stopped":
-        store = _module("factory.store")
+        store = _module("headframe.store")
         watchdog = input.get("watchdog", {})
         root = watchdog.get("issueId", watchdog.get("root_task_id"))
         store.set_watchdog_fingerprint(root, result["stopFingerprint"])

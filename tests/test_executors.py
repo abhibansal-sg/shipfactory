@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from factory.executors import get_executor
+from headframe.executors import get_executor
 
 
 def test_codex_command_and_usage(tmp_path):
@@ -46,13 +46,13 @@ def test_codex_extract_text_finds_sentinel_in_jsonl():
     log = "\n".join([
         '{"type":"thread.started","thread_id":"abc"}',
         '{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls"}}',
-        '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"APPROVE ok\\n\\nFACTORY_VERDICT: {\\"outcome\\":\\"approve\\",\\"body\\":\\"clean\\"}"}}',
+        '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"APPROVE ok\\n\\nHEADFRAME_VERDICT: {\\"outcome\\":\\"approve\\",\\"body\\":\\"clean\\"}"}}',
         '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}',
     ])
     text = codex.extract_text(log)
-    assert text.splitlines()[-1].startswith("FACTORY_VERDICT:")
+    assert text.splitlines()[-1].startswith("HEADFRAME_VERDICT:")
     # Plain-text logs pass through unchanged (fallback contract).
-    assert codex.extract_text("no json here\nFACTORY_RESULT: done x") == "no json here\nFACTORY_RESULT: done x"
+    assert codex.extract_text("no json here\nHEADFRAME_RESULT: done x") == "no json here\nHEADFRAME_RESULT: done x"
 
 
 def test_claude_extract_text_finds_sentinel_in_stream_json():
@@ -60,10 +60,10 @@ def test_claude_extract_text_finds_sentinel_in_stream_json():
     log = "\n".join([
         '{"type":"system","subtype":"init"}',
         '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}',
-        '{"type":"result","result":"FACTORY_RESULT: done shipped the fix"}',
+        '{"type":"result","result":"HEADFRAME_RESULT: done shipped the fix"}',
     ])
     text = claude.extract_text(log)
-    assert text.splitlines()[-1] == "FACTORY_RESULT: done shipped the fix"
+    assert text.splitlines()[-1] == "HEADFRAME_RESULT: done shipped the fix"
     assert claude.extract_text("plain log") == "plain log"
 
 
@@ -91,7 +91,7 @@ def test_codex_worktree_git_root_added_to_writable_roots(tmp_path):
 
 
 def test_worktree_git_root_helper(tmp_path):
-    from factory.executors.base import worktree_git_root
+    from headframe.executors.base import worktree_git_root
     assert worktree_git_root(str(tmp_path)) is None  # no .git at all
     ws = tmp_path / "ws"
     ws.mkdir()

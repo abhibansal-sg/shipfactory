@@ -8,7 +8,7 @@ rework; read `daemon.py` and `factory/recipes/advancer.py` fresh, do not
 assume pre-merge line numbers.
 
 ## Context
-Repo: hermes-factory. Today `python -m factory.cli daemon --board <one>`
+Repo: hermes-factory. Today `python -m headframe.cli daemon --board <one>`
 serves exactly one board; the API layer is already multi-board (each
 recipe instance row carries its own `board`). The dashboard header chip
 reads the daemon run-row. Finding #20 (cosmetic, fold in): the chip can
@@ -31,7 +31,7 @@ db, corruption) logs + telemetry-events and moves on — it must NEVER kill
 the loop or starve the other boards (best-effort seam law).
 
 **M2 — Daemon run-row schema.** The liveness row
-(`runs` table, task_id='__factory_daemon__') currently records one board.
+(`runs` table, task_id='__headframe_daemon__') currently records one board.
 Record `boards: [..]` + per-board `last_tick_at`. Keep the old `board` key
 populated (first board) for one release so existing readers don't break;
 note the deprecation in the row.

@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from factory import store
-from factory import watchdog
+from headframe import store
+from headframe import watchdog
 
 
 def issue(issue_id, *, parent=None, status="ready", updated="2026-07-12T00:00:00Z"):
@@ -40,16 +40,16 @@ def test_classifier_live_and_pending_verdict_are_not_stopped():
 
 def test_tick_uses_recovery_ladder_and_kanban_cli(monkeypatch):
     calls = []
-    store = types.ModuleType("factory.store")
+    store = types.ModuleType("headframe.store")
     store.due_monitors = lambda now: [{"task_id": "T1", "recovery_policy": "wake_owner", "scheduled_by": "seat", "notes": "ping", "max_attempts": 3}]
     store.advance_monitor = lambda task_id, now, close=False: calls.append(("advance", task_id, now, close))
-    config = types.ModuleType("factory.config")
+    config = types.ModuleType("headframe.config")
     config.load_seats = lambda: SimpleNamespace(company="demo")
-    hierarchy = types.ModuleType("factory.hierarchy")
+    hierarchy = types.ModuleType("headframe.hierarchy")
     hierarchy.escalation_target = lambda cfg, seat: "manager"
-    monkeypatch.setitem(sys.modules, "factory.store", store)
-    monkeypatch.setitem(sys.modules, "factory.config", config)
-    monkeypatch.setitem(sys.modules, "factory.hierarchy", hierarchy)
+    monkeypatch.setitem(sys.modules, "headframe.store", store)
+    monkeypatch.setitem(sys.modules, "headframe.config", config)
+    monkeypatch.setitem(sys.modules, "headframe.hierarchy", hierarchy)
 
     def run(command, **kwargs):
         calls.append(command)
@@ -112,10 +112,10 @@ def test_terminal_escalation_happens_at_most_once(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
         "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
     })
-    monkeypatch.setitem(sys.modules, "factory.config", types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "headframe.config", types.SimpleNamespace(
         load_seats=lambda: SimpleNamespace(company="demo")
     ))
-    monkeypatch.setitem(sys.modules, "factory.hierarchy", types.SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "headframe.hierarchy", types.SimpleNamespace(
         escalation_target=lambda cfg, seat: None
     ))
     calls = []

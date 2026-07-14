@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from factory.hierarchy import chain, escalation_target, may_land, may_verdict, validate_acyclic
+from headframe.hierarchy import chain, escalation_target, may_land, may_verdict, validate_acyclic
 
 
 def test_chain_and_gates():

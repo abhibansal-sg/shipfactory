@@ -3,11 +3,11 @@
 Lane V1 exercises Factory through the real Hermes kanban database and real
 subprocesses. The only fake is the external AI harness: a temporary `/bin/sh`
 script emits captured-style Codex output (`tokens used\n1,234`) and its final
-`FACTORY_RESULT` protocol line.
+`HEADFRAME_RESULT` protocol line.
 
 Proven paths:
 
-- Kanban board creation, task dispatch, real `factory_spawn`, process polling,
+- Kanban board creation, task dispatch, real `headframe_spawn`, process polling,
   result parsing, task transition, and durable run telemetry.
 - Successful and blocked sentinels, including exit-0 without a sentinel being
   blocked as `no result sentinel`.

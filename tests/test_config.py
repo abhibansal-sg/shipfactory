@@ -3,7 +3,7 @@ import types
 
 import pytest
 
-from factory.config import FactoryConfigError, load_seats
+from headframe.config import FactoryConfigError, load_seats
 
 
 def _profiles(monkeypatch):
@@ -18,7 +18,7 @@ def _profiles(monkeypatch):
 def test_load_seats_and_defaults(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _profiles(monkeypatch)
-    path = tmp_path / "factory" / "seats.yaml"
+    path = tmp_path / "headframe" / "seats.yaml"
     path.parent.mkdir()
     path.write_text("""company: demo
 seats:

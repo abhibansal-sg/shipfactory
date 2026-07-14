@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-DAEMON_RUN_TASK_ID = "__factory_daemon__"
+DAEMON_RUN_TASK_ID = "__headframe_daemon__"
 
 
 def _now() -> str:
@@ -22,7 +22,7 @@ def _db_path() -> Path:
     if not home:
         from hermes_constants import get_hermes_home
         home = str(get_hermes_home())
-    return Path(home) / "factory" / "factory.db"
+    return Path(home) / "headframe" / "headframe.db"
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -153,7 +153,7 @@ def _daemon_payload(
 ) -> dict[str, Any]:
     """Build the one-release-compatible daemon liveness payload."""
     return {
-        "kind": "factory_daemon",
+        "kind": "headframe_daemon",
         "board": boards[0],
         "board_deprecation": "board is retained for one release; use boards",
         "boards": boards,
@@ -171,7 +171,7 @@ def record_daemon_start(
 ) -> int:
     """Insert a durable Factory-daemon run record for all served boards."""
     names = list(dict.fromkeys(boards or [board]))
-    run_id = record_run_start(DAEMON_RUN_TASK_ID, names[0], "factory-daemon", "", pid)
+    run_id = record_run_start(DAEMON_RUN_TASK_ID, names[0], "headframe-daemon", "", pid)
     payload = _daemon_payload(
         names,
         {name: None for name in names},

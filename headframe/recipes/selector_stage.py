@@ -7,8 +7,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from factory import store
-from factory.config import load_seats, selector_config
+from headframe import store
+from headframe.config import load_seats, selector_config
 from .instantiate import instantiate
 from .loader import RecipeError, load_library
 from .selector import (
@@ -85,7 +85,7 @@ def _promote_for_parking(conn: Any, source_task_id: str) -> None:
     from hermes_cli import kanban_db
     task = kanban_db.get_task(conn, source_task_id)
     if task and task.status == "triage":
-        if not kanban_db.specify_triage_task(conn, source_task_id, author="factory-selector"):
+        if not kanban_db.specify_triage_task(conn, source_task_id, author="headframe-selector"):
             raise RuntimeError("selector source moved before parking")
     kanban_db.assign_task(conn, source_task_id, None)
 
@@ -180,7 +180,7 @@ def _finish_root(conn: Any, source_task_id: str, collectors: list[str]) -> None:
     from hermes_cli import kanban_db
     task = kanban_db.get_task(conn, source_task_id)
     if task and task.status == "triage":
-        if not kanban_db.specify_triage_task(conn, source_task_id, author="factory-selector"):
+        if not kanban_db.specify_triage_task(conn, source_task_id, author="headframe-selector"):
             raise RuntimeError("selector source moved before root conversion")
     kanban_db.assign_task(conn, source_task_id, None)
     task = kanban_db.get_task(conn, source_task_id)

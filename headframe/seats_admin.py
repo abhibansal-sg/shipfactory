@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from factory.config import EXECUTORS, FactoryConfigError
+from headframe.config import EXECUTORS, FactoryConfigError
 
 
 def _hermes_home() -> Path:
@@ -23,7 +23,7 @@ def _hermes_home() -> Path:
 
 
 def _seats_path() -> Path:
-    return _hermes_home() / "factory" / "seats.yaml"
+    return _hermes_home() / "headframe" / "seats.yaml"
 
 
 def _profile_path(profile: str) -> Path:
@@ -146,7 +146,7 @@ def _seat_record(name: str, values: dict[str, Any]) -> dict[str, Any]:
 
 def _write_seat(name: str, values: dict[str, Any], *, create: bool, provider_config: dict[str, Any] | None) -> dict[str, Any]:
     path = _seats_path()
-    document, header = _load_mapping(path, missing={"company": "hermes-factory", "seats": {}})
+    document, header = _load_mapping(path, missing={"company": "headframe", "seats": {}})
     seats = document.get("seats")
     if not isinstance(seats, dict):
         raise FactoryConfigError("seats must be a mapping")
@@ -217,7 +217,7 @@ def profile_provider_config(profile: str) -> dict[str, str] | None:
 
 def seat_details() -> list[dict[str, Any]]:
     """Read seats with the two source-of-truth models exposed for operators."""
-    from factory.config import load_seats
+    from headframe.config import load_seats
     rows: list[dict[str, Any]] = []
     for seat in load_seats().seats.values():
         configured = profile_model(seat.profile)

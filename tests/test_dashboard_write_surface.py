@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from factory import store
+from headframe import store
 
 
 PLUGIN_API = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
@@ -25,12 +25,12 @@ def _client() -> TestClient:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     app = FastAPI()
-    app.include_router(module.router, prefix="/api/plugins/factory")
+    app.include_router(module.router, prefix="/api/plugins/headframe")
     return TestClient(app)
 
 
 def _recipe_text(recipe_id: str, first_step: str) -> str:
-    return f"""schema: factory.recipe/v1
+    return f"""schema: headframe.recipe/v1
 id: {recipe_id}
 version: 1
 status: active
@@ -78,10 +78,10 @@ def _configure_library(tmp_path: Path, monkeypatch) -> Path:
         "dispatcher_max_in_progress": 2,
         "execution_profiles": {},
     }
-    import factory.config
+    import headframe.config
 
     monkeypatch.setattr(
-        factory.config,
+        headframe.config,
         "load_seats",
         lambda: SimpleNamespace(seats={}, recipes=recipes),
     )
@@ -107,7 +107,7 @@ def _payload(recipe: str = "route-a") -> dict:
 def test_recipes_endpoint_lists_schema_and_optional_steps(tmp_path, monkeypatch):
     _configure_library(tmp_path, monkeypatch)
 
-    response = _client().get("/api/plugins/factory/recipes")
+    response = _client().get("/api/plugins/headframe/recipes")
 
     assert response.status_code == 200
     recipe = response.json()[0]
@@ -123,7 +123,7 @@ def test_instances_endpoint_instantiates_and_rejects_invalid_parameters(
     _configure_library(tmp_path, monkeypatch)
     client = _client()
 
-    created = client.post("/api/plugins/factory/instances", json=_payload())
+    created = client.post("/api/plugins/headframe/instances", json=_payload())
 
     assert created.status_code == 200
     instance_id = created.json()["instance_id"]
@@ -138,7 +138,7 @@ def test_instances_endpoint_instantiates_and_rejects_invalid_parameters(
 
     invalid = _payload()
     invalid["parameters"]["effort"] = "three"
-    rejected = client.post("/api/plugins/factory/instances", json=invalid)
+    rejected = client.post("/api/plugins/headframe/instances", json=invalid)
 
     assert rejected.status_code == 400
     assert rejected.json()["detail"] == "parameter effort has wrong type"
@@ -151,7 +151,7 @@ def test_triage_endpoint_creates_a_real_triage_task(tmp_path, monkeypatch):
     client = _client()
 
     response = client.post(
-        "/api/plugins/factory/triage",
+        "/api/plugins/headframe/triage",
         json={"title": "Investigate release blocker", "body": "Collect context", "board": "default"},
     )
 
@@ -172,10 +172,10 @@ def test_triage_endpoint_creates_a_real_triage_task(tmp_path, monkeypatch):
 def test_reroute_endpoint_uses_cli_replacement_path(tmp_path, monkeypatch):
     _configure_library(tmp_path, monkeypatch)
     client = _client()
-    created = client.post("/api/plugins/factory/instances", json=_payload()).json()
+    created = client.post("/api/plugins/headframe/instances", json=_payload()).json()
 
     response = client.post(
-        f"/api/plugins/factory/instances/{created['instance_id']}/reroute",
+        f"/api/plugins/headframe/instances/{created['instance_id']}/reroute",
         json={
             "recipe": "route-b",
             "version": 1,
@@ -197,7 +197,7 @@ def test_reroute_endpoint_uses_cli_replacement_path(tmp_path, monkeypatch):
 def test_cancel_requires_preview_then_explicit_confirm(tmp_path, monkeypatch):
     _configure_library(tmp_path, monkeypatch)
     client = _client()
-    created = client.post("/api/plugins/factory/instances", json=_payload()).json()
+    created = client.post("/api/plugins/headframe/instances", json=_payload()).json()
     instance_id = created["instance_id"]
     from hermes_cli import kanban_db
 
@@ -213,7 +213,7 @@ def test_cancel_requires_preview_then_explicit_confirm(tmp_path, monkeypatch):
             (task_id, instance_id),
         )
 
-    from factory.spawn import _RUNNING
+    from headframe.spawn import _RUNNING
 
     _RUNNING[98765] = {
         "task_id": task_id,
@@ -222,7 +222,7 @@ def test_cancel_requires_preview_then_explicit_confirm(tmp_path, monkeypatch):
     }
     try:
         preview = client.get(
-            f"/api/plugins/factory/instances/{instance_id}/cancel"
+            f"/api/plugins/headframe/instances/{instance_id}/cancel"
         )
     finally:
         _RUNNING.pop(98765, None)
@@ -238,7 +238,7 @@ def test_cancel_requires_preview_then_explicit_confirm(tmp_path, monkeypatch):
         ).fetchone()["status"] == "running"
 
     confirmed = client.post(
-        f"/api/plugins/factory/instances/{instance_id}/cancel"
+        f"/api/plugins/headframe/instances/{instance_id}/cancel"
     )
 
     assert confirmed.status_code == 200
@@ -253,7 +253,7 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
     _configure_library(tmp_path, monkeypatch)
     client = _client()
 
-    stopped = client.get("/api/plugins/factory/status")
+    stopped = client.get("/api/plugins/headframe/status")
 
     assert stopped.status_code == 200
     assert stopped.json() == {
@@ -272,7 +272,7 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
 
     run_id = store.record_daemon_start("default", os.getpid())
     ticked_at = store.record_daemon_tick(run_id, "default")
-    running = client.get("/api/plugins/factory/status")
+    running = client.get("/api/plugins/headframe/status")
 
     assert running.status_code == 200
     assert running.json()["running"] is True
@@ -284,7 +284,7 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
 
     store.record_daemon_start("default", 999999)
     monkeypatch.setattr(os, "kill", lambda *_args: (_ for _ in ()).throw(ProcessLookupError()))
-    stale = client.get("/api/plugins/factory/status")
+    stale = client.get("/api/plugins/headframe/status")
     assert stale.json()["running"] is False
     assert stale.json()["pid"] is None
 
@@ -307,7 +307,7 @@ def test_status_uses_daemon_boards_and_marks_ticks_over_three_intervals_stale(
             (json.dumps(payload), run_id),
         )
 
-    status = _client().get("/api/plugins/factory/status").json()
+    status = _client().get("/api/plugins/headframe/status").json()
 
     assert status["board"] == "served-a"
     assert [item["board"] for item in status["boards"]] == ["served-a", "served-b"]

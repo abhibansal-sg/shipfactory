@@ -6,7 +6,7 @@ import json
 import uuid
 from typing import Any
 
-from factory import store
+from headframe import store
 from .loader import Recipe, bind_parameters
 
 

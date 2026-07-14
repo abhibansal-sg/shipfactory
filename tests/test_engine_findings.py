@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from factory import daemon, store
-from factory.recipes.advancer import apply_events, cancel, reconcile
-from factory.recipes.instantiate import instantiate
-from factory.recipes.loader import RecipeError, load_library
+from headframe import daemon, store
+from headframe.recipes.advancer import apply_events, cancel, reconcile
+from headframe.recipes.instantiate import instantiate
+from headframe.recipes.loader import RecipeError, load_library
 
 
 PROFILES = {
@@ -28,7 +28,7 @@ def _write_recipe(path: Path, *, recipe_id: str = "finding", steps: str,
                   parameters: str = "{}", max_tokens: int = 500_000):
     path.mkdir()
     (path / f"{recipe_id}@1.yaml").write_text(
-        f"""schema: factory.recipe/v1
+        f"""schema: headframe.recipe/v1
 id: {recipe_id}
 version: 1
 status: active
@@ -86,9 +86,9 @@ def _pending_events() -> int:
 
 def test_finding_14_tick_reconciles_without_events(tmp_path, kanban_conn, monkeypatch):
     """A completed task advances on the daemon tick even when no hook was queued."""
-    from factory import config as factory_config
-    from factory import watchdog
-    from factory.recipes import advancer
+    from headframe import config as factory_config
+    from headframe import watchdog
+    from headframe.recipes import advancer
     from hermes_cli import kanban_db
 
     store.init_db()
@@ -113,7 +113,7 @@ def test_finding_14_tick_reconciles_without_events(tmp_path, kanban_conn, monkey
     monkeypatch.setattr(factory_config, "load_seats", lambda: cfg)
     monkeypatch.setattr(advancer, "startup_guard", lambda config: None)
     monkeypatch.setattr(kanban_db, "dispatch_once", lambda *args, **kwargs: 0)
-    monkeypatch.setattr("factory.spawn.reap_finished", lambda: [])
+    monkeypatch.setattr("headframe.spawn.reap_finished", lambda: [])
     monkeypatch.setattr(watchdog, "tick", lambda *args, **kwargs: None)
 
     daemon.tick(kanban_conn, board="test")
@@ -313,7 +313,7 @@ def test_finding_15_approval_gate_parks_with_upstream_case_file(tmp_path, kanban
     )
     reconcile(kanban_conn, "approval-evidence", profiles=PROFILES)
     verify = _step("approval-evidence", "verify")
-    verdict = "FACTORY_VERDICT: " + json.dumps(
+    verdict = "HEADFRAME_VERDICT: " + json.dumps(
         {"outcome": "approve", "body": "APPROVE clean pass"}, separators=(",", ":")
     )
     assert kanban_db.complete_task(
@@ -367,7 +367,7 @@ def test_finding_7_templated_seat_is_validated_after_binding(tmp_path, kanban_co
     library_path = tmp_path / "library"
     library_path.mkdir()
     (library_path / "templated-seat@1.yaml").write_text(
-        """schema: factory.recipe/v1
+        """schema: headframe.recipe/v1
 id: templated-seat
 version: 1
 status: active
@@ -432,8 +432,8 @@ def test_finding_10_database_health_failure_is_loud_and_best_effort(
     monkeypatch, caplog
 ):
     """Checkpoint/quick-check failures emit telemetry but never abort dispatch."""
-    from factory import watchdog
-    from factory import telemetry
+    from headframe import watchdog
+    from headframe import telemetry
     from hermes_cli import kanban_db
 
     class BrokenHealthConnection:
@@ -446,7 +446,7 @@ def test_finding_10_database_health_failure_is_loud_and_best_effort(
     monkeypatch.setattr(daemon, "_DB_HEALTH_EVERY_TICKS", 1)
     monkeypatch.setattr(daemon, "_db_health_tick", 0)
     monkeypatch.setattr(kanban_db, "dispatch_once", lambda *args, **kwargs: "dispatched")
-    monkeypatch.setattr("factory.spawn.reap_finished", lambda: [])
+    monkeypatch.setattr("headframe.spawn.reap_finished", lambda: [])
     monkeypatch.setattr(watchdog, "tick", lambda *args, **kwargs: None)
     monkeypatch.setattr(telemetry, "append_jsonl", records.append)
     caplog.set_level(logging.ERROR)

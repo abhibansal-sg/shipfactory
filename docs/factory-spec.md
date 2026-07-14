@@ -2,7 +2,7 @@
 
 Date: 2026-07-12. Ratified by: Abhi. Author: Hermes (operator).
 Repo: ~/Developer/products/hermes-factory (standalone plugin repo, installed
-into ~/.hermes/plugins/factory/).
+into ~/.hermes/plugins/headframe/).
 
 ## 0. Mission
 
@@ -35,7 +35,7 @@ HARD RULES
 
 ```
 GitHub Issues <--sync--> kanban board (per company) <-- factory daemon
-                                                          |  dispatch_once(spawn_fn=factory_spawn)
+                                                          |  dispatch_once(spawn_fn=headframe_spawn)
                                                           v
                                             executor layer (per-seat config)
                                             | hermes | codex | claude |
@@ -55,14 +55,14 @@ factory/
   plugin.yaml           # name: factory, kind: general
   config.py             # load/validate factory config + seat registry
   store.py              # factory.db SQLite schema + migrations + accessors
-  spawn.py              # factory_spawn(task, workspace, board) -> pid
+  spawn.py              # headframe_spawn(task, workspace, board) -> pid
   daemon.py             # dispatch loop: dispatch_once(spawn_fn=...) + watchdog tick
   policy.py             # execution-policy engine (review/approval stages)
   telemetry.py          # token/cost parsing + JSONL + rollups
   watchdog.py           # monitors + subtree watchdogs + recovery ladder
   hierarchy.py          # reportsTo chain, roles, permission checks
   github_sync.py        # two-way GitHub Issues <-> kanban sync
-  cli.py                # `hermes factory <verb>` argparse tree
+  cli.py                # `hermes headframe <verb>` argparse tree
   executors/
     __init__.py         # registry: get_executor(name)
     base.py             # Executor ABC: build_cmd, parse_usage, inject_identity
@@ -83,7 +83,7 @@ docs/
 
 ## 3. Seat model (config)
 
-`$HERMES_HOME/factory/seats.yaml`:
+`$HERMES_HOME/headframe/seats.yaml`:
 ```yaml
 company: straits-lab-eng          # kanban board slug
 seats:
@@ -111,7 +111,7 @@ executor known, reports_to acyclic, roles from PC's AGENT_ROLES list.
 
 ## 4. Executor layer (spawn.py + executors/)
 
-`factory_spawn(task, workspace, board) -> Optional[int]`:
+`headframe_spawn(task, workspace, board) -> Optional[int]`:
 1. Look up task.assignee in seat registry. Unknown seat -> return None
    (dispatcher skips, same semantics as skipped_nonspawnable).
 2. executor=hermes -> delegate to kanban_db._default_spawn unchanged.
@@ -121,7 +121,7 @@ executor known, reports_to acyclic, roles from PC's AGENT_ROLES list.
    - Build task prompt from kanban build_worker_context(conn, task_id) EXACT
      same context the hermes worker gets (import from hermes_cli.kanban_db).
    - Spawn subprocess.Popen (fire-and-forget, new session), redirect output
-     to $HERMES_HOME/factory/runs/<task_id>-<ts>.log, return pid.
+     to $HERMES_HOME/headframe/runs/<task_id>-<ts>.log, return pid.
 4. Record run row in factory.db (seat, task, executor, model, pid, started_at).
 5. On child exit (daemon reaps via pid polling — same pattern as kanban's
    _record_worker_exit): parse usage from log (telemetry.py), finalize run row,
@@ -129,7 +129,7 @@ executor known, reports_to acyclic, roles from PC's AGENT_ROLES list.
    claude workers cannot call kanban tools — the DAEMON transitions the task
    from the harness's exit code + a DONE/BLOCKED sentinel line the prompt
    instructs the harness to print as its last output:
-   `FACTORY_RESULT: done|blocked <one-line summary>`).
+   `HEADFRAME_RESULT: done|blocked <one-line summary>`).
    Missing sentinel + exit 0 = blocked with reason "no result sentinel"
    (case-law: exit-0 is not success).
 
@@ -153,7 +153,7 @@ issue-execution-policy.d.ts) onto kanban:
      to ready assigned to next stage participant) and logs a decision row.
      Completion only sticks when the policy state machine says all stages
      passed.
-  b. Stage verdicts are recorded via `hermes factory verdict <task> \
+  b. Stage verdicts are recorded via `hermes headframe verdict <task> \
      --stage review --outcome approve|request_changes --body ...` (tool +
      CLI; the verdict body must pass governor-style citation check:
      file:line regex OR clean-approve, port the verdict-proof regex from
@@ -181,8 +181,8 @@ issue-execution-policy.d.ts) onto kanban:
 
 - runs table: (id, task_id, seat, executor, model, started_at, ended_at,
   exit_code, tokens_in, tokens_out, tokens_total, duration_s, result).
-- JSONL mirror at $HERMES_HOME/factory/telemetry.jsonl (append-only).
-- Rollups (pure SQL): by seat/day, by executor, by task; `hermes factory
+- JSONL mirror at $HERMES_HOME/headframe/telemetry.jsonl (append-only).
+- Rollups (pure SQL): by seat/day, by executor, by task; `hermes headframe
   costs [--by seat|executor|task] [--since 7d]` prints a table.
 - This answers "is PC burning more than Hermes-native": same work, measured
   per run from day one.
@@ -190,7 +190,7 @@ issue-execution-policy.d.ts) onto kanban:
 ## 8. GitHub sync (github_sync.py)
 
 - One-way-each-direction explicit sync (NOT a hidden daemon thread):
-  `hermes factory sync [--board X] [--repo owner/name]` +
+  `hermes headframe sync [--board X] [--repo owner/name]` +
   optional daemon flag --sync-interval.
 - gh CLI (already authed) via subprocess; NO tokens in config.
 - Mapping: GH issue <-> kanban task; labels seat:<name> -> assignee;
@@ -212,7 +212,7 @@ issue-execution-policy.d.ts) onto kanban:
 - Gates: may_land(seat), may_verdict(seat) from hierarchy_gates. policy.py
   and cli.py consult these — a verdict from a non-verdict seat is rejected
   at write time (the PR#138 lane-breach class, enforced in code).
-- org chart: `hermes factory org` prints the tree ASCII.
+- org chart: `hermes headframe org` prints the tree ASCII.
 
 ## 10. Dashboard — HERMES DASHBOARD TAB (§10-v2, operator law 2026-07-13)
 
@@ -222,9 +222,9 @@ RETIRED. Abhi ruled (twice — 2nd time 2026-07-13, first during an earlier
 session): factory UI lives INSIDE the Hermes dashboard via the first-class
 plugin-dashboard extension system. No second server, port, token, or
 maintenance surface. LAW FOR ALL FUTURE LANES: any factory UI work targets
-plugins/factory/dashboard/{manifest.json,plugin_api.py,dist/} —
+plugins/headframe/dashboard/{manifest.json,plugin_api.py,dist/} —
 the same mechanism the kanban plugin tab uses. The standalone server code
-may be deleted on sight after the tab ships; hermes factory dashboard CLI
+may be deleted on sight after the tab ships; hermes headframe dashboard CLI
 verb prints a pointer to the dashboard URL instead of serving.
 
 Tab spec (v1 views, priority order):
@@ -242,7 +242,7 @@ data layer the CLI verbs read; no new state).
 
 ## 11. CLI (cli.py) — registered via ctx.register_cli_command
 
-`hermes factory <verb>`: init (write seats.yaml skeleton + db), seats,
+`hermes headframe <verb>`: init (write seats.yaml skeleton + db), seats,
 org, daemon (runs dispatch+watchdog+optional sync loop; --once for one
 tick), verdict, policy (show/set per task), monitor (add/list), watchdog
 (add/list), costs, sync, dashboard, runs, pause/resume <seat>.
@@ -254,8 +254,8 @@ register(ctx):
 - Hooks: kanban_task_completed -> policy.on_complete;
   kanban_task_blocked -> watchdog.on_block (monitor bump);
   kanban_task_claimed -> telemetry.on_claim (run row precreate).
-- Tools (service-gated on factory.db existing): factory_verdict,
-  factory_costs, factory_monitor_add — JSON-string returns per Hermes tool
+- Tools (service-gated on factory.db existing): headframe_verdict,
+  headframe_costs, headframe_monitor_add — JSON-string returns per Hermes tool
   contract.
 
 ## 13. Testing contract (every lane)
@@ -267,7 +267,7 @@ register(ctx):
   fingerprint unchanged skip, conflict both-updated, usage parse of real
   captured codex/claude output samples — include fixture strings).
 - A tests/test_e2e_smoke.py: init -> create task on a tmp board (real
-  kanban_db API against tmp db) -> factory_spawn with executor=hermes
+  kanban_db API against tmp db) -> headframe_spawn with executor=hermes
   stubbed spawn -> complete -> policy reopen -> verdict -> done. Proves the
   whole loop headless.
 
@@ -320,11 +320,11 @@ telemetry.py MUST export:
   append_jsonl(record: dict) -> None ; on_claim(task_id, board, assignee, **kw) -> None
 
 spawn.py MUST export:
-  factory_spawn(task, workspace: str, *, board=None) -> int|None   # signature matches kanban spawn_fn
+  headframe_spawn(task, workspace: str, *, board=None) -> int|None   # signature matches kanban spawn_fn
   reap_finished() -> list[dict]  # poll recorded pids, finalize runs, transition tasks via kanban CLI
 
 Sentinel (executor prompts MUST instruct, daemon MUST parse):
-  last line of harness output: `FACTORY_RESULT: done|blocked <summary>`
+  last line of harness output: `HEADFRAME_RESULT: done|blocked <summary>`
 
 All timestamps ISO8601 UTC strings. All public functions get docstrings.
 
@@ -340,10 +340,10 @@ execution-context answer (what runs where; what does a SLOW callee do),
 Files: tests/test_e2e_smoke.py, tests/test_e2e_cli.py, docs/VALIDATION.md
 - test_e2e_smoke.py: NO stubs of factory modules. tmp HERMES_HOME; create a
   REAL kanban board via hermes_cli.kanban_db (sys.path to
-  ~/Developer/products/hermes-mobile); real factory.store init_db; real
+  ~/Developer/products/hermes-mobile); real headframe.store init_db; real
   seats.yaml via factory.config; add a task; run kanban dispatch_once with
-  the REAL factory_spawn but executor command swapped to a /bin/sh stub
-  harness that prints tokens + FACTORY_RESULT sentinel (spawn a REAL
+  the REAL headframe_spawn but executor command swapped to a /bin/sh stub
+  harness that prints tokens + HEADFRAME_RESULT sentinel (spawn a REAL
   subprocess — only the AI harness binary is faked); reap_finished();
   assert: run row finalized w/ parsed tokens, task transitioned; then a
   policy: set a review stage, complete the task, assert policy.on_complete
@@ -371,7 +371,7 @@ diff, comment with #16-V2 tag).
      block and TTL semantics hold.
   c. Dashboard under a slow store accessor — server thread must not wedge
      other requests indefinitely (document if single-threaded by design).
-  d. Malformed FACTORY_RESULT lines (garbage, multiple, mid-log) — parser
+  d. Malformed HEADFRAME_RESULT lines (garbage, multiple, mid-log) — parser
      must be last-line-wins, never crash.
   e. store.py under concurrent writers (2 threads x 50 ops) — no
      sqlite 'database is locked' unhandled (WAL or busy_timeout = fix).
@@ -434,7 +434,7 @@ Every referenced execution profile and seat MUST exist at startup. Factory SHALL
 Published recipes SHALL use this exact shape:
 
 ```yaml
-schema: factory.recipe/v1
+schema: headframe.recipe/v1
 id: dev-pipeline
 version: 1
 status: active
@@ -513,11 +513,11 @@ Exactly five primitives SHALL ship:
 
    Required params are the same as `agent_task`. The worker’s last line MUST be:
 
-   `FACTORY_VERDICT: {"outcome":"approve","body":"..."}`
+   `HEADFRAME_VERDICT: {"outcome":"approve","body":"..."}`
 
    or:
 
-   `FACTORY_VERDICT: {"outcome":"request_changes","target_step":"step-id","body":"..."}`
+   `HEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"step-id","body":"..."}`
 
    The body MUST pass citation validation. A change request MUST name one transitive upstream `agent_task`. The advancer SHALL invalidate the dependency cone from that target through the rejecting gate, insert new activations for affected steps, and bind all later decisions to the new upstream revision vector.
 

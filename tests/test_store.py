@@ -1,6 +1,6 @@
 import sqlite3
 
-from factory import store
+from headframe import store
 
 
 def test_run_policy_decisions_and_rollup(tmp_path, monkeypatch):
@@ -41,7 +41,7 @@ def test_monitors_watchdogs_pause_and_sync(tmp_path, monkeypatch):
 
 def test_init_db_migrates_legacy_monitor_table(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    path = tmp_path / "factory" / "factory.db"
+    path = tmp_path / "headframe" / "headframe.db"
     path.parent.mkdir(parents=True)
     with sqlite3.connect(path) as conn:
         conn.execute("""CREATE TABLE monitors (

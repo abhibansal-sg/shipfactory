@@ -46,7 +46,7 @@ hierarchy_gates:
 
 def _home() -> Path:
     """Return Factory's state directory."""
-    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "factory"
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "headframe"
 
 
 def _emit(value: Any) -> Any:
@@ -68,7 +68,7 @@ def _since_days(value: str) -> int:
 
 
 def _init(args: argparse.Namespace) -> dict[str, Any]:
-    from factory import store
+    from headframe import store
     root = _home()
     root.mkdir(parents=True, exist_ok=True)
     seats = root / "seats.yaml"
@@ -82,14 +82,14 @@ def _init(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _seats(_args: argparse.Namespace) -> list[dict[str, Any]]:
-    from factory.config import load_seats
+    from headframe.config import load_seats
     cfg = load_seats()
     rows = [vars(seat) for seat in cfg.seats.values()]
     return _emit(rows)
 
 
 def _seat_create(args: argparse.Namespace) -> dict[str, Any]:
-    from factory.seats_admin import create_seat
+    from headframe.seats_admin import create_seat
     return _emit(create_seat(
         args.name, args.profile, args.executor, args.model, args.reasoning,
         args.role, args.max_concurrent, _provider_config_from_args(args),
@@ -97,7 +97,7 @@ def _seat_create(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _seat_update(args: argparse.Namespace) -> dict[str, Any]:
-    from factory.seats_admin import update_seat
+    from headframe.seats_admin import update_seat
     return _emit(update_seat(
         args.name, args.profile, args.executor, args.model, args.reasoning,
         args.role, args.max_concurrent, _provider_config_from_args(args),
@@ -105,7 +105,7 @@ def _seat_update(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _seat_list(_args: argparse.Namespace) -> list[dict[str, Any]]:
-    from factory.seats_admin import seat_details
+    from headframe.seats_admin import seat_details
     return _emit(seat_details())
 
 
@@ -119,7 +119,7 @@ def _provider_config_from_args(args: argparse.Namespace) -> dict[str, Any] | Non
 
 
 def _org(_args: argparse.Namespace) -> str:
-    from factory.config import load_seats
+    from headframe.config import load_seats
     cfg = load_seats()
     children: dict[str | None, list[str]] = {}
     for name, seat in cfg.seats.items():
@@ -136,7 +136,7 @@ def _org(_args: argparse.Namespace) -> str:
 
 
 def _daemon(args: argparse.Namespace) -> Any:
-    from factory import daemon
+    from headframe import daemon
     from hermes_cli import kanban_db
     def argument_values(value: Any) -> list[Any]:
         if value is None:
@@ -182,12 +182,12 @@ def _daemon(args: argparse.Namespace) -> Any:
 
 
 def _verdict(args: argparse.Namespace) -> Any:
-    from factory.policy import record_verdict
+    from headframe.policy import record_verdict
     return _emit(record_verdict(args.task, args.stage, args.outcome, args.body, args.seat))
 
 
 def _policy(args: argparse.Namespace) -> Any:
-    from factory import store
+    from headframe import store
     if args.policy_command == "show":
         return _emit(store.get_policy(args.task))
     if args.file:
@@ -199,7 +199,7 @@ def _policy(args: argparse.Namespace) -> Any:
 
 
 def _monitor(args: argparse.Namespace) -> Any:
-    from factory import store
+    from headframe import store
     if args.monitor_command == "list":
         return _emit(store.due_monitors("9999-12-31T23:59:59+00:00"))
     store.add_monitor(args.task, args.next_check_at, args.timeout_at, args.max_attempts,
@@ -208,7 +208,7 @@ def _monitor(args: argparse.Namespace) -> Any:
 
 
 def _watchdog(args: argparse.Namespace) -> Any:
-    from factory import store
+    from headframe import store
     if args.watchdog_command == "list":
         return _emit(store.watchdogs())
     store.add_watchdog(args.root_task, args.agent, args.instructions)
@@ -216,37 +216,37 @@ def _watchdog(args: argparse.Namespace) -> Any:
 
 
 def _costs(args: argparse.Namespace) -> Any:
-    from factory import store
+    from headframe import store
     return _emit(store.costs_rollup(args.by, args.since))
 
 
 def _sync(args: argparse.Namespace) -> Any:
-    from factory import github_sync
+    from headframe import github_sync
     return _emit(github_sync.sync(board=args.board, repo=args.repo))
 
 
 def _dashboard(args: argparse.Namespace) -> None:
-    from factory.dashboard.server import serve
+    from headframe.dashboard.server import serve
     serve(port=args.port)
 
 
 def _runs(args: argparse.Namespace) -> Any:
-    from factory import store
+    from headframe import store
     accessor = getattr(store, "get_run", None) if args.id else getattr(store, "runs", None)
     return _emit(accessor(args.id) if args.id and accessor else accessor() if accessor else [])
 
 
 def _pause(args: argparse.Namespace) -> Any:
-    from factory import store
-    paused = args.factory_verb == "pause"
+    from headframe import store
+    paused = args.headframe_verb == "pause"
     store.set_seat_paused(args.seat, paused)
     return _emit({"seat": args.seat, "paused": paused})
 
 
 def _recipe(args: argparse.Namespace) -> Any:
     """Thin CLI facade: commands enqueue/reconcile through the recipe service."""
-    from factory import store
-    from factory.recipes import advancer
+    from headframe import store
+    from headframe.recipes import advancer
     from hermes_cli import kanban_db
     command = args.recipe_command
     if command in {"show", "waiting", "list"}:
@@ -281,8 +281,8 @@ def _recipe(args: argparse.Namespace) -> Any:
 
 
 def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reason: str) -> dict[str, Any]:
-    from factory import store
-    from factory.recipes import advancer
+    from headframe import store
+    from headframe.recipes import advancer
     with store._connect() as db:
         instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
         step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance_id, step_id)).fetchone()
@@ -295,8 +295,8 @@ def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reaso
 
 
 def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> dict[str, Any]:
-    from factory import store
-    from factory.recipes import advancer
+    from headframe import store
+    from headframe.recipes import advancer
     with store._connect() as db:
         step = db.execute(
             "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
@@ -312,10 +312,10 @@ def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> d
 
 
 def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
-    from factory import store
-    from factory.recipes.loader import load_library
-    from factory.recipes.instantiate import instantiate, replace_unactivated
-    from factory.recipes.advancer import cancel
+    from headframe import store
+    from headframe.recipes.loader import load_library
+    from headframe.recipes.instantiate import instantiate, replace_unactivated
+    from headframe.recipes.advancer import cancel
     with store._connect() as db:
         old = dict(db.execute("SELECT * FROM recipe_instances WHERE id=?", (args.instance,)).fetchone() or {})
         if not old: raise ValueError("unknown recipe instance")
@@ -338,13 +338,13 @@ def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
 def _handler(parser: argparse.ArgumentParser, name: str, help_text: str,
              function: Callable[[argparse.Namespace], Any]) -> argparse.ArgumentParser:
     command = parser.add_parser(name, help=help_text)
-    command.set_defaults(_factory_handler=function)
+    command.set_defaults(_headframe_handler=function)
     return command
 
 
 def register_cli(parser: argparse.ArgumentParser) -> None:
-    """Install the complete ``hermes factory`` argparse command tree."""
-    verbs = parser.add_subparsers(dest="factory_verb", required=True)
+    """Install the complete ``hermes headframe`` argparse command tree."""
+    verbs = parser.add_subparsers(dest="headframe_verb", required=True)
     p = _handler(verbs, "init", "initialize Factory state", _init); p.add_argument("--force", action="store_true")
     _handler(verbs, "seats", "list configured seats", _seats)
     p = _handler(verbs, "seat-create", "create a Factory employment contract", _seat_create)
@@ -385,19 +385,19 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
 setup_parser = register_cli
 
 
-def factory_command(args: argparse.Namespace) -> Any:
+def headframe_command(args: argparse.Namespace) -> Any:
     """Dispatch parsed Factory arguments to their lazy command handler."""
-    return args._factory_handler(args)
+    return args._headframe_handler(args)
 
 
 def main(argv: list[str] | None = None) -> Any:
     """Parse and execute a standalone Factory command, primarily for tests."""
-    parser = argparse.ArgumentParser(prog="hermes factory")
+    parser = argparse.ArgumentParser(prog="hermes headframe")
     register_cli(parser)
-    return factory_command(parser.parse_args(argv))
+    return headframe_command(parser.parse_args(argv))
 
 
-__all__ = ["factory_command", "main", "register_cli", "setup_parser"]
+__all__ = ["headframe_command", "main", "register_cli", "setup_parser"]
 
 
 if __name__ == "__main__":

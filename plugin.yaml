@@ -1,12 +1,12 @@
-name: factory
+name: headframe
 version: 1.0.0
-description: "Production teams, hierarchy, policy gates, watchdogs, and cost telemetry on Hermes kanban."
-author: Hermes Factory
+description: "Headframe — governed software factory on Hermes kanban: seats, hierarchy, review/approval gates, watchdogs, cost telemetry."
+author: Abhinav Bansal
 kind: general
 provides_tools:
-  - factory_verdict
-  - factory_costs
-  - factory_monitor_add
+  - headframe_verdict
+  - headframe_costs
+  - headframe_monitor_add
 hooks:
   - kanban_task_claimed
   - kanban_task_completed

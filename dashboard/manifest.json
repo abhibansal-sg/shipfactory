@@ -1,11 +1,11 @@
 {
-  "name": "factory",
-  "label": "Factory",
-  "description": "Recipe gates, instances, seats, and cost telemetry.",
+  "name": "headframe",
+  "label": "Headframe",
+  "description": "Governed software factory: recipe gates, instances, seats, and cost telemetry.",
   "icon": "Factory",
   "version": "1.0.0",
   "tab": {
-    "path": "/factory",
+    "path": "/headframe",
     "position": "after:kanban"
   },
   "entry": "dist/index.js",

@@ -8,11 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from factory import store
-from factory.config import FactoryConfig, Seat, selector_config
-from factory.recipes import selector_stage
-from factory.recipes.advancer import reconcile
-from factory.recipes.selector import lease_source_task
+from headframe import store
+from headframe.config import FactoryConfig, Seat, selector_config
+from headframe.recipes import selector_stage
+from headframe.recipes.advancer import reconcile
+from headframe.recipes.selector import lease_source_task
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,7 +264,7 @@ def test_selector_stage_crash_between_instantiate_and_outcome_is_idempotent(
 def test_selector_stage_budget_refusal_parks_before_model_call(
     kanban_conn, stage_config, fake_aux,
 ):
-    from factory import cli
+    from headframe import cli
 
     source = _source(kanban_conn)
     stage_config.recipes["board_day_token_ceiling"] = 5_000

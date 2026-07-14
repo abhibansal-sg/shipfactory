@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from factory.config import FactoryConfigError
-from factory.seats_admin import create_seat, list_profiles, seat_details, update_seat
+from headframe.config import FactoryConfigError
+from headframe.seats_admin import create_seat, list_profiles, seat_details, update_seat
 
 
 def _profile(home: Path, name: str, model: str = "claude-sonnet-5") -> Path:
@@ -27,7 +27,7 @@ def test_create_hermes_requires_explicit_profile_config(hermetic_hermes_home: Pa
 def test_hermes_create_writes_both_contract_files_and_keeps_header(hermetic_hermes_home: Path):
     profile = hermetic_hermes_home / "profiles" / "builder"
     profile.mkdir(parents=True)
-    seats = hermetic_hermes_home / "factory" / "seats.yaml"
+    seats = hermetic_hermes_home / "headframe" / "seats.yaml"
     seats.parent.mkdir()
     seats.write_text("# retained factory header\ncompany: demo\nseats: {}\n")
     created = create_seat("builder", "builder", "hermes", "claude-sonnet-5", "high", "engineer", 2, {
@@ -41,8 +41,8 @@ def test_hermes_create_writes_both_contract_files_and_keeps_header(hermetic_herm
 
 def test_mismatch_is_visible_and_update_resynchronizes_hermes_model(hermetic_hermes_home: Path):
     _profile(hermetic_hermes_home, "builder", "old-model")
-    (hermetic_hermes_home / "factory").mkdir()
-    (hermetic_hermes_home / "factory" / "seats.yaml").write_text("company: demo\nseats:\n  builder:\n    profile: builder\n    executor: hermes\n    model: new-model\n    role: engineer\n    max_concurrent: 1\n")
+    (hermetic_hermes_home / "headframe").mkdir()
+    (hermetic_hermes_home / "headframe" / "seats.yaml").write_text("company: demo\nseats:\n  builder:\n    profile: builder\n    executor: hermes\n    model: new-model\n    role: engineer\n    max_concurrent: 1\n")
     assert seat_details()[0]["model_mismatch"] is True
     updated = update_seat("builder", model="new-model")
     assert updated["model"] == "new-model"
@@ -57,4 +57,4 @@ def test_home_isolation_and_validation(hermetic_hermes_home: Path):
     with pytest.raises(FactoryConfigError, match="positive"):
         create_seat("bad", "builder", "codex", "gpt", "low", "engineer", 0)
     create_seat("isolated", "builder", "codex", "gpt", "low", "custom-role", 1)
-    assert (hermetic_hermes_home / "factory" / "seats.yaml").exists()
+    assert (hermetic_hermes_home / "headframe" / "seats.yaml").exists()

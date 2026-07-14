@@ -1,4 +1,4 @@
-schema: factory.recipe/v1
+schema: headframe.recipe/v1
 id: dev-pipeline
 version: 2
 status: active
@@ -24,7 +24,7 @@ steps:
         Tag every finding BLOCKER or WARNING and give path:line evidence for repository claims.
         Report a deterministic finding_count and one finding per line when changes are required.
         Approve only when every requested outcome maps to executable and verifiable work.
-        Finish with the exact FACTORY_VERDICT JSON sentinel required by the canonical contract.
+        Finish with the exact HEADFRAME_VERDICT JSON sentinel required by the canonical contract.
       execution_profile: standard
       workspace: worktree
   - id: build
@@ -59,7 +59,7 @@ steps:
         Classify each actionable issue BLOCKER or WARNING and cite path/to/file.ext:line.
         Report finding_count plus one finding per line on request_changes and target the upstream build step.
         Approve only with explicit APPROVE and clean-pass/no-findings wording when there is nothing to cite.
-        Finish with the exact FACTORY_VERDICT JSON sentinel required by the canonical contract.
+        Finish with the exact HEADFRAME_VERDICT JSON sentinel required by the canonical contract.
       execution_profile: standard
       workspace: worktree
   - id: approval

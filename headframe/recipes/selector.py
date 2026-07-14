@@ -527,7 +527,7 @@ def run_selection(task, library, *, seats: dict[str, object], max_tokens: int = 
             get_auxiliary_extra_body,
             get_text_auxiliary_client,
         )
-        client, model = get_text_auxiliary_client("factory_recipe_selector")
+        client, model = get_text_auxiliary_client("headframe_recipe_selector")
     except Exception as exc:
         raise RuntimeError("selector auxiliary client unavailable") from exc
     if client is None or not model:
@@ -635,7 +635,7 @@ def validate_or_park_selection(conn, source_task_id: str, selection: object, lib
     if task is None:
         raise ValueError("unknown selector source task")
     if task.status == "triage":
-        if not kb.specify_triage_task(conn, source_task_id, author="factory-selector"):
+        if not kb.specify_triage_task(conn, source_task_id, author="headframe-selector"):
             raise RuntimeError("selector source moved before clarification park")
         task = kb.get_task(conn, source_task_id)
     reason = "needs_clarification: " + json.dumps(markers, ensure_ascii=False)
@@ -649,7 +649,7 @@ def validate_or_park_selection(conn, source_task_id: str, selection: object, lib
 def lease_source_task(source_task_id: str, board: str, *, seconds: int = 120) -> str | None:
     """Acquire a Factory-db lease before any selector/model invocation."""
     from datetime import datetime, timedelta, timezone
-    from factory import store
+    from headframe import store
     import uuid
     now = datetime.now(timezone.utc); lease = (now + timedelta(seconds=seconds)).isoformat(); selection_id = str(uuid.uuid4())
     store.init_db()

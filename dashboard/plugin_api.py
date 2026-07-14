@@ -1,4 +1,4 @@
-"""Factory dashboard API, mounted by Hermes below ``/api/plugins/factory``."""
+"""Factory dashboard API, mounted by Hermes below ``/api/plugins/headframe``."""
 
 from __future__ import annotations
 
@@ -17,13 +17,13 @@ from pydantic import BaseModel, Field
 
 # Dashboard APIs are imported directly from ``dashboard/plugin_api.py`` by
 # Hermes, unlike the normal plugin entry point.  Make the repository root
-# importable so ``factory`` resolves when this is an installed user plugin.
+# importable so ``headframe`` resolves when this is an installed user plugin.
 _PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
-from factory import store
-from factory.recipes import advancer
+from headframe import store
+from headframe.recipes import advancer
 
 
 router = APIRouter()
@@ -158,7 +158,7 @@ def _gate_or_400(instance_id: str, step_id: str) -> None:
 
 
 def _recipe_config() -> tuple[Any, dict[str, Any]]:
-    from factory.config import load_seats
+    from headframe.config import load_seats
 
     config = load_seats()
     recipes = config.recipes or {}
@@ -169,7 +169,7 @@ def _recipe_config() -> tuple[Any, dict[str, Any]]:
 
 
 def _library(*, persist: bool = True) -> Any:
-    from factory.recipes.loader import load_library
+    from headframe.recipes.loader import load_library
 
     config, recipes = _recipe_config()
     return load_library(
@@ -210,7 +210,7 @@ def _request_error(exc: Exception) -> HTTPException:
 
 
 def _cancel_preview(instance_id: str, board: str) -> dict[str, Any]:
-    from factory.spawn import _RUNNING
+    from headframe.spawn import _RUNNING
     from hermes_cli import kanban_db
 
     conn = kanban_db.connect(board=board)
@@ -274,7 +274,7 @@ def list_recipes() -> list[dict[str, Any]]:
 
 @router.post("/instances")
 def create_instance(request: InstantiateRecipe) -> dict[str, Any]:
-    from factory.recipes.instantiate import instantiate
+    from headframe.recipes.instantiate import instantiate
     from hermes_cli import kanban_db
 
     conn = None
@@ -315,7 +315,7 @@ def create_triage_task(request: TriageTask) -> dict[str, Any]:
 
 @router.post("/instances/{instance_id}/reroute")
 def reroute_instance(instance_id: str, request: RerouteRecipe) -> dict[str, Any]:
-    from factory.cli import _reroute
+    from headframe.cli import _reroute
     from hermes_cli import kanban_db
 
     board = _instance_board(instance_id)
@@ -360,7 +360,7 @@ def cancel_instance(instance_id: str) -> dict[str, Any]:
 
 
 @router.get("/status")
-def factory_status() -> dict[str, Any]:
+def headframe_status() -> dict[str, Any]:
     try:
         _, recipes = _recipe_config()
     except (FileNotFoundError, OSError, ValueError):
@@ -502,7 +502,7 @@ def waiting_gates() -> list[dict[str, Any]]:
 def seats() -> list[dict[str, Any]]:
     store.init_db()
     try:
-        from factory.seats_admin import seat_details
+        from headframe.seats_admin import seat_details
         return [seat | {"paused": store.seat_paused(seat["name"])} for seat in seat_details()]
     except (FileNotFoundError, OSError, ValueError):
         return []
@@ -510,17 +510,17 @@ def seats() -> list[dict[str, Any]]:
 
 @router.get("/profiles")
 def profiles() -> list[str]:
-    from factory.seats_admin import list_profiles
+    from headframe.seats_admin import list_profiles
     return list_profiles()
 
 
 @router.post("/seats", status_code=201)
 def create_seat(seat: SeatWrite) -> dict[str, Any]:
-    """Create through the same writer used by ``hermes factory seat-create``."""
+    """Create through the same writer used by ``hermes headframe seat-create``."""
     if None in (seat.name, seat.profile, seat.executor, seat.model, seat.role):
         raise HTTPException(status_code=422, detail="name, profile, executor, model, and role are required")
     try:
-        from factory.seats_admin import create_seat as create
+        from headframe.seats_admin import create_seat as create
         return create(seat.name, seat.profile, seat.executor, seat.model, seat.reasoning or "", seat.role,
                       seat.max_concurrent or 1, seat.provider_config)
     except (ValueError, TypeError) as exc:
@@ -530,7 +530,7 @@ def create_seat(seat: SeatWrite) -> dict[str, Any]:
 @router.put("/seats/{name}")
 def update_seat(name: str, seat: SeatWrite) -> dict[str, Any]:
     try:
-        from factory.seats_admin import update_seat as update
+        from headframe.seats_admin import update_seat as update
         return update(name, seat.profile, seat.executor, seat.model, seat.reasoning, seat.role,
                       seat.max_concurrent, seat.provider_config)
     except (ValueError, TypeError) as exc:

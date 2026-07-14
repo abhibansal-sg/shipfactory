@@ -64,7 +64,7 @@ def _participant_names(stage: dict[str, Any]) -> list[str]:
 def _default_policy() -> dict[str, Any]:
     """Build the ratified review -> approval -> land pipeline from seats."""
 
-    cfg = _module("factory.config").load_seats()
+    cfg = _module("headframe.config").load_seats()
     seats = getattr(cfg, "seats", {}) or {}
     gates = getattr(cfg, "hierarchy_gates", {}) or {}
 
@@ -95,13 +95,13 @@ def _default_policy() -> dict[str, Any]:
 def _get_policy(task_id: str) -> dict[str, Any] | None:
     """Read a task policy through the frozen store contract."""
 
-    return _module("factory.store").get_policy(task_id)
+    return _module("headframe.store").get_policy(task_id)
 
 
 def _decisions(task_id: str) -> list[dict[str, Any]]:
     """Read task decisions through the frozen store contract."""
 
-    return list(_module("factory.store").decisions_for(task_id) or [])
+    return list(_module("headframe.store").decisions_for(task_id) or [])
 
 
 def _stage_status(task_id: str, policy: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
@@ -146,7 +146,7 @@ def _reopen(task_id: str, board: str, seat: str, summary: str) -> None:
     # after that transition, so reopen the row atomically and retain an event.
     # The branch below preserves the lightweight module-contract test setup,
     # whose intentionally fake store has no real board to update.
-    if not hasattr(_module("factory.store"), "_db_path"):
+    if not hasattr(_module("headframe.store"), "_db_path"):
         return
     from hermes_cli import kanban_db
 
@@ -159,7 +159,7 @@ def _reopen(task_id: str, board: str, seat: str, summary: str) -> None:
             )
             if updated.rowcount:
                 kanban_db._append_event(  # type: ignore[attr-defined]
-                    conn, task_id, "factory_policy_reopened", {"seat": seat},
+                    conn, task_id, "headframe_policy_reopened", {"seat": seat},
                 )
     finally:
         conn.close()
@@ -168,7 +168,7 @@ def _reopen(task_id: str, board: str, seat: str, summary: str) -> None:
 def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[str, Any]:
     """Apply the policy after worker completion and reopen when stages remain."""
 
-    store = _module("factory.store")
+    store = _module("headframe.store")
     # Recipes are the exclusive flow authority.  This lookup is intentionally
     # best-effort so the frozen lightweight policy-module tests remain usable.
     if hasattr(store, "_connect"):
@@ -183,8 +183,8 @@ def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[s
         return {"action": "allow", "next_stage": None}
     passed, stage = _stage_status(task_id, policy)
     if passed:
-        hierarchy = _module("factory.hierarchy")
-        config = _module("factory.config")
+        hierarchy = _module("headframe.hierarchy")
+        config = _module("headframe.config")
         cfg = config.load_seats()
         may_land = getattr(hierarchy, "may_land", lambda _cfg, _seat: True)
         if policy.get("stages") and not may_land(cfg, assignee):
@@ -214,13 +214,13 @@ def record_verdict(task_id: str, stage_id: str, outcome: str, body: str, seat: s
     if outcome not in {"approve", "request_changes", "approved", "changes_requested"}:
         raise ValueError("outcome must be approve or request_changes")
 
-    config = _module("factory.config")
-    hierarchy = _module("factory.hierarchy")
+    config = _module("headframe.config")
+    hierarchy = _module("headframe.hierarchy")
     cfg = config.load_seats()
     if not hierarchy.may_verdict(cfg, seat):
         raise PermissionError(f"seat {seat!r} is not allowed to post verdicts")
 
-    store = _module("factory.store")
+    store = _module("headframe.store")
     policy = store.get_policy(task_id)
     if not policy:
         raise ValueError(f"no execution policy for task {task_id}")

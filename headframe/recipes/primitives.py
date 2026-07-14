@@ -5,18 +5,18 @@ import json
 import re
 from typing import Any
 
-from factory import store
-from factory.policy import citation_ok
+from headframe import store
+from headframe.policy import citation_ok
 from .instantiate import task_key
 
-_VERDICT = re.compile(r"^FACTORY_VERDICT:\s*(\{.*\})\s*$")
+_VERDICT = re.compile(r"^HEADFRAME_VERDICT:\s*(\{.*\})\s*$")
 
 def parse_verdict(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     match = _VERDICT.fullmatch(lines[-1]) if lines else None
-    if not match: raise ValueError("review final line must be FACTORY_VERDICT JSON")
+    if not match: raise ValueError("review final line must be HEADFRAME_VERDICT JSON")
     try: verdict = json.loads(match.group(1))
-    except json.JSONDecodeError as exc: raise ValueError("invalid FACTORY_VERDICT JSON") from exc
+    except json.JSONDecodeError as exc: raise ValueError("invalid HEADFRAME_VERDICT JSON") from exc
     if not isinstance(verdict, dict) or verdict.get("outcome") not in {"approve", "request_changes"} or not isinstance(verdict.get("body"), str) or not citation_ok(verdict["body"]): raise ValueError("invalid review verdict")
     if verdict["outcome"] == "approve" and set(verdict) != {"outcome", "body"}: raise ValueError("approve verdict has unknown fields")
     if verdict["outcome"] == "request_changes" and (set(verdict) != {"outcome", "target_step", "body"} or not isinstance(verdict.get("target_step"), str)): raise ValueError("invalid request_changes verdict")

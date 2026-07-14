@@ -3,7 +3,7 @@ Donor: https://github.com/gsd-build/get-shit-done
 File: agents/gsd-plan-checker.md; get-shit-done/references/gates.md
 Upstream SHA: bdcaab2c752d9a33a1a1ca9acf3a3c81fb991815
 License: MIT
-Deltas: Adapted phase plans to recipe input artifacts and kanban tasks; selected the seven dimensions ratified for Factory; replaced GSD report output with the FACTORY_VERDICT sentinel and citation gate.
+Deltas: Adapted phase plans to recipe input artifacts and kanban tasks; selected the seven dimensions ratified for Factory; replaced GSD report output with the HEADFRAME_VERDICT sentinel and citation gate.
 -->
 
 # Pre-execution plan check
@@ -25,11 +25,11 @@ Tag every finding `BLOCKER` when execution would miss the goal, or `WARNING` whe
 End with one sentinel. Use an approval only when all dimensions pass:
 
 ```text
-FACTORY_VERDICT: {"outcome":"approve","body":"APPROVE: clean pass; no findings"}
+HEADFRAME_VERDICT: {"outcome":"approve","body":"APPROVE: clean pass; no findings"}
 ```
 
 For a rejection, name the upstream planning `agent_task`, report the exact total, and list one finding per line so stall detection remains deterministic:
 
 ```text
-FACTORY_VERDICT: {"outcome":"request_changes","target_step":"<step-id>","body":"finding_count: 2\nBLOCKER path/file.md:12 — uncovered requirement\nWARNING path/file.md:30 — budget risk"}
+HEADFRAME_VERDICT: {"outcome":"request_changes","target_step":"<step-id>","body":"finding_count: 2\nBLOCKER path/file.md:12 — uncovered requirement\nWARNING path/file.md:30 — budget risk"}
 ```

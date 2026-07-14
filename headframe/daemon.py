@@ -34,7 +34,7 @@ def _board_db_health_pass(conn, board: str | None) -> None:
     except Exception as exc:
         logger.critical("Factory board database health pass failed for %s: %s", board, exc, exc_info=True)
         try:
-            from factory.telemetry import append_jsonl
+            from headframe.telemetry import append_jsonl
             append_jsonl({
                 "event": "database_health_failure",
                 "at": time.time(),
@@ -48,17 +48,17 @@ def _board_db_health_pass(conn, board: str | None) -> None:
 def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any]:
     """Run one dispatch, reaping, watchdog, and optional GitHub-sync cycle."""
     from hermes_cli.kanban_db import dispatch_once
-    from factory.spawn import factory_spawn, reap_finished
+    from headframe.spawn import headframe_spawn, reap_finished
 
     dispatch_kwargs: dict[str, Any] = {}
     result_recipes = None
     result_selector = None
     try:
-        from factory.config import FactoryConfigError, load_seats
+        from headframe.config import FactoryConfigError, load_seats
         cfg = load_seats()
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
-            from factory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
+            from headframe.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
             startup_guard(cfg)
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             recipe_board = board or cfg.company
@@ -71,9 +71,9 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
                 "outbox": deliver_outbox(),
                 "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
             }
-            from factory.config import selector_config
+            from headframe.config import selector_config
             if selector_config(recipes_cfg)["enabled"]:
-                from factory.recipes.selector_stage import run_stage
+                from headframe.recipes.selector_stage import run_stage
                 result_selector = run_stage(conn, board or cfg.company)
             else:
                 result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
@@ -86,7 +86,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
     # and records a protocol violation — burning the failure fuse on workers
     # that completed perfectly. Reaping first finalizes their kanban state.
     reaped = reap_finished()
-    dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board, **dispatch_kwargs)
+    dispatched = dispatch_once(conn, spawn_fn=headframe_spawn, board=board, **dispatch_kwargs)
     reaped += reap_finished()
     _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
@@ -96,14 +96,14 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
         result["selector"] = result_selector
     # Lane C modules are deliberately optional at plugin import time.
     try:
-        from factory import watchdog
+        from headframe import watchdog
 
         result["watchdog"] = watchdog.tick(conn, board=board)
     except ImportError:
         result["watchdog"] = None
     if sync:
         try:
-            from factory import github_sync
+            from headframe import github_sync
 
             result["sync"] = github_sync.tick(board=board)
         except ImportError:
@@ -121,8 +121,8 @@ def _record_board_tick_failure(board: str, exc: Exception) -> None:
     """Log and emit best-effort telemetry for one isolated board failure."""
     logger.error("Factory daemon tick failed for board %s: %s", board, exc, exc_info=True)
     try:
-        from factory import store
-        from factory.telemetry import append_jsonl
+        from headframe import store
+        from headframe.telemetry import append_jsonl
 
         append_jsonl({
             "event": "daemon_board_tick_failure",
@@ -155,7 +155,7 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
     ``conn``.  Multi-board callers may pass a board-to-connection mapping, or
     ``None`` to let the daemon own and reconnect each board connection.
     """
-    from factory import store
+    from headframe import store
     board_names = _served_boards(board, boards)
     first_board = board_names[0]
     owns_connections = conn is None
