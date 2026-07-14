@@ -1,22 +1,14 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { Badge } from "../../hermes-mobile/web/node_modules/@nous-research/ui/src/ui/components/badge.tsx";
+import { Button } from "../../hermes-mobile/web/node_modules/@nous-research/ui/src/ui/components/button.tsx";
+import { Card, CardContent } from "../../hermes-mobile/web/node_modules/@nous-research/ui/src/ui/components/card.tsx";
 import "../../hermes-mobile/web/src/index.css";
 import "./dist/style.css";
 
 const h = React.createElement;
 const now = Date.now();
 const isoAgo = seconds => new Date(now - seconds * 1000).toISOString();
-
-function cleanDomProps(props, className) {
-  const next = { ...props, className: [className, props.className].filter(Boolean).join(" ") };
-  delete next.size;
-  delete next.variant;
-  return next;
-}
-
-const Button = props => h("button", cleanDomProps(props, "h-8 rounded-md border border-border px-3 text-xs"), props.children);
-const Card = props => h("div", cleanDomProps(props, "rounded-lg border border-border bg-card"), props.children);
-const CardContent = props => h("div", cleanDomProps(props), props.children);
 
 const instances = [
   {
@@ -131,7 +123,7 @@ window.__HERMES_PLUGIN_SDK__ = {
     useCallback: React.useCallback,
     useMemo: React.useMemo,
   },
-  components: { Button, Card, CardContent },
+  components: { Badge, Button, Card, CardContent },
   utils: {},
   fetchJSON(url, options = {}) {
     if (options.method === "POST") return Promise.resolve({ key: "harness-decision" });
