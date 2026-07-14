@@ -540,3 +540,52 @@ def test_root_collector_completes_once_after_two_sibling_successes(tmp_path, kan
 def test_advance_key_is_spec_formula():
     expected = hashlib.sha256(b"i|h|s|2|done|event-9").hexdigest()
     assert advance_key("i", "h", "s", 2, "done", "event-9") == expected
+
+
+def test_gate_rejection_accepts_kanban_task_id_target(tmp_path, kanban_conn):
+    """Finding #25b: review workers are prompted with kanban task ids, so
+    verdicts routinely cite t_<id> of the build task instead of the recipe
+    step id. The advancer must resolve it instead of fusing the gate."""
+    from hermes_cli import kanban_db
+
+    recipe = _recipe(
+        tmp_path,
+        """schema: factory.recipe/v1
+id: task-id-target
+version: 1
+status: active
+description: verdict targets a kanban task id
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets: {max_activations: 10, max_step_activations: 3, max_tokens: 500000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}
+  - id: qa
+    primitive: review_gate
+    title: QA
+    needs: [build]
+    optional: false
+    params: {seat: verifier, instructions: qa, execution_profile: standard, workspace: worktree}
+""",
+        "task-id-target@1",
+    )
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="tid")
+    reconcile(kanban_conn, "tid", profiles=PROFILES)
+    build1 = _step("tid", "build", 1)
+    assert kanban_db.complete_task(kanban_conn, build1["kanban_task_id"], result="rev one")
+    reconcile(kanban_conn, "tid", profiles=PROFILES)
+    qa1 = _step("tid", "qa", 1)
+    # Target the build step by its KANBAN TASK id, exactly as t_10fdf585 did.
+    _complete_review(kanban_db, kanban_conn, qa1["kanban_task_id"],
+                     outcome="request_changes", target=build1["kanban_task_id"])
+    reconcile(kanban_conn, "tid", profiles=PROFILES)
+    build2 = _step("tid", "build", 2)
+    assert build2["state"] == "running"
+    assert _step("tid", "qa", 1)["blocked_reason"] == "changes_requested"
+    assert _instance("tid")["status"] != "blocked"

@@ -101,3 +101,19 @@ def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
     result = spawn.reap_finished()[0]
     assert result["result"] == "done" and "plan approved" in result["summary"]
     assert any(item[0] == "complete" for item in calls)
+
+
+def test_parse_result_prefers_verdict_over_trailing_result():
+    """Finding #25: disciplined review workers emit FACTORY_VERDICT then
+    FACTORY_RESULT (both contracts demand 'last line'). The verdict JSON is
+    what parse_verdict needs — it must win over the trailing result line."""
+    text = (
+        "review done\n"
+        'FACTORY_VERDICT: {"outcome":"request_changes","target_step":"build","body":"BLOCKER a.py:1 — x"}\n'
+        "FACTORY_RESULT: done Verification requested changes\n"
+    )
+    result, summary = spawn._parse_result(text, 0)
+    assert result == "done" and summary.startswith("FACTORY_VERDICT:")
+    # Non-review workers keep the plain result contract.
+    result, summary = spawn._parse_result("work\nFACTORY_RESULT: done shipped\n", 0)
+    assert (result, summary) == ("done", "shipped")

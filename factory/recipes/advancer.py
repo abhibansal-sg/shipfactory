@@ -358,6 +358,28 @@ def _consume_resume_note(conn: Any, task_id: str | None) -> None:
     if has_note and not consumed:
         kanban_db.add_comment(conn, task_id, "factory", f"RESUMED {store._now()}")
 
+def _resolve_target_step(db: Any, instance_id: str, recipe: dict[str, Any], target: str) -> str:
+    """Map a verdict's target to a recipe step id, accepting kanban task ids.
+
+    Review workers are prompted with kanban TASK ids (their context and the
+    summary frontmatter both carry ``t_...``), so verdicts routinely cite the
+    task id of the step they want reworked rather than the recipe's abstract
+    step id (finding #25b, t_10fdf585 targeting t_3b0e86d6). Accept both:
+    return *target* unchanged when it is a known step id; otherwise look up
+    which step activation created that kanban task and return its step id.
+    Unknown targets return unchanged so ``_invalidate_cone`` raises its
+    existing precise error.
+    """
+    if any(step["id"] == target for step in recipe["steps"]):
+        return target
+    row = db.execute(
+        "SELECT step_id FROM recipe_steps WHERE instance_id=? AND kanban_task_id=? "
+        "ORDER BY activation DESC LIMIT 1",
+        (instance_id, target),
+    ).fetchone()
+    return row["step_id"] if row else target
+
+
 def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
@@ -487,7 +509,11 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                                         (store._now(), instance_id),
                                     )
                                     continue
-                                _invalidate_cone(db, instance, recipe, verdict["target_step"], step["step_id"], f"kanban:{task.id}")
+                                _invalidate_cone(
+                                    db, instance, recipe,
+                                    _resolve_target_step(db, instance_id, recipe, verdict["target_step"]),
+                                    step["step_id"], f"kanban:{task.id}",
+                                )
                                 changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="changes_requested")
                                 continue
                         except ValueError as exc:
@@ -675,7 +701,9 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                         raise ValueError("review stall has no rejecting verdict")
                     recipe = recipe_for_instance(instance).document
                     _invalidate_cone(
-                        db, instance, recipe, verdict["target_step"], step["step_id"],
+                        db, instance, recipe,
+                        _resolve_target_step(db, instance["id"], recipe, verdict["target_step"]),
+                        step["step_id"],
                         f"operator_release:{row['key']}",
                     )
                     _transition(
