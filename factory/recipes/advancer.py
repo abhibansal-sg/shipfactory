@@ -342,7 +342,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
                         continue
                 parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
-                task = activate(conn, instance, recipe, definition, step, params, parents)
+                task = activate(conn, instance, recipe, definition, step, params, parents, db=db)
                 state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
                 if primitive in {"approval_gate", "wait_for_event"} and task:
                     _resume_note(db, conn, instance, recipe, definition, task)

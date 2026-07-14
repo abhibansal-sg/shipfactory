@@ -22,7 +22,7 @@ def parse_verdict(text: str) -> dict[str, Any]:
     if verdict["outcome"] == "request_changes" and (set(verdict) != {"outcome", "target_step", "body"} or not isinstance(verdict.get("target_step"), str)): raise ValueError("invalid request_changes verdict")
     return verdict
 
-def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_def: dict[str, Any], step: dict[str, Any], parameters: dict[str, Any], parents: list[str]) -> str | None:
+def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_def: dict[str, Any], step: dict[str, Any], parameters: dict[str, Any], parents: list[str], db: Any = None) -> str | None:
     """Perform one idempotent primitive mutation and return its task id if any."""
     from hermes_cli import kanban_db
     primitive, params = step_def["primitive"], step_def["params"]
@@ -43,7 +43,13 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
     if primitive == "wait_for_event":
         return kanban_db.create_blocked_task(conn, title=title, body=f"Waiting for event: {render(params['event'])}", parents=parents, idempotency_key=key, block_kind="needs_input", reason="event_wait")
     if primitive == "notify":
-        with store._connect() as db:
+        # Reuse the caller's open factory-db handle when provided — opening a
+        # second connection here deadlocks against reconcile()'s held write
+        # txn on the same file (shakedown finding #17: 'database is locked').
+        if db is not None:
             db.execute("INSERT OR IGNORE INTO outbox(key,target,message,state,attempts,next_attempt_at) VALUES(?,?,?,'pending',0,?)", (key, render(params["target"]), body, store._now()))
+        else:
+            with store._connect() as fresh:
+                fresh.execute("INSERT OR IGNORE INTO outbox(key,target,message,state,attempts,next_attempt_at) VALUES(?,?,?,'pending',0,?)", (key, render(params["target"]), body, store._now()))
         return None
     raise RuntimeError(f"unknown primitive {primitive}")

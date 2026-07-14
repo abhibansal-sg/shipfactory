@@ -37,4 +37,9 @@ def on_claim(task_id, board, assignee, **kw) -> None:
                   "board": board, "assignee": assignee, **kw})
 
 
-__all__ = ["append_jsonl", "on_claim", "parse_usage"]
+def hello_shakedown() -> str:
+    """Return the canonical shakedown liveness string for the factory."""
+    return "factory-live"
+
+
+__all__ = ["append_jsonl", "hello_shakedown", "on_claim", "parse_usage"]
