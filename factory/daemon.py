@@ -81,8 +81,13 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
         # Existing Factory installations without a seats file retain the old
         # dispatch behavior; a configured recipe board is always fail-closed.
         result_recipes = None
-    dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board, **dispatch_kwargs)
+    # Finding #23 tick-order race: reap exited harnesses BEFORE dispatch_once,
+    # whose claim watchdog otherwise sees a dead pid with an unfinalized task
+    # and records a protocol violation — burning the failure fuse on workers
+    # that completed perfectly. Reaping first finalizes their kanban state.
     reaped = reap_finished()
+    dispatched = dispatch_once(conn, spawn_fn=factory_spawn, board=board, **dispatch_kwargs)
+    reaped += reap_finished()
     _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
     if result_recipes is not None:

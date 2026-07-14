@@ -44,3 +44,24 @@ class CodexExecutor(Executor):
     def identity_files(self, seat, workspace: str) -> None:
         """Place the profile's Codex-recognized ``AGENTS.md`` at workspace root."""
         write_identity(seat, workspace, "AGENTS.md")
+
+    def extract_text(self, log_text: str) -> str:
+        """Concatenate ``agent_message`` texts from Codex ``--json`` JSONL.
+
+        The sentinel line lives inside the last agent message's ``text``
+        field; the raw log ends with ``turn.completed`` machine events
+        (finding #23). Falls back to the raw log when no agent messages
+        are found (e.g. startup crash before any turn).
+        """
+        texts: list[str] = []
+        for line in log_text.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text)
+        return "\n".join(texts) if texts else log_text

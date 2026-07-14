@@ -37,3 +37,35 @@ def test_identity_copy_and_unknown_executor(tmp_path, monkeypatch):
         pass
     else:
         assert False, "unknown executors must be rejected"
+
+
+def test_codex_extract_text_finds_sentinel_in_jsonl():
+    """Finding #23: the sentinel lives inside agent_message JSON, not on the
+    raw log's last line — extract_text must surface it for _parse_result."""
+    codex = get_executor("codex")
+    log = "\n".join([
+        '{"type":"thread.started","thread_id":"abc"}',
+        '{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls"}}',
+        '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"APPROVE ok\\n\\nFACTORY_VERDICT: {\\"outcome\\":\\"approve\\",\\"body\\":\\"clean\\"}"}}',
+        '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}',
+    ])
+    text = codex.extract_text(log)
+    assert text.splitlines()[-1].startswith("FACTORY_VERDICT:")
+    # Plain-text logs pass through unchanged (fallback contract).
+    assert codex.extract_text("no json here\nFACTORY_RESULT: done x") == "no json here\nFACTORY_RESULT: done x"
+
+
+def test_claude_extract_text_finds_sentinel_in_stream_json():
+    claude = get_executor("claude")
+    log = "\n".join([
+        '{"type":"system","subtype":"init"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}',
+        '{"type":"result","result":"FACTORY_RESULT: done shipped the fix"}',
+    ])
+    text = claude.extract_text(log)
+    assert text.splitlines()[-1] == "FACTORY_RESULT: done shipped the fix"
+    assert claude.extract_text("plain log") == "plain log"
+
+
+def test_hermes_extract_text_passthrough():
+    assert get_executor("hermes").extract_text("raw") == "raw"

@@ -162,7 +162,9 @@ def reap_finished() -> list[dict]:
             log_text = Path(record["log_path"]).read_text(encoding="utf-8", errors="replace")
         except OSError:
             log_text = ""
-        result, summary = _parse_result(log_text, code)
+        result, summary = _parse_result(
+            get_executor(record["executor"]).extract_text(log_text), code
+        )
         usage = get_executor(record["executor"]).parse_usage(log_text)
         store.record_run_end(
             record["run_id"], code, usage["tokens_in"], usage["tokens_out"],

@@ -50,3 +50,33 @@ class ClaudeExecutor(Executor):
     def identity_files(self, seat, workspace: str) -> None:
         """Place profile instructions in Claude's conventional ``CLAUDE.md``."""
         write_identity(seat, workspace, "CLAUDE.md")
+
+    def extract_text(self, log_text: str) -> str:
+        """Concatenate assistant text from Claude stream-JSON events.
+
+        Handles both ``{"type":"assistant","message":{"content":[...]}}``
+        stream events and the final ``{"type":"result","result":"..."}``
+        record. Falls back to the raw log when no assistant text is found
+        (finding #23 — sentinel lives inside JSON, not on the last line).
+        """
+        texts: list[str] = []
+        for line in log_text.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if isinstance(text, str) and text.strip():
+                                texts.append(text)
+            result = event.get("result")
+            if event.get("type") == "result" and isinstance(result, str) and result.strip():
+                texts.append(result)
+        return "\n".join(texts) if texts else log_text

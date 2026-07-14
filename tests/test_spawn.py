@@ -79,3 +79,25 @@ def test_unknown_seat_skips(monkeypatch):
     monkeypatch.setitem(sys.modules, "factory.config", config)
     monkeypatch.setitem(sys.modules, "factory.store", store)
     assert spawn.factory_spawn(SimpleNamespace(id="t", assignee="nobody"), "/tmp") is None
+
+
+def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
+    """Finding #23 end-to-end: codex --json output must reap as done, not
+    'no result sentinel' — the exact failure that fused t_737aec66."""
+    calls = []
+    seat = SimpleNamespace(name="dev", profile="dev", executor="codex", model="gpt", reasoning="medium")
+    _install_stubs(monkeypatch, seat, calls)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
+    spawn._RUNNING.clear()
+    spawn.factory_spawn(SimpleNamespace(id="t3", assignee="dev"), str(tmp_path / "work"), board="b")
+    record = spawn._RUNNING[1234]
+    Path(record["log_path"]).write_text(
+        '{"type":"thread.started"}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"APPROVE\\n\\nFACTORY_RESULT: done plan approved"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n'
+    )
+    record["proc"].code = 0
+    result = spawn.reap_finished()[0]
+    assert result["result"] == "done" and "plan approved" in result["summary"]
+    assert any(item[0] == "complete" for item in calls)

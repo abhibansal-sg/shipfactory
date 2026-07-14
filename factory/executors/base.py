@@ -27,6 +27,18 @@ class Executor(ABC):
     def identity_files(self, seat: "Seat", workspace: str) -> None:
         """Materialize the seat's identity instructions in *workspace*."""
 
+    def extract_text(self, log_text: str) -> str:
+        """Return the harness's agent-visible text from its raw log.
+
+        Plain-text harnesses return the log unchanged. JSONL harnesses
+        (codex ``--json``, claude ``stream-json``) MUST override this to
+        pull the agent message text out of the event stream — otherwise
+        the FACTORY_RESULT / FACTORY_VERDICT sentinel protocol can never
+        match, because the raw log's last line is a machine event like
+        ``{"type":"turn.completed",...}`` (finding #23, 2026-07-14).
+        """
+        return log_text
+
 
 def token_usage(tokens_in: int = 0, tokens_out: int = 0) -> dict:
     """Return the canonical Factory usage mapping with non-negative values."""

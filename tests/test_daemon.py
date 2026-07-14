@@ -12,7 +12,11 @@ def test_tick_dispatches_reaps_and_optionally_ticks(monkeypatch):
     hermes.kanban_db = kanban
     spawn = types.ModuleType("factory.spawn")
     spawn.factory_spawn = object()
-    spawn.reap_finished = lambda: [{"task_id": "x"}]
+    # Finding #23: tick reaps BEFORE dispatch (finalize exited harnesses so the
+    # claim watchdog can't fuse them) and once after. First reap returns the
+    # finished worker; second returns nothing.
+    _reaps = iter([[{"task_id": "x"}], []])
+    spawn.reap_finished = lambda: calls.append(("reap",)) or next(_reaps, [])
     watchdog = types.ModuleType("factory.watchdog")
     watchdog.tick = lambda conn, board=None: calls.append(("watchdog", board)) or "watched"
     sync = types.ModuleType("factory.github_sync")
@@ -31,7 +35,7 @@ def test_tick_dispatches_reaps_and_optionally_ticks(monkeypatch):
     monkeypatch.setattr(_factory_pkg, "github_sync", sync, raising=False)
     result = daemon.tick(object(), board="board", sync=True)
     assert result == {"dispatch": "dispatched", "reaped": [{"task_id": "x"}], "watchdog": "watched", "sync": "synced"}
-    assert calls[0][0] == "dispatch"
+    assert calls[0][0] == "reap" and calls[1][0] == "dispatch"
 
 
 def test_run_once_returns_tick(monkeypatch):
