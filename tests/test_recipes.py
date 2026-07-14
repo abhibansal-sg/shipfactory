@@ -589,3 +589,58 @@ steps:
     assert build2["state"] == "running"
     assert _step("tid", "qa", 1)["blocked_reason"] == "changes_requested"
     assert _instance("tid")["status"] != "blocked"
+
+
+def test_rework_activation_inherits_rejecting_verdict_as_parent(tmp_path, kanban_conn):
+    """Finding #26: build act-2 must receive the review gate's verdict in its
+    parent handoffs — otherwise the rework worker rebuilds blind."""
+    from hermes_cli import kanban_db
+
+    recipe = _recipe(
+        tmp_path,
+        """schema: factory.recipe/v1
+id: rework-context
+version: 1
+status: active
+description: rework worker sees the verdict
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets: {max_activations: 10, max_step_activations: 3, max_tokens: 500000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}
+  - id: qa
+    primitive: review_gate
+    title: QA
+    needs: [build]
+    optional: false
+    params: {seat: verifier, instructions: qa, execution_profile: standard, workspace: worktree}
+""",
+        "rework-context@1",
+    )
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="rwctx")
+    reconcile(kanban_conn, "rwctx", profiles=PROFILES)
+    build1 = _step("rwctx", "build", 1)
+    assert kanban_db.complete_task(kanban_conn, build1["kanban_task_id"], result="rev one")
+    reconcile(kanban_conn, "rwctx", profiles=PROFILES)
+    qa1 = _step("rwctx", "qa", 1)
+    _complete_review(kanban_db, kanban_conn, qa1["kanban_task_id"],
+                     outcome="request_changes", target="build")
+    reconcile(kanban_conn, "rwctx", profiles=PROFILES)
+    build2 = _step("rwctx", "build", 2)
+    assert build2["state"] == "running"
+    parent_ids = [
+        row[0] for row in kanban_conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=?",
+            (build2["kanban_task_id"],),
+        ).fetchall()
+    ]
+    assert qa1["kanban_task_id"] in parent_ids, (
+        "rework build must list the rejecting QA gate as a parent so its "
+        "verdict findings flow into the worker context"
+    )

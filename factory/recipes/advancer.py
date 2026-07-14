@@ -380,6 +380,38 @@ def _resolve_target_step(db: Any, instance_id: str, recipe: dict[str, Any], targ
     return row["step_id"] if row else target
 
 
+def _rejecting_gate_task(db: Any, conn: Any, instance_id: str, recipe: dict[str, Any], step_id: str) -> str | None:
+    """Find the review-gate kanban task whose verdict sent *step_id* to rework.
+
+    Rework activations otherwise inherit only their recipe-DAG ``needs``
+    parents, so the verifier's cited findings never reach the rework worker's
+    context — it rebuilds from the original instructions blind (finding #26,
+    t_1082ec9b). Returns the most recent changes-requested gate task whose
+    verdict targets *step_id*, or ``None``.
+    """
+    from hermes_cli import kanban_db
+
+    rows = db.execute(
+        "SELECT kanban_task_id FROM recipe_steps WHERE instance_id=? AND primitive='review_gate' "
+        "AND state='blocked' AND blocked_reason='changes_requested' AND kanban_task_id IS NOT NULL "
+        "ORDER BY updated_at DESC, activation DESC",
+        (instance_id,),
+    ).fetchall()
+    for row in rows:
+        task = kanban_db.get_task(conn, row["kanban_task_id"])
+        if task is None or not task.result:
+            continue
+        try:
+            verdict = parse_verdict(task.result)
+        except ValueError:
+            continue
+        if verdict["outcome"] != "request_changes":
+            continue
+        if _resolve_target_step(db, instance_id, recipe, verdict["target_step"]) == step_id:
+            return row["kanban_task_id"]
+    return None
+
+
 def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
@@ -559,6 +591,11 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
                         continue
                 parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
+                if primitive == "agent_task" and int(step["activation"]) > 1:
+                    # Finding #26: hand the rework worker the rejecting verdict.
+                    gate_task = _rejecting_gate_task(db, conn, instance_id, recipe, sid)
+                    if gate_task and gate_task not in parents:
+                        parents.append(gate_task)
                 task = activate(conn, instance, recipe, definition, step, params, parents, db=db)
                 state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
                 changed |= _transition(db, instance, step, state, "activate", task=task)
