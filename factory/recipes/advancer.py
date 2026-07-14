@@ -720,7 +720,15 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
                     if payload.get("decision") == "approve":
                         # The blocked kanban task is the canonical approval
                         # signal; reconciliation observes its completion.
-                        kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved")
+                        # Gate tasks are created blocked/needs_input, and
+                        # complete_task only accepts running|ready — unblock
+                        # first or the approval is silently swallowed
+                        # (shakedown finding #30).
+                        kanban_db.unblock_task(conn, step["kanban_task_id"])
+                        if not kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved"):
+                            raise ValueError(
+                                f"approval gate task {step['kanban_task_id']} could not be completed"
+                            )
                     elif payload.get("decision") == "reject":
                         reason = str(payload.get("reason") or "operator_rejected")
                         _transition(db, instance, dict(step), "blocked", "operator_rejected", reason=reason)
