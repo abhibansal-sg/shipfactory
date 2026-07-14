@@ -26,6 +26,15 @@
   var POLL_MS = 20000;
 
   function request(path, options) {
+    // POST bodies are JSON.stringify'd — without an explicit JSON
+    // Content-Type FastAPI receives the raw string and Pydantic rejects it
+    // ("Input should be a valid dictionary") — shakedown finding #16.
+    if (options && options.body) {
+      options.headers = Object.assign(
+        { "Content-Type": "application/json" },
+        options.headers || {}
+      );
+    }
     return SDK.fetchJSON(API + path, options);
   }
 
