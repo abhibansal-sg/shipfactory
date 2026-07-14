@@ -1,6 +1,6 @@
 import json
 
-from factory.telemetry import append_jsonl, on_claim, parse_usage
+from factory.telemetry import append_jsonl, hello_shakedown, on_claim, parse_usage
 
 CODEX_USAGE = "tokens used\n152,138"
 CLAUDE_USAGE = '{"usage":{"input_tokens":100,"output_tokens":50}}'
@@ -18,3 +18,7 @@ def test_jsonl_and_claim(tmp_path, monkeypatch):
     rows = [json.loads(line) for line in (tmp_path / "factory" / "telemetry.jsonl").read_text().splitlines()]
     assert rows[0] == {"event": "custom", "n": 1}
     assert rows[1]["task_id"] == "T1" and rows[1]["run_id"] == 9
+
+
+def test_hello_shakedown():
+    assert hello_shakedown() == "factory-live"
