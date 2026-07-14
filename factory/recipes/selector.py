@@ -137,6 +137,10 @@ assumptions, and needs_clarification. Document low-impact informed defaults
 in assumptions. Put at most three material unresolved questions in
 needs_clarification, prioritized scope > security/privacy > UX > technical.
 
+When no published recipe is needed, set chosen to null and provide exactly
+one assignee_seat parameter naming a seat from the supplied roster. Factory
+will bind title, body, and assignee_seat to its bare-task recipe.
+
 Task sizing targets one seat-context-comfortable agent_task: about 0-3 files
 touched. At 4-6 files, prefer splitting the node. At 7+ files, split it or
 record a specific justification in assumptions. Never send unresolved
@@ -515,6 +519,54 @@ class SelectionNeedsClarification(RecipeError):
         self.markers = markers
 
 
+def run_selection(task, library, *, seats: dict[str, object], max_tokens: int = 5_000,
+                  timeout: int = 180) -> dict:
+    """Call the configured auxiliary model with the recipe/seat manifest."""
+    try:
+        from agent.auxiliary_client import (  # type: ignore
+            get_auxiliary_extra_body,
+            get_text_auxiliary_client,
+        )
+        client, model = get_text_auxiliary_client("factory_recipe_selector")
+    except Exception as exc:
+        raise RuntimeError("selector auxiliary client unavailable") from exc
+    if client is None or not model:
+        raise RuntimeError("selector auxiliary client unavailable")
+    manifest = library.active_manifest()
+    roster = [
+        {"name": name, **{
+            field: getattr(seat, field)
+            for field in ("profile", "role", "reports_to")
+            if getattr(seat, field, None) is not None
+        }}
+        for name, seat in sorted(seats.items())
+    ]
+    request = {
+        "source_task": {"id": task.id, "title": task.title or "", "body": task.body or ""},
+        "active_recipes": manifest,
+        "seats": roster,
+    }
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": RECIPE_SELECTOR_PROMPT},
+            {"role": "user", "content": json.dumps(request, sort_keys=True)},
+        ],
+        temperature=0.2,
+        max_tokens=int(max_tokens),
+        timeout=timeout,
+        extra_body=get_auxiliary_extra_body() or None,
+    )
+    try:
+        raw = response.choices[0].message.content or ""
+    except Exception:
+        raw = ""
+    parsed = _extract_json_blob(raw)
+    if parsed is None:
+        raise RecipeError("selector returned malformed JSON")
+    return parsed
+
+
 def validate_selection(selection: object, library, *, seats: set[str], profiles: set[str]) -> list[dict]:
     """Validate selector nodes exactly; invalid references are rejected, never dropped."""
     from .loader import bind_parameters, validate
@@ -540,7 +592,13 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
         for candidate in node["ranked_candidates"]:
             if not isinstance(candidate, dict) or set(candidate) != {"id", "score", "reason"} or not isinstance(candidate["id"], str) or not isinstance(candidate["score"], (int, float)) or not isinstance(candidate["reason"], str): raise RecipeError("invalid ranked candidate")
         chosen = node["chosen"]
-        if chosen is not None:
+        if chosen is None:
+            if (
+                set(node["parameters"]) != {"assignee_seat"}
+                or node["parameters"]["assignee_seat"] not in seats
+            ):
+                raise RecipeError("bare task requires a configured assignee_seat")
+        else:
             if not isinstance(chosen, str): raise RecipeError("chosen recipe must be id@version or null")
             recipe = library.get(chosen)
             if recipe.document["status"] != "active": raise RecipeError("deprecated recipe choice")

@@ -14,6 +14,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
 
     dispatch_kwargs: dict[str, Any] = {}
     result_recipes = None
+    result_selector = None
     try:
         from factory.config import FactoryConfigError, load_seats
         cfg = load_seats()
@@ -23,6 +24,12 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
             startup_guard(cfg)
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             result_recipes = {"events": apply_events(conn, profiles=recipes_cfg["execution_profiles"]), "outbox": deliver_outbox(), "root_collectors": reconcile_root_collectors(conn)}
+            from factory.config import selector_config
+            if selector_config(recipes_cfg)["enabled"]:
+                from factory.recipes.selector_stage import run_stage
+                result_selector = run_stage(conn, board or cfg.company)
+            else:
+                result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
     except (ImportError, FileNotFoundError, OSError, FactoryConfigError):
         # Existing Factory installations without a seats file retain the old
         # dispatch behavior; a configured recipe board is always fail-closed.
@@ -32,6 +39,8 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
     if result_recipes is not None:
         result["recipes"] = result_recipes
+    if result_selector is not None:
+        result["selector"] = result_selector
     # Lane C modules are deliberately optional at plugin import time.
     try:
         from factory import watchdog

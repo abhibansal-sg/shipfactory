@@ -13,6 +13,11 @@ import yaml
 
 AGENT_ROLES = frozenset({"ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"})
 EXECUTORS = frozenset({"hermes", "codex", "claude"})
+SELECTOR_DEFAULTS = {
+    "enabled": True,
+    "max_per_tick": 3,
+    "selection_allowance": 5_000,
+}
 
 
 class FactoryConfigError(ValueError):
@@ -175,6 +180,27 @@ def validate(cfg) -> None:
         for name, profile in profiles.items():
             if not isinstance(profile, dict) or set(profile) != {"max_runtime_seconds", "max_retries", "token_allowance"} or any(not isinstance(profile[x], int) or profile[x] < 1 for x in profile):
                 raise FactoryConfigError(f"invalid execution profile {name!r}")
+        selector = recipes.get("selector", {}) or {}
+        if not isinstance(selector, dict) or set(selector) - set(SELECTOR_DEFAULTS):
+            raise FactoryConfigError("recipes.selector has unknown keys")
+        if "enabled" in selector and not isinstance(selector["enabled"], bool):
+            raise FactoryConfigError("recipes.selector.enabled must be boolean")
+        for field in ("max_per_tick", "selection_allowance"):
+            if field in selector and (
+                not isinstance(selector[field], int)
+                or isinstance(selector[field], bool)
+                or selector[field] < 1
+            ):
+                raise FactoryConfigError(f"recipes.selector.{field} must be a positive integer")
 
 
-__all__ = ["FactoryConfig", "FactoryConfigError", "Seat", "load_seats", "validate"]
+def selector_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
+    """Return validated selector settings with the ratified defaults."""
+    configured = dict(((recipes or {}).get("selector", {}) or {}))
+    return {**SELECTOR_DEFAULTS, **configured}
+
+
+__all__ = [
+    "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS", "Seat",
+    "load_seats", "selector_config", "validate",
+]

@@ -1,0 +1,23 @@
+schema: factory.recipe/v1
+id: bare-task-default
+version: 1
+status: active
+description: Run one deliberately light agent task without review or approval gates.
+intent_tags: [bare-task, single-agent]
+supersedes: null
+parameters:
+  title: {type: string, required: true, default: null}
+  body: {type: string, required: false, default: ""}
+  assignee_seat: {type: string, required: true, default: null}
+budgets: {max_activations: 1, max_step_activations: 1, max_tokens: 50000}
+steps:
+  - id: work
+    primitive: agent_task
+    title: "${title}"
+    needs: []
+    optional: false
+    params:
+      seat: "${assignee_seat}"
+      instructions: "${body}\n\nFollow the vendored executor discipline in recipes/templates/executor-discipline.md."
+      execution_profile: standard
+      workspace: worktree

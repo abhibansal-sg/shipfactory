@@ -193,6 +193,13 @@ def _recipe(args: argparse.Namespace) -> Any:
                 answer = dict(row); answer["steps"] = [dict(r) for r in db.execute("SELECT * FROM recipe_steps WHERE instance_id=? ORDER BY step_id,activation", (args.instance,))]
             elif command == "waiting":
                 answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances WHERE status IN ('waiting_gate','waiting_event','blocked') ORDER BY updated_at")]
+                answer.extend({
+                    **dict(row), "status": "blocked", "blocked_reason": row["outcome"],
+                    "kind": "triage_selection",
+                } for row in db.execute(
+                    "SELECT * FROM triage_selections WHERE outcome IN "
+                    "('budget_refused','needs_clarification','no_recipe_match') ORDER BY updated_at"
+                ))
             else:
                 answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances ORDER BY created_at DESC")]
         return _emit(answer)
