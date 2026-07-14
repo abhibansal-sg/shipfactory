@@ -10,6 +10,8 @@ Deltas: Replaced GSD phase/plan and Claude terminology with Factory step/task/se
 
 Execute the assigned kanban task and its Done criteria. When work not named by the task appears, apply these rules in order and record every deviation in the step summary.
 
+Completing your kanban task IS the handoff to review — do NOT block your task for review yourself.
+
 1. **Auto-fix bugs in your own diff.** Fix broken behavior, errors, incorrect output, security defects, races, or type failures directly caused by this task. Add or update focused tests and verify the fix.
 2. **Auto-add missing critical functionality.** Add validation, error handling, authorization, or other functionality required for the task to be correct, secure, and operable. This is correctness work, not optional feature growth.
 3. **Auto-fix blocking issues, except package installs.** Fix local blockers that prevent the assigned task from completing. Never install, substitute, or guess a package name without operator approval. A failed or missing package always escalates for legitimacy review to prevent slopsquatting.

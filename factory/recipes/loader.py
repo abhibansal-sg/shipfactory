@@ -30,6 +30,8 @@ class RecipeError(ValueError):
 class Recipe:
     document: dict[str, Any]
     hash: str
+    seats: frozenset[str] | None = None
+    profiles: frozenset[str] | None = None
 
     @property
     def key(self) -> str:
@@ -59,9 +61,28 @@ def _error(message: str) -> None:
 
 
 def _substitution_names(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return set(re.findall(r"\$\{([a-z][a-z0-9_]*)\}", value))
+    if isinstance(value, dict):
+        return set().union(*(_substitution_names(item) for item in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_substitution_names(item) for item in value)) if value else set()
+    return set()
+
+
+def _templated(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.search(r"\$\{[^}]+\}", value))
+
+
+def _render(value: Any, parameters: dict[str, Any]) -> Any:
     if not isinstance(value, str):
-        return set()
-    return set(re.findall(r"\$\{([a-z][a-z0-9_]*)\}", value))
+        return value
+    for name, item in parameters.items():
+        token = "${" + name + "}"
+        if value == token:
+            return item
+        value = value.replace(token, "" if item is None else str(item))
+    return value
 
 
 def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str] | None = None) -> dict[str, Any]:
@@ -98,19 +119,19 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
         primitive, params = step["primitive"], step["params"]
         if primitive in {"agent_task", "review_gate"}:
             if set(params) != _AGENT_REQUIRED: _error(f"{primitive} params are exact")
-            if params["workspace"] not in {"worktree", "shared"}: _error("workspace must be worktree or shared")
-            if seats is not None and params["seat"] not in seats: _error(f"unknown seat {params['seat']!r}")
-            if profiles is not None and params["execution_profile"] not in profiles: _error(f"unknown profile {params['execution_profile']!r}")
+            if not _templated(params["workspace"]) and params["workspace"] not in {"worktree", "shared"}: _error("workspace must be worktree or shared")
+            if seats is not None and not _templated(params["seat"]) and params["seat"] not in seats: _error(f"unknown seat {params['seat']!r}")
+            if profiles is not None and not _templated(params["execution_profile"]) and params["execution_profile"] not in profiles: _error(f"unknown profile {params['execution_profile']!r}")
         elif primitive == "approval_gate":
             if set(params) != {"approvers", "instructions"} or not isinstance(params["approvers"], list) or not params["approvers"]: _error("approval_gate params are exact")
-            if seats is not None and any(x not in seats for x in params["approvers"]): _error("unknown approver")
+            if seats is not None and any(not _templated(x) and x not in seats for x in params["approvers"]): _error("unknown approver")
             if step["optional"]: _error("approval_gate cannot be optional")
         elif primitive == "notify":
             if set(params) != {"target", "message"}: _error("notify params are exact")
         else:
             if set(params) - {"event", "due_at"} or not isinstance(params.get("event"), str) or (params["event"] == "timer" and not params.get("due_at")): _error("invalid wait_for_event params")
-        for text in [step["title"], *[v for v in params.values() if isinstance(v, str)]]:
-            if not _substitution_names(text) <= set(parameters): _error(f"missing parameter substitution in {step['id']}")
+        for value in [step["title"], *params.values()]:
+            if not _substitution_names(value) <= set(parameters): _error(f"missing parameter substitution in {step['id']}")
     # directed cycle check and v1 shared-workspace total ordering rule
     visiting: set[str] = set(); visited: set[str] = set()
     def visit(node: str) -> None:
@@ -146,11 +167,18 @@ def load_library(path: str | Path, *, seats: set[str] | None = None, profiles: s
                 row = conn.execute("SELECT hash FROM recipe_versions WHERE id=? AND version=?", (document["id"], document["version"])).fetchone()
                 if row and row["hash"] != digest: _error(f"published recipe {key} is immutable")
                 conn.execute("INSERT OR IGNORE INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) VALUES(?,?,?,?,?,?)", (document["id"], document["version"], digest, document["status"], normalized, store._now()))
-        recipes[key] = Recipe(document, digest)
+        recipes[key] = Recipe(
+            document,
+            digest,
+            frozenset(seats) if seats is not None else None,
+            frozenset(profiles) if profiles is not None else None,
+        )
     return RecipeLibrary(recipes)
 
 
-def bind_parameters(recipe: Recipe, provided: dict[str, Any], skip_steps: list[str] | None = None) -> dict[str, Any]:
+def bind_parameters(recipe: Recipe, provided: dict[str, Any], skip_steps: list[str] | None = None,
+                    *, seats: set[str] | frozenset[str] | None = None,
+                    profiles: set[str] | frozenset[str] | None = None) -> dict[str, Any]:
     """Type-check instantiation values and reject illegal skips, fail closed."""
     spec = recipe.document["parameters"]
     if set(provided) - set(spec): _error("unknown recipe parameters")
@@ -168,4 +196,22 @@ def bind_parameters(recipe: Recipe, provided: dict[str, Any], skip_steps: list[s
     skips = set(skip_steps or [])
     steps = {x["id"]: x for x in recipe.document["steps"]}
     if not skips <= set(steps) or any(not steps[x]["optional"] or steps[x]["primitive"] in {"review_gate", "approval_gate"} for x in skips): _error("invalid skip_steps")
+    seats = recipe.seats if seats is None else seats
+    profiles = recipe.profiles if profiles is None else profiles
+    for step in recipe.document["steps"]:
+        params = step["params"]
+        if step["primitive"] in {"agent_task", "review_gate"}:
+            seat = _render(params["seat"], bound)
+            profile = _render(params["execution_profile"], bound)
+            workspace = _render(params["workspace"], bound)
+            if seats is not None and seat not in seats:
+                _error(f"unknown seat {seat!r}")
+            if profiles is not None and profile not in profiles:
+                _error(f"unknown profile {profile!r}")
+            if workspace not in {"worktree", "shared"}:
+                _error("workspace must be worktree or shared")
+        elif step["primitive"] == "approval_gate" and seats is not None:
+            approvers = [_render(value, bound) for value in params["approvers"]]
+            if any(value not in seats for value in approvers):
+                _error("unknown approver")
     return bound

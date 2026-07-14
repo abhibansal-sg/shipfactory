@@ -37,7 +37,7 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
         # falls back to get_current_board() (the GLOBAL current board), which
         # poisons workspace_path with another board's workdir when the factory
         # board isn't current (shakedown finding #11).
-        return kanban_db.create_task(conn, title=title, body=body, assignee=render(params["seat"]), workspace_kind=params["workspace"], board=instance.get("board"), parents=parents, idempotency_key=key, max_runtime_seconds=int(params.get("max_runtime_seconds", 1800)), max_retries=int(params.get("max_retries", 2)))
+        return kanban_db.create_task(conn, title=title, body=body, assignee=render(params["seat"]), workspace_kind=render(params["workspace"]), board=instance.get("board"), parents=parents, idempotency_key=key, max_runtime_seconds=int(params.get("max_runtime_seconds", 1800)), max_retries=int(params.get("max_retries", 2)))
     if primitive == "approval_gate":
         return kanban_db.create_blocked_task(conn, title=title, body=body, parents=parents, idempotency_key=key, block_kind="needs_input", reason="approval_required")
     if primitive == "wait_for_event":

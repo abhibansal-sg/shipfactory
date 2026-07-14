@@ -603,7 +603,10 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
             recipe = library.get(chosen)
             if recipe.document["status"] != "active": raise RecipeError("deprecated recipe choice")
             validate(recipe.document, seats=seats, profiles=profiles)
-            bind_parameters(recipe, node["parameters"], node["skip_steps"])
+            bind_parameters(
+                recipe, node["parameters"], node["skip_steps"],
+                seats=seats, profiles=profiles,
+            )
     for node in nodes:
         if any(not isinstance(ref, str) or ref not in ids or ref == node["id"] for ref in node["needs"]):
             raise RecipeError("invalid selector sibling dependency")
