@@ -1,0 +1,91 @@
+schema: factory.recipe/v1
+id: dev-pipeline
+version: 3
+status: active
+description: Right-sized dev pipeline; plan-check depth proportional to request size.
+intent_tags: [software-change]
+supersedes: dev-pipeline@2
+parameters:
+  request: {type: string, required: true, default: null}
+  notify_target: {type: string, required: false, default: telegram:home}
+budgets: {max_activations: 12, max_step_activations: 3, max_tokens: 300000}
+steps:
+  - id: plan-check
+    primitive: review_gate
+    title: Check the execution plan
+    needs: []
+    optional: false
+    params:
+      seat: verifier
+      instructions: |
+        TIME-BOX: 10 minutes. Scope your depth to the size of ${request} —
+        a one-function change needs a 5-minute sanity check, not a repo audit.
+        Do NOT investigate engine internals, other instances, task history,
+        or database state; confine reads to files the request will touch.
+        Check only: (1) the request is unambiguous and implementable,
+        (2) the named target files exist (or are clearly creatable),
+        (3) Done criteria are verifiable by tests,
+        (4) scope fits the budget. Tag findings BLOCKER or WARNING with
+        path:line evidence for repository claims.
+        Approve when the request maps to executable, verifiable work.
+        Finish with the exact FACTORY_VERDICT JSON sentinel per
+        recipes/templates/plan-check.md (outcome/body schema, final line).
+      execution_profile: standard
+      workspace: worktree
+  - id: build
+    primitive: agent_task
+    title: Build the change
+    needs: [plan-check]
+    optional: false
+    params:
+      seat: dev-backend
+      instructions: |
+        Canonical contracts: recipes/templates/executor-discipline.md and recipes/templates/summary-frontmatter.md.
+        Implement ${request} and its Done criteria within the assigned kanban task.
+        Apply only the four numbered deviation-authority rules; architectural changes escalate.
+        Package installs always escalate, and unrelated pre-existing failures are logged rather than fixed.
+        Stop after three failed fixes for one issue or five consecutive read/search operations without action.
+        Return the required step_id/activation/subsystem dependency frontmatter and key artifact metadata.
+        Lead the body with a substantive shipped-outcome one-liner, never a generic completion claim.
+        Record task commits, files, numbered deviations, issues, and next-step readiness with test evidence.
+      execution_profile: standard
+      workspace: worktree
+  - id: verify
+    primitive: review_gate
+    title: Verify the change
+    needs: [build]
+    optional: false
+    params:
+      seat: verifier
+      instructions: |
+        Canonical contract: recipes/templates/verifier-discipline.md; Factory citation-gate law wins on conflict.
+        TIME-BOX: 15 minutes; confine reads to the changed files, their tests, and direct callers.
+        Falsify the build summary and verify against this step's Done criteria, not the executor narrative.
+        Check every claimed artifact for existence, substance, wiring, and real non-hardcoded data flow.
+        Classify each actionable issue BLOCKER or WARNING and cite path/to/file.ext:line.
+        Report finding_count plus one finding per line on request_changes and target the upstream build step.
+        Approve only with explicit APPROVE and clean-pass/no-findings wording when there is nothing to cite.
+        Finish with the exact FACTORY_VERDICT JSON sentinel required by the canonical contract.
+      execution_profile: standard
+      workspace: worktree
+  - id: approval
+    primitive: approval_gate
+    title: Approve the verified revision
+    needs: [verify]
+    optional: false
+    params:
+      approvers: [operator]
+      instructions: |
+        Canonical handoff contract: recipes/templates/continue-here.md.
+        Review the verified revision, its cited evidence, and any documented deviations.
+        Approve only the exact revision represented by the latest upstream revision vector.
+        Reject with a concrete operator reason when risk or scope remains unacceptable.
+        The parked kanban comment records where work stands, what remains, and the first resume action.
+  - id: notify
+    primitive: notify
+    title: Notify completion
+    needs: [approval]
+    optional: false
+    params:
+      target: "${notify_target}"
+      message: "Development pipeline v3 completed plan-check, build, verification, and operator approval."
