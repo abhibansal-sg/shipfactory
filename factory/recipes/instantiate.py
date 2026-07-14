@@ -33,7 +33,7 @@ def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, 
     bound = bind_parameters(recipe, parameters, skip_steps)
     instance_id = instance_id or str(uuid.uuid4())
     collector_key = f"recipe/{instance_id}/{recipe.hash}/collector"
-    collector = kanban_db.create_blocked_task(conn, title=f"Recipe collector {recipe.key}", body="Inert Factory completion collector.", parents=parent_tasks or (), idempotency_key=collector_key, block_kind="needs_input", reason="recipe_collector")
+    collector = kanban_db.create_blocked_task(conn, title=f"Recipe collector {recipe.key}", body="Inert Factory completion collector.", parents=parent_tasks or (), idempotency_key=collector_key, board=board, block_kind="needs_input", reason="recipe_collector")
     now = store._now(); skips = set(skip_steps or [])
     with store._connect() as db:
         db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), now, now))

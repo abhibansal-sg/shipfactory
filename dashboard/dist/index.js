@@ -948,14 +948,20 @@
 
   function FactoryHeader(props) {
     var daemon = props.status;
+    var daemonBoards = daemon && Array.isArray(daemon.boards) ? daemon.boards : daemon && daemon.board ? [{ board: daemon.board, last_tick_at: daemon.last_tick_at, stale: false }] : [];
+    var staleBoards = daemonBoards.filter(function (item) { return item.stale; });
     var daemonLabel = props.statusError ? "Daemon: status unavailable" : !daemon ? "Daemon: checking…" : daemon.running
-      ? "Daemon: running (tick " + timeAgo(daemon.last_tick_at) + ")"
-      : "Daemon: STOPPED — instances will not advance";
+      ? "Daemon: " + daemonBoards.length + (daemonBoards.length === 1 ? " board" : " boards") + (staleBoards.length ? " (" + staleBoards.length + " stale)" : "")
+      : "Daemon: STOPPED — " + daemonBoards.length + (daemonBoards.length === 1 ? " board" : " boards");
+    var daemonTitle = daemonLabel + (daemonBoards.length ? "\n" + daemonBoards.map(function (item) {
+      return item.board + " — tick " + timeAgo(item.last_tick_at) + (item.stale ? " (stale)" : "");
+    }).join("\n") : "");
+    var daemonState = daemon && daemon.running ? (staleBoards.length ? "waiting" : "running") : daemon ? "stopped" : "waiting";
     return h("header", { className: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between" },
       h("div", { className: "min-w-0" },
         h("div", { className: "flex flex-wrap items-center gap-2" },
           h(StatePill, { value: "running" }, props.board || "All boards"),
-          h(StatePill, { value: daemon && daemon.running ? "running" : daemon ? "stopped" : "waiting", title: daemonLabel }, daemonLabel),
+          h(StatePill, { value: daemonState, title: daemonTitle }, daemonLabel),
           h("p", { className: "text-sm text-text-secondary" }, "Recipe operations, approvals, capacity, and spend.")
         ),
         h("div", { className: "mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-tertiary" },

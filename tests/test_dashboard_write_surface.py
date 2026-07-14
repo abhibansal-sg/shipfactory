@@ -260,7 +260,9 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
         "running": False,
         "pid": None,
         "last_tick_at": None,
-        "board": "default",
+        "board": None,
+        "boards": [],
+        "tick_interval_seconds": 5.0,
         "config": {
             "recipes_enabled": True,
             "library_path": str(tmp_path / "recipes"),
@@ -276,9 +278,39 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
     assert running.json()["running"] is True
     assert running.json()["pid"] == os.getpid()
     assert running.json()["last_tick_at"] == ticked_at
+    assert running.json()["board"] == "default"
+    assert running.json()["boards"][0]["board"] == "default"
+    assert running.json()["boards"][0]["stale"] is False
 
     store.record_daemon_start("default", 999999)
     monkeypatch.setattr(os, "kill", lambda *_args: (_ for _ in ()).throw(ProcessLookupError()))
     stale = client.get("/api/plugins/factory/status")
     assert stale.json()["running"] is False
     assert stale.json()["pid"] is None
+
+
+def test_status_uses_daemon_boards_and_marks_ticks_over_three_intervals_stale(
+    tmp_path, monkeypatch
+):
+    _configure_library(tmp_path, monkeypatch)
+    run_id = store.record_daemon_start(
+        "served-a", os.getpid(), boards=["served-a", "served-b"], tick_interval=10,
+    )
+    store.record_daemon_tick(run_id, "served-a")
+    store.record_daemon_tick(run_id, "served-b")
+    with store._connect() as db:
+        row = db.execute("SELECT result FROM runs WHERE id=?", (run_id,)).fetchone()
+        payload = json.loads(row["result"])
+        payload["last_tick_at"]["served-b"] = "2020-01-01T00:00:00+00:00"
+        db.execute(
+            "UPDATE runs SET result=? WHERE id=?",
+            (json.dumps(payload), run_id),
+        )
+
+    status = _client().get("/api/plugins/factory/status").json()
+
+    assert status["board"] == "served-a"
+    assert [item["board"] for item in status["boards"]] == ["served-a", "served-b"]
+    assert status["boards"][0]["stale"] is False
+    assert status["boards"][1]["stale"] is True
+    assert status["boards"][1]["last_tick_age_seconds"] > 30

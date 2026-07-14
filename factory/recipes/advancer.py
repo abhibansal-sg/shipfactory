@@ -571,7 +571,7 @@ def deliver_outbox(*, now: str | None = None) -> int:
                 db.execute("UPDATE outbox SET state='delivered',attempts=attempts+1,delivered_at=? WHERE key=?", (store._now(), row["key"])); delivered += 1
     return delivered
 
-def reconcile_root_collectors(conn: Any) -> int:
+def reconcile_root_collectors(conn: Any, *, board: str | None = None) -> int:
     """Explicitly finish triage root collectors once every sibling collector is done.
 
     A root is never left ready simply because kanban dependency propagation saw
@@ -580,7 +580,15 @@ def reconcile_root_collectors(conn: Any) -> int:
     from hermes_cli import kanban_db
     completed = 0
     with store._connect() as db:
-        rows = [dict(r) for r in db.execute("SELECT id,root_collector_task_id FROM triage_selections WHERE root_collector_task_id IS NOT NULL").fetchall()]
+        query = (
+            "SELECT id,root_collector_task_id FROM triage_selections "
+            "WHERE root_collector_task_id IS NOT NULL"
+        )
+        args: tuple[Any, ...] = ()
+        if board is not None:
+            query += " AND board=?"
+            args = (board,)
+        rows = [dict(r) for r in db.execute(query, args).fetchall()]
         for selection in rows:
             root = selection["root_collector_task_id"]
             links = conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (root,)).fetchall()
@@ -623,7 +631,17 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
     from hermes_cli import kanban_db
     count = 0
     with store._connect() as db:
-        events = [dict(r) for r in db.execute("SELECT * FROM advance_events WHERE state='pending' ORDER BY created_at LIMIT 100").fetchall()]
+        event_query = (
+            "SELECT e.* FROM advance_events e "
+            "LEFT JOIN recipe_instances i ON i.id=e.instance_id "
+            "WHERE e.state='pending'"
+        )
+        event_args: tuple[Any, ...] = ()
+        if board is not None:
+            event_query += " AND i.board=?"
+            event_args = (board,)
+        event_query += " ORDER BY e.created_at LIMIT 100"
+        events = [dict(r) for r in db.execute(event_query, event_args).fetchall()]
         for row in events:
             payload = json.loads(row["payload_json"]); instance = _instance(db, row["instance_id"])
             if not instance or instance["status"] in {"cancelling", "cancelled"}: db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); continue

@@ -302,7 +302,8 @@ def create_triage_task(request: TriageTask) -> dict[str, Any]:
     conn = kanban_db.connect(board=request.board)
     try:
         task_id = kanban_db.create_task(
-            conn, title=request.title, body=request.body, triage=True
+            conn, title=request.title, body=request.body, triage=True,
+            board=request.board,
         )
         task = kanban_db.get_task(conn, task_id)
         return {"task_id": task_id, "status": task.status, "board": request.board}
@@ -360,22 +361,47 @@ def cancel_instance(instance_id: str) -> dict[str, Any]:
 
 @router.get("/status")
 def factory_status() -> dict[str, Any]:
-    from hermes_cli import kanban_db
-
-    board = kanban_db.get_current_board()
     try:
         _, recipes = _recipe_config()
     except (FileNotFoundError, OSError, ValueError):
         recipes = {}
-    record = store.latest_daemon_run(board)
+    record = store.latest_daemon_run()
     running = bool(
         record and record.get("ended_at") is None and _pid_alive(record.get("pid"))
     )
+    names = list(record.get("boards") or []) if record else []
+    ticks = record.get("last_tick_at") if record else {}
+    if not isinstance(ticks, dict):
+        ticks = {names[0]: ticks} if names else {}
+    interval = float(record.get("tick_interval_seconds") or 5.0) if record else 5.0
+    now = datetime.now(timezone.utc)
+    board_status = []
+    for name in names:
+        ticked_at = ticks.get(name)
+        age = None
+        if ticked_at:
+            try:
+                stamp = datetime.fromisoformat(str(ticked_at).replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                age = max(0.0, (now - stamp).total_seconds())
+            except (TypeError, ValueError):
+                age = None
+        board_status.append({
+            "board": name,
+            "last_tick_at": ticked_at,
+            "last_tick_age_seconds": age,
+            "stale": age is None or age > 3 * interval,
+        })
+    first_board = names[0] if names else None
     return {
         "running": running,
         "pid": record.get("pid") if running and record else None,
-        "last_tick_at": record.get("last_tick_at") if record else None,
-        "board": board,
+        # One-release compatibility for readers expecting a single board/tick.
+        "board": first_board,
+        "last_tick_at": ticks.get(first_board) if first_board else None,
+        "boards": board_status,
+        "tick_interval_seconds": interval,
         "config": {
             "recipes_enabled": bool(recipes.get("enabled")),
             "library_path": recipes.get("library_path"),

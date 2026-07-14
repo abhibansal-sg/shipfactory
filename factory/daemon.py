@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 
@@ -60,7 +61,16 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
             from factory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
             startup_guard(cfg)
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
-            result_recipes = {"events": apply_events(conn, profiles=recipes_cfg["execution_profiles"], board=board or cfg.company), "outbox": deliver_outbox(), "root_collectors": reconcile_root_collectors(conn)}
+            recipe_board = board or cfg.company
+            result_recipes = {
+                "events": apply_events(
+                    conn,
+                    profiles=recipes_cfg["execution_profiles"],
+                    board=recipe_board,
+                ),
+                "outbox": deliver_outbox(),
+                "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
+            }
             from factory.config import selector_config
             if selector_config(recipes_cfg)["enabled"]:
                 from factory.recipes.selector_stage import run_stage
@@ -102,28 +112,114 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
     return result
 
 
-def run(conn, *, board: str | None = None, interval: float = 5.0,
-        once: bool = False, sync: bool = False, sync_interval: float | None = None) -> dict[str, Any] | None:
-    """Run Factory ticks until interrupted, or return one tick when ``once``."""
-    from factory import store
-    if board is None:
+def _record_board_tick_failure(board: str, exc: Exception) -> None:
+    """Log and emit best-effort telemetry for one isolated board failure."""
+    logger.error("Factory daemon tick failed for board %s: %s", board, exc, exc_info=True)
+    try:
+        from factory import store
+        from factory.telemetry import append_jsonl
+
+        append_jsonl({
+            "event": "daemon_board_tick_failure",
+            "at": store._now(),
+            "board": board,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        })
+    except Exception:
+        logger.exception("Factory could not emit board-tick failure telemetry")
+
+
+def _served_boards(board: str | None, boards: Sequence[str] | None) -> list[str]:
+    """Normalize the daemon's ordered, de-duplicated board set."""
+    values = [str(value).strip() for value in (boards or ()) if str(value).strip()]
+    if board is not None and str(board).strip():
+        values.insert(0, str(board).strip())
+    if not values:
         from hermes_cli.kanban_db import get_current_board
-        board = get_current_board()
-    run_id = store.record_daemon_start(board, os.getpid())
+        values = [get_current_board()]
+    return list(dict.fromkeys(values))
+
+
+def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
+        interval: float = 5.0, once: bool = False, sync: bool = False,
+        sync_interval: float | None = None) -> dict[str, Any] | None:
+    """Run one tick loop across one or more isolated board connections.
+
+    A traditional single-board caller continues to pass its connection in
+    ``conn``.  Multi-board callers may pass a board-to-connection mapping, or
+    ``None`` to let the daemon own and reconnect each board connection.
+    """
+    from factory import store
+    board_names = _served_boards(board, boards)
+    first_board = board_names[0]
+    owns_connections = conn is None
+    if isinstance(conn, Mapping):
+        connections = dict(conn)
+    elif conn is None:
+        connections: dict[str, Any] = {}
+    elif len(board_names) == 1:
+        connections = {first_board: conn}
+    else:
+        raise ValueError("multi-board daemon requires a connection mapping or conn=None")
+
+    run_id = store.record_daemon_start(
+        first_board,
+        os.getpid(),
+        boards=board_names,
+        tick_interval=interval,
+    )
     last_sync = 0.0
     try:
         while True:
             now = time.monotonic()
             do_sync = sync and (sync_interval is None or now - last_sync >= sync_interval)
-            result = tick(conn, board=board, sync=do_sync)
-            store.record_daemon_tick(run_id, board)
+            results: dict[str, Any] = {}
+            for board_name in board_names:
+                board_conn = connections.get(board_name)
+                if board_conn is None:
+                    try:
+                        from hermes_cli import kanban_db
+                        board_conn = kanban_db.connect(board=board_name)
+                        connections[board_name] = board_conn
+                    except Exception as exc:
+                        _record_board_tick_failure(board_name, exc)
+                        results[board_name] = {"error": str(exc)}
+                        continue
+                try:
+                    results[board_name] = tick(
+                        board_conn,
+                        board=board_name,
+                        sync=do_sync,
+                    )
+                    store.record_daemon_tick(run_id, board_name)
+                except Exception as exc:
+                    _record_board_tick_failure(board_name, exc)
+                    results[board_name] = {"error": str(exc)}
+                    if owns_connections:
+                        try:
+                            board_conn.close()
+                        except Exception:
+                            logger.exception(
+                                "Factory could not close failed board connection for %s",
+                                board_name,
+                            )
+                        connections.pop(board_name, None)
             if do_sync:
                 last_sync = now
             if once:
-                return result
+                return results[first_board] if len(board_names) == 1 else {"boards": results}
             time.sleep(max(0.01, interval))
     finally:
-        store.record_daemon_end(run_id)
+        try:
+            store.record_daemon_end(run_id)
+        finally:
+            if owns_connections:
+                for board_conn in connections.values():
+                    try:
+                        board_conn.close()
+                    except Exception:
+                        logger.exception("Factory could not close a board connection")
 
 
 __all__ = ["tick", "run"]

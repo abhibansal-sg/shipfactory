@@ -127,20 +127,76 @@ def record_run_end(run_id, exit_code, tokens_in, tokens_out, duration_s, result)
                      (_now(), exit_code, tokens_in, tokens_out, tokens_in + tokens_out, duration_s, result, run_id))
 
 
-def record_daemon_start(board: str, pid: int) -> int:
-    """Insert a durable Factory-daemon run record for liveness checks."""
-    return record_run_start(DAEMON_RUN_TASK_ID, board, "factory-daemon", "", pid)
+def _daemon_payload(
+    boards: list[str],
+    last_tick_at: dict[str, str | None],
+    *,
+    tick_interval: float,
+) -> dict[str, Any]:
+    """Build the one-release-compatible daemon liveness payload."""
+    return {
+        "kind": "factory_daemon",
+        "board": boards[0],
+        "board_deprecation": "board is retained for one release; use boards",
+        "boards": boards,
+        "last_tick_at": last_tick_at,
+        "tick_interval_seconds": tick_interval,
+    }
+
+
+def record_daemon_start(
+    board: str,
+    pid: int,
+    *,
+    boards: list[str] | None = None,
+    tick_interval: float = 5.0,
+) -> int:
+    """Insert a durable Factory-daemon run record for all served boards."""
+    names = list(dict.fromkeys(boards or [board]))
+    run_id = record_run_start(DAEMON_RUN_TASK_ID, names[0], "factory-daemon", "", pid)
+    payload = _daemon_payload(
+        names,
+        {name: None for name in names},
+        tick_interval=float(tick_interval),
+    )
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE runs SET result=? WHERE id=?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")), run_id),
+        )
+    return run_id
 
 
 def record_daemon_tick(run_id: int, board: str) -> str:
-    """Persist the latest completed daemon tick on its run record."""
+    """Persist one board's latest completed tick on its daemon run record."""
     ticked_at = _now()
-    result = json.dumps(
-        {"kind": "factory_daemon", "board": board, "last_tick_at": ticked_at},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     with _connect() as conn:
+        row = conn.execute("SELECT seat,result FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown daemon run {run_id}")
+        try:
+            payload = json.loads(row["result"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        names = payload.get("boards")
+        if not isinstance(names, list) or not names:
+            names = [str(payload.get("board") or row["seat"])]
+        if board not in names:
+            names.append(board)
+        ticks = payload.get("last_tick_at")
+        if not isinstance(ticks, dict):
+            ticks = {names[0]: ticks}
+        ticks = {name: ticks.get(name) for name in names}
+        ticks[board] = ticked_at
+        result = json.dumps(
+            _daemon_payload(
+                names,
+                ticks,
+                tick_interval=float(payload.get("tick_interval_seconds") or 5.0),
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         conn.execute("UPDATE runs SET result=? WHERE id=?", (result, run_id))
     return ticked_at
 
@@ -154,22 +210,42 @@ def record_daemon_end(run_id: int) -> None:
         )
 
 
-def latest_daemon_run(board: str) -> dict[str, Any] | None:
-    """Return the latest durable daemon record for one board."""
+def latest_daemon_run(board: str | None = None) -> dict[str, Any] | None:
+    """Return the latest durable daemon record, optionally serving ``board``."""
     init_db()
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM runs WHERE task_id=? AND seat=? ORDER BY id DESC LIMIT 1",
-            (DAEMON_RUN_TASK_ID, board),
-        ).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM runs WHERE task_id=? ORDER BY id DESC",
+            (DAEMON_RUN_TASK_ID,),
+        ).fetchall()
+    row = None
+    payload: dict[str, Any] = {}
+    for candidate in rows:
+        try:
+            candidate_payload = json.loads(candidate["result"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            candidate_payload = {}
+        names = candidate_payload.get("boards")
+        if not isinstance(names, list) or not names:
+            names = [str(candidate_payload.get("board") or candidate["seat"])]
+        if board is None or board in names:
+            row = candidate
+            payload = candidate_payload
+            break
     if row is None:
         return None
     value = dict(row)
-    try:
-        payload = json.loads(value.get("result") or "{}")
-    except (TypeError, json.JSONDecodeError):
-        payload = {}
-    value["last_tick_at"] = payload.get("last_tick_at")
+    names = payload.get("boards")
+    if not isinstance(names, list) or not names:
+        names = [str(payload.get("board") or value["seat"])]
+    ticks = payload.get("last_tick_at")
+    if not isinstance(ticks, dict):
+        ticks = {names[0]: ticks}
+    value["board"] = payload.get("board") or names[0]
+    value["boards"] = names
+    value["last_tick_at"] = {name: ticks.get(name) for name in names}
+    value["tick_interval_seconds"] = float(payload.get("tick_interval_seconds") or 5.0)
+    value["board_deprecation"] = payload.get("board_deprecation")
     return value
 
 

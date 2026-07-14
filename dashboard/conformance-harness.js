@@ -159,9 +159,11 @@ window.__HERMES_PLUGIN_SDK__ = {
     if (options.method === "POST") return Promise.resolve({ key: "harness-decision" });
     if (url.endsWith("/status")) return Promise.resolve(scenario.get("daemon") === "stopped" ? {
       running: false, pid: null, last_tick_at: isoAgo(95), board: "hermes-mobile",
+      boards: [{ board: "hermes-mobile", last_tick_at: isoAgo(95), last_tick_age_seconds: 95, stale: true }], tick_interval_seconds: 20,
       config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
     } : {
       running: true, pid: 48120, last_tick_at: isoAgo(12), board: "hermes-mobile",
+      boards: [{ board: "hermes-mobile", last_tick_at: isoAgo(12), last_tick_age_seconds: 12, stale: false }], tick_interval_seconds: 20,
       config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
     });
     if (url.endsWith("/recipes")) return Promise.resolve(recipes.map(item => ({ ...item })));
