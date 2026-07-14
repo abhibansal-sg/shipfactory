@@ -9,6 +9,7 @@ import "./dist/style.css";
 const h = React.createElement;
 const now = Date.now();
 const isoAgo = seconds => new Date(now - seconds * 1000).toISOString();
+const scenario = new URLSearchParams(window.location.search);
 
 const instances = [
   {
@@ -58,9 +59,31 @@ const instances = [
   },
 ];
 
+const recipes = [
+  {
+    id: "ship-feature", version: 3, status: "active",
+    description: "Build, review, verify, and release a product change.",
+    parameters: {
+      request: { type: "string", required: true, default: null },
+      rollout_batch: { type: "integer", required: false, default: 10 },
+      expedited: { type: "boolean", required: false, default: false },
+      release_lane: { type: "enum", required: true, default: "standard", values: ["standard", "urgent"] },
+      approval_due_at: { type: "datetime", required: false, default: null },
+    },
+    optional_steps: [{ id: "announce", title: "Announce the release" }],
+  },
+  {
+    id: "release-train", version: 2, status: "active",
+    description: "Coordinate a bounded release train across verified changes.",
+    parameters: { request: { type: "string", required: true, default: null } },
+    optional_steps: [],
+  },
+];
+
 const details = {
   fac_a91d2e7c: {
     ...instances[0],
+    parameters_json: JSON.stringify({ request: "Ship Factory dashboard writes", rollout_batch: 10, expedited: false, release_lane: "standard", approval_due_at: null }),
     steps: [
       { step_id: "scope", activation: 1, primitive: "agent_task", state: "done", kanban_task_id: "t_8b32f04", blocked_reason: null },
       { step_id: "implement", activation: 1, primitive: "agent_task", state: "done", kanban_task_id: "t_a29d8e1", blocked_reason: null },
@@ -126,9 +149,28 @@ window.__HERMES_PLUGIN_SDK__ = {
   components: { Badge, Button, Card, CardContent },
   utils: {},
   fetchJSON(url, options = {}) {
+    if (options.method === "POST" && url.endsWith("/instances")) return Promise.resolve({ instance_id: "fac_new7c20", recipe: "ship-feature@3" });
+    if (options.method === "POST" && url.endsWith("/triage")) return Promise.resolve({ task_id: "t_triage1", status: "triage", board: "hermes-mobile" });
+    if (options.method === "POST" && url.endsWith("/reroute")) return Promise.resolve({ activated: false, replacement: { instance_id: "fac_a91d2e7c" } });
+    if (options.method === "POST" && url.endsWith("/cancel")) return Promise.resolve({ instance_id: "fac_a91d2e7c", status: "cancelled" });
     if (options.method === "POST") return Promise.resolve({ key: "harness-decision" });
+    if (url.endsWith("/status")) return Promise.resolve(scenario.get("daemon") === "stopped" ? {
+      running: false, pid: null, last_tick_at: isoAgo(95), board: "hermes-mobile",
+      config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
+    } : {
+      running: true, pid: 48120, last_tick_at: isoAgo(12), board: "hermes-mobile",
+      config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
+    });
+    if (url.endsWith("/recipes")) return Promise.resolve(recipes.map(item => ({ ...item })));
     if (url.endsWith("/waiting")) return Promise.resolve(waiting.map(item => ({ ...item })));
     if (url.endsWith("/instances")) return Promise.resolve(instances.map(item => ({ ...item })));
+    if (url.endsWith("/cancel")) return Promise.resolve({
+      instance_id: "fac_a91d2e7c",
+      workers: [{ task_id: "t_1d7b902", pid: 55231, executor: "codex" }],
+      nonterminal_steps: ["verify", "release"],
+      suppressed: ["t_1d7b902", "t_4e2c551"],
+      collector: "t_collector9",
+    });
     if (url.includes("/instances/")) {
       const id = decodeURIComponent(url.split("/instances/")[1]);
       return Promise.resolve(details[id] || { ...instances.find(item => item.id === id), steps: [], decisions: [] });
@@ -145,17 +187,30 @@ await import("./dist/index.js");
 if (!registeredPage) throw new Error("Factory bundle did not register a page");
 createRoot(document.querySelector(".factory-root")).render(h(registeredPage));
 
-const scenario = new URLSearchParams(window.location.search);
 const requestedView = scenario.get("view");
 if (requestedView) {
   window.setTimeout(() => {
     const tab = Array.from(document.querySelectorAll(".factory-tabs button"))
       .find(button => button.textContent.toLowerCase().startsWith(requestedView.toLowerCase()));
     if (tab) tab.click();
-    if (scenario.get("drawer") === "open") {
+    const dialog = scenario.get("dialog");
+    if (dialog === "run" || dialog === "triage") {
+      window.setTimeout(() => {
+        const label = dialog === "run" ? "Run recipe" : "New triage task";
+        const button = Array.from(document.querySelectorAll("button")).find(item => item.textContent.trim() === label);
+        if (button) button.click();
+      }, 150);
+    }
+    if (scenario.get("drawer") === "open" || dialog === "cancel") {
       window.setTimeout(() => {
         const row = document.querySelector(".factory-instance-table tbody tr");
         if (row) row.click();
+        if (dialog === "cancel") {
+          window.setTimeout(() => {
+            const button = Array.from(document.querySelectorAll("button")).find(item => item.textContent.includes("Preview cancellation"));
+            if (button) button.click();
+          }, 180);
+        }
       }, 150);
     }
   }, 100);
