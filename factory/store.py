@@ -25,10 +25,28 @@ def _db_path() -> Path:
     return Path(home) / "factory" / "factory.db"
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3.Connection whose ``with`` block commits AND closes.
+
+    Finding #27 (2026-07-14): stock ``with sqlite3.connect(...)`` is a
+    TRANSACTION scope — it commits/rolls back on exit but never closes the
+    handle. Every ``with _connect()`` in this package therefore leaked one
+    fd per call; the daemon leaked ~13/hour against macOS's default 256
+    soft limit, and EMFILE surfaces as SQLite "disk I/O error" + index
+    corruption (finding #21 was this leak's downstream symptom).
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=5.0)
+    conn = sqlite3.connect(path, timeout=5.0, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")  # #16-V2: wait out concurrent writers.
