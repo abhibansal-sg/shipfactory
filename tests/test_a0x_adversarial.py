@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -208,18 +209,19 @@ def _run_action_intents_child(home: str, kanban_path: str, kinds, result_queue) 
         conn.close()
 
 
-def _slow_send_child_30s(home: str, kanban_path: str, started) -> None:
-    """Scenario 8: a notification send that stalls for 31 real seconds."""
+def _slow_send_child_30s(home: str, kanban_path: str, bin_dir: str) -> None:
+    """Scenario 8: a notification send that stalls for 20 real seconds.
+
+    Blocks on a real ``hermes`` executable placed ahead on PATH (written by
+    the test into ``bin_dir``), not an in-process monkeypatch of
+    ``subprocess.run`` — the production code's own real
+    ``subprocess.run(["hermes", "send", ...])`` call does the blocking.
+    """
     os.environ["HERMES_HOME"] = home
+    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
     from hermes_cli import kanban_db
     from shipfactory.recipes import advancer as child_advancer
 
-    def slow_run(*args, **kwargs):
-        started.set()
-        time.sleep(31)
-        return subprocess.CompletedProcess(args[0], 0, "", "")
-
-    child_advancer.subprocess.run = slow_run
     conn = kanban_db.connect(Path(kanban_path))
     try:
         child_advancer.run_action_intents(conn, board="test", kinds={"notification_delivery"}, limit=1)
@@ -670,7 +672,18 @@ def test_gate_completion_after_kanban_task_already_terminal_is_abandoned_not_sil
 
 
 def test_thirty_second_notification_send_holds_no_factory_write_transaction(tmp_path, kanban_conn):
-    """Review §2.0.6 #8: the second writer succeeds within the busy timeout."""
+    """Review §2.0.6 #8: the second writer succeeds within the busy timeout.
+
+    Cross-lab review finding #1: this previously monkeypatched
+    ``subprocess.run`` in-process to fake a stall, contradicting the
+    suite's real-failpoint claim. This version installs a real executable
+    named ``hermes`` ahead on PATH and lets the production
+    ``subprocess.run(["hermes", "send", ...])`` call (advancer.py) genuinely
+    exec and block on it. The script sleeps 20 real seconds: comfortably
+    past the sqlite ``busy_timeout`` (5s, store.py) so a held write
+    transaction would be caught, but under the production code's own 30s
+    per-call subprocess timeout so the send still completes and delivers.
+    """
     key = "slow-notification-30s"
     store.init_db()
     with store._connect() as db:
@@ -682,13 +695,34 @@ def test_thirty_second_notification_send_holds_no_factory_write_transaction(tmp_
             db, logical_key=key, kind="notification_delivery",
             payload={"outbox_key": key, "board": "test"},
         )
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    started_marker = tmp_path / "hermes-send-started"
+    fake_hermes = bin_dir / "hermes"
+    fake_hermes.write_text(
+        "#!/bin/sh\n"
+        f"touch {shlex.quote(str(started_marker))}\n"
+        "sleep 20\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_hermes.chmod(0o755)
+
     home = os.environ["HERMES_HOME"]
     kanban_path = kanban_conn.execute("PRAGMA database_list").fetchone()[2]
     ctx = multiprocessing.get_context("spawn")
-    started = ctx.Event()
-    process = ctx.Process(target=_slow_send_child_30s, args=(home, kanban_path, started))
+    process = ctx.Process(target=_slow_send_child_30s, args=(home, kanban_path, str(bin_dir)))
     process.start()
-    assert started.wait(15)
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if started_marker.exists():
+            break
+        if not process.is_alive():
+            pytest.fail("notification-send child exited before starting the real send")
+        time.sleep(0.02)
+    else:
+        pytest.fail("real 'hermes send' subprocess never started")
 
     before = time.monotonic()
     store.set_policy("writer-mid-send", {"stages": []})
