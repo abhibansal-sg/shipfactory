@@ -1,38 +1,42 @@
-## What does this PR do?
+## Summary
 
-<!-- Describe the change clearly. What problem does it solve? Why is this approach the right one? -->
+<!-- One sentence of BEHAVIOR, not implementation. `Closes #N` when applicable. -->
 
-## Type of Change
+## Changes
 
-- [ ] 🐛 Bug fix (non-breaking change that fixes an issue)
-- [ ] ✨ New feature (non-breaking change that adds functionality)
-- [ ] 🔒 Security / control-plane hardening
-- [ ] 📝 Documentation update
-- [ ] ✅ Tests (adding or improving test coverage)
-- [ ] ♻️ Refactor (no behavior change)
-- [ ] 🧪 Recipe (new pipeline version — published recipes are immutable)
-
-## Changes Made
-
-<!-- List the specific changes. Include file paths for code changes. -->
+<!-- Terse bullets with file paths. -->
 
 -
 
-## How to Test
+## Behaviour
 
-<!-- Steps to verify. Include the exact test command and both full-suite run counts. -->
+<!-- Before/after prose — for features AND fixes alike. -->
 
-1. `bash -c 'ulimit -n 4096; <hermes-venv-python> -m pytest tests/ -q'`
-2.
+**Before:**
 
-## Risk & Rollback
+**After:**
 
-<!-- What could break? How is it reverted? Control-plane changes require adversarial-suite evidence. -->
+## Validation
+
+<!-- Table. Every row executed first-hand — no lane self-reports.
+     Include a RED-control row for fixes: revert the fix keeping the tests,
+     show the regressions FAIL, restore, show green. -->
+
+| Check | Result |
+|---|---|
+| Full suite (run 1) | |
+| Full suite (run 2) | |
+| RED control | |
 
 ## Checklist
 
-- [ ] Full suite green ×2 consecutively (counts pasted above)
+- [ ] Full suite green ×2 consecutively (counts in the table)
 - [ ] No published recipe bytes changed
 - [ ] Spec §15/§17 updated if any module signature or primitive changed
 - [ ] New findings landed in AGENTS.md in this same PR
 - [ ] No secrets, tokens, or private paths
+- [ ] Author `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`, no AI trailers, no tracker IDs
+
+## Infographic
+
+<!-- Last. Fix PRs get one too. -->
