@@ -28,6 +28,15 @@
 | Full suite (run 2) | |
 | RED control | |
 
+## Execution context
+
+<!-- Table for every modified call site: what thread/process runs it,
+     and what a slow or crashing callee does now. -->
+
+| Modified call site | What thread/process runs it | What a slow/crashing callee does now |
+|---|---|---|
+| | | |
+
 ## Checklist
 
 - [ ] Full suite green ×2 consecutively (counts in the table)
@@ -39,4 +48,9 @@
 
 ## Infographic
 
-<!-- Last. Fix PRs get one too. -->
+<!-- Last. Fix PRs get one too. An ACTUAL embedded image is required:
+     prompt file under prompts/ first, generate, adversarial vision QC
+     (SHIP verdict), host on the pr-assets orphan branch, verify HTTP 200,
+     then embed. A placeholder sentence here is non-compliance. -->
+
+![](https://raw.githubusercontent.com/abhibansal-sg/shipfactory/pr-assets/assets/<name>.png)
