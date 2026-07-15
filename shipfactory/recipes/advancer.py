@@ -599,6 +599,31 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         f"kanban:missing:{step['kanban_task_id']}",
                     )
                 elif task.status == "done":
+                    if recipe.get("schema") == "shipfactory.recipe/v2":
+                        from shipfactory.artifacts import (
+                            ArtifactValidationError,
+                            artifact_set_hash,
+                            output_artifacts,
+                        )
+                        try:
+                            outputs = output_artifacts(
+                                db, instance_id, step["step_id"],
+                                int(step["activation"]), definition,
+                            )
+                        except ArtifactValidationError as exc:
+                            changed |= _transition(
+                                db, instance, step, "blocked", f"kanban:{task.id}",
+                                reason=f"worker_failed: {exc}",
+                            )
+                            continue
+                        db.execute(
+                            "UPDATE recipe_steps SET output_artifact_set_hash=?,updated_at=? "
+                            "WHERE instance_id=? AND step_id=? AND activation=?",
+                            (
+                                artifact_set_hash(outputs), store._now(), instance_id,
+                                step["step_id"], step["activation"],
+                            ),
+                        )
                     if step["primitive"] == "review_gate":
                         try:
                             verdict = parse_verdict(task.result or "")
@@ -633,7 +658,15 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         _consume_resume_note(conn, step["kanban_task_id"])
                     changed |= _transition(db, instance, step, "done", f"kanban:{task.id}")
                 elif task.status == "blocked" and step["primitive"] in {"agent_task", "review_gate"}:
-                    changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="worker_blocked")
+                    visible_reason = "worker_blocked"
+                    if recipe.get("schema") == "shipfactory.recipe/v2":
+                        visible_reason = str(
+                            getattr(task, "blocked_reason", "") or visible_reason
+                        )
+                    changed |= _transition(
+                        db, instance, step, "blocked", f"kanban:{task.id}",
+                        reason=visible_reason,
+                    )
                 elif task.status in KANBAN_TERMINAL:
                     changed |= _fresh_activation(
                         db, instance, definition, step,
@@ -644,6 +677,29 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
             for step_id, step in list(latest.items()):
                 if step["state"] != "pending": continue
                 if all(latest[parent]["state"] in {"done", "skipped"} for parent in defs[step_id]["needs"]):
+                    if recipe.get("schema") == "shipfactory.recipe/v2":
+                        from shipfactory.artifacts import (
+                            ArtifactMissing,
+                            artifact_set_hash,
+                            input_artifacts,
+                        )
+                        try:
+                            inputs = input_artifacts(db, instance_id, defs[step_id])
+                        except ArtifactMissing:
+                            changed |= _transition(
+                                db, instance, step, "blocked", "artifacts",
+                                reason="artifact_missing",
+                            )
+                            continue
+                        db.execute(
+                            "UPDATE recipe_steps SET input_artifact_set_hash=?,updated_at=? "
+                            "WHERE instance_id=? AND step_id=? AND activation=?",
+                            (
+                                artifact_set_hash(inputs), store._now(), instance_id,
+                                step_id, step["activation"],
+                            ),
+                        )
+                        step["input_artifact_set_hash"] = artifact_set_hash(inputs)
                     if step["primitive"] in {"review_gate", "approval_gate"}:
                         vector = revision_vector(db, instance_id, step, recipe)
                         db.execute(

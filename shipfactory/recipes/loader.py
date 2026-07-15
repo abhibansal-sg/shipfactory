@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -16,7 +16,10 @@ from shipfactory import store
 
 _ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _TOP = {"schema", "id", "version", "status", "description", "intent_tags", "supersedes", "parameters", "budgets", "steps"}
-_STEP = {"id", "primitive", "title", "needs", "optional", "params"}
+_STEP_V1 = {"id", "primitive", "title", "needs", "optional", "params"}
+_STEP_V2 = {"id", "primitive", "title", "needs", "optional", "inputs", "outputs", "params"}
+_INPUT_V2 = {"from", "kind", "required"}
+_OUTPUT_V2 = {"kind", "schema", "path"}
 _PRIMITIVES = {"agent_task", "review_gate", "approval_gate", "notify", "wait_for_event"}
 _PARAM_TYPES = {"string", "integer", "boolean", "enum", "datetime"}
 _AGENT_REQUIRED = {"seat", "instructions", "execution_profile", "workspace"}
@@ -85,11 +88,60 @@ def _render(value: Any, parameters: dict[str, Any]) -> Any:
     return value
 
 
+def _validate_v2_io(step: dict[str, Any]) -> None:
+    ident = step.get("id")
+    inputs = step.get("inputs")
+    if not isinstance(inputs, list):
+        _error(f"v2 step {ident!r} inputs must be a list")
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            _error(f"v2 step {ident!r} input {index} must be a mapping")
+        unknown = sorted(set(item) - _INPUT_V2)
+        missing = sorted(_INPUT_V2 - set(item))
+        if unknown:
+            _error(f"v2 step {ident!r} input {index} unknown keys: {', '.join(unknown)}")
+        if missing:
+            _error(f"v2 step {ident!r} input {index} missing keys: {', '.join(missing)}")
+        if (not isinstance(item["from"], str) or not _ID.fullmatch(item["from"])
+                or not isinstance(item["kind"], str) or not _ID.fullmatch(item["kind"])
+                or not isinstance(item["required"], bool)):
+            _error(f"invalid v2 input in step {ident!r}")
+    outputs = step.get("outputs")
+    if not isinstance(outputs, list):
+        _error(f"v2 step {ident!r} outputs must be a list")
+    kinds: set[str] = set()
+    for index, item in enumerate(outputs):
+        if not isinstance(item, dict):
+            _error(f"v2 step {ident!r} output {index} must be a mapping")
+        unknown = sorted(set(item) - _OUTPUT_V2)
+        missing = sorted(_OUTPUT_V2 - set(item))
+        if unknown:
+            _error(f"v2 step {ident!r} output {index} unknown keys: {', '.join(unknown)}")
+        if missing:
+            _error(f"v2 step {ident!r} output {index} missing keys: {', '.join(missing)}")
+        kind, schema, path = item["kind"], item["schema"], item["path"]
+        if not isinstance(kind, str) or not _ID.fullmatch(kind) or kind in kinds:
+            _error(f"invalid or duplicate v2 output kind in step {ident!r}")
+        kinds.add(kind)
+        if (not isinstance(schema, str)
+                or not re.fullmatch(rf"shipfactory\.{re.escape(kind)}/v[1-9][0-9]*", schema)):
+            _error(f"v2 output schema does not match kind {kind!r}")
+        if not isinstance(path, str) or "\\" in path:
+            _error(f"invalid v2 output path in step {ident!r}")
+        parsed = PurePosixPath(path)
+        if (parsed.is_absolute() or len(parsed.parts) < 2
+                or parsed.parts[0] != ".shipfactory-output"
+                or ".." in parsed.parts or path.endswith("/")):
+            _error(f"v2 output path must stay under .shipfactory-output/ in step {ident!r}")
+
+
 def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str] | None = None) -> dict[str, Any]:
-    """Validate exactly the v1 schema; no repair or permissive coercion occurs."""
+    """Validate recipe v1 or v2 exactly; never repair or coerce input."""
     if not isinstance(document, dict) or set(document) != _TOP:
-        _error("recipe top-level keys must exactly match shipfactory.recipe/v1")
-    if document["schema"] != "shipfactory.recipe/v1": _error("unsupported recipe schema")
+        _error("recipe top-level keys must exactly match schema")
+    schema = document["schema"]
+    if schema not in {"shipfactory.recipe/v1", "shipfactory.recipe/v2"}: _error("unsupported recipe schema")
+    v2 = schema == "shipfactory.recipe/v2"
     if not isinstance(document["id"], str) or not _ID.fullmatch(document["id"]): _error("invalid recipe id")
     if not isinstance(document["version"], int) or isinstance(document["version"], bool) or document["version"] < 1: _error("version must be positive integer")
     if document["status"] not in {"active", "deprecated"}: _error("invalid recipe status")
@@ -109,16 +161,46 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
     if not isinstance(steps, list) or not steps: _error("steps must be nonempty list")
     known: dict[str, dict[str, Any]] = {}
     for step in steps:
-        if not isinstance(step, dict) or set(step) != _STEP: _error("step keys must exactly match schema")
+        if not isinstance(step, dict): _error("step must be a mapping")
+        expected_keys = _STEP_V2 if v2 else _STEP_V1
+        unknown = sorted(set(step) - expected_keys)
+        missing = sorted(expected_keys - set(step))
+        if unknown:
+            suffix = " in v2" if v2 else ""
+            _error(f"unknown step keys{suffix}: {', '.join(unknown)}")
+        if missing:
+            suffix = " in v2" if v2 else ""
+            _error(f"missing step keys{suffix}: {', '.join(missing)}")
         ident = step.get("id")
         if not isinstance(ident, str) or not _ID.fullmatch(ident) or ident in known: _error("invalid or duplicate step id")
         if step.get("primitive") not in _PRIMITIVES or not isinstance(step.get("title"), str) or not isinstance(step.get("needs"), list) or not all(isinstance(x, str) for x in step["needs"]) or not isinstance(step.get("optional"), bool) or not isinstance(step.get("params"), dict): _error(f"invalid step {ident!r}")
+        if v2:
+            _validate_v2_io(step)
         known[ident] = step
     for step in steps:
         if any(n not in known or n == step["id"] for n in step["needs"]): _error(f"unknown/self need in {step['id']}")
+        if v2:
+            for item in step["inputs"]:
+                if item["from"] not in known:
+                    _error(f"v2 input in {step['id']!r} references nonexistent producer {item['from']!r}")
+                if item["from"] == step["id"]:
+                    _error(f"v2 input in {step['id']!r} references itself")
+                produced = {output["kind"] for output in known[item["from"]]["outputs"]}
+                if item["kind"] not in produced:
+                    _error(
+                        f"v2 input in {step['id']!r} references producer "
+                        f"{item['from']!r} without output kind {item['kind']!r}"
+                    )
         primitive, params = step["primitive"], step["params"]
         if primitive in {"agent_task", "review_gate"}:
-            if set(params) != _AGENT_REQUIRED: _error(f"{primitive} params are exact")
+            allowed = _AGENT_REQUIRED | ({"access_mode", "environment"} if v2 else set())
+            if (not _AGENT_REQUIRED <= set(params) or set(params) - allowed
+                    or (not v2 and set(params) != _AGENT_REQUIRED)):
+                _error(f"{primitive} params are exact")
+            if "access_mode" in params and params["access_mode"] not in {"readonly", "readwrite"}:
+                _error("access_mode must be readonly or readwrite")
+            if "environment" in params and not isinstance(params["environment"], str):
+                _error("environment must be string")
             if not _templated(params["workspace"]) and params["workspace"] not in {"worktree", "shared"}: _error("workspace must be worktree or shared")
             if seats is not None and not _templated(params["seat"]) and params["seat"] not in seats: _error(f"unknown seat {params['seat']!r}")
             if profiles is not None and not _templated(params["execution_profile"]) and params["execution_profile"] not in profiles: _error(f"unknown profile {params['execution_profile']!r}")

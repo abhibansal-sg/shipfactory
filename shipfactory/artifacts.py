@@ -1,0 +1,574 @@
+"""Factory-owned sealing and verified read-back for typed recipe artifacts."""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import os
+import stat
+import subprocess
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
+
+from shipfactory import store
+
+
+DEFAULT_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024
+
+
+class ArtifactValidationError(ValueError):
+    """A candidate or sealed artifact failed a fail-closed check."""
+
+
+class ArtifactMissing(ArtifactValidationError):
+    """A required declared artifact is not sealed and readable."""
+
+
+def artifact_id(instance_id: str, step_id: str, activation: int, kind: str) -> str:
+    """Return the normative immutable artifact identity."""
+    value = "|".join((instance_id, step_id, str(int(activation)), kind))
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def artifact_set_hash(artifacts: Iterable[dict[str, Any]]) -> str:
+    """Hash sorted ``kind:sha256`` pairs for one declared artifact set."""
+    pairs = sorted(f"{item['kind']}:{item['sha256']}" for item in artifacts)
+    return hashlib.sha256("|".join(pairs).encode()).hexdigest()
+
+
+def artifact_is_stale(artifact: dict[str, Any], instance: dict[str, Any]) -> bool:
+    """Return whether a sealed artifact is bound to an older instance base."""
+    current = instance.get("current_base_sha") or instance.get("base_sha")
+    if not isinstance(current, str) or not current:
+        raise ValueError("instance current base_sha is required")
+    return artifact.get("base_sha") != current
+
+
+def _schema_version(schema: str) -> int:
+    try:
+        prefix, version = schema.rsplit("/v", 1)
+        if not prefix.startswith("shipfactory.") or not version.isdigit() or int(version) < 1:
+            raise ValueError
+        return int(version)
+    except (AttributeError, ValueError) as exc:
+        raise ArtifactValidationError(f"invalid artifact schema {schema!r}") from exc
+
+
+def _require_keys(document: dict[str, Any], schema: str, keys: set[str]) -> None:
+    missing = sorted(keys - set(document))
+    if missing:
+        raise ArtifactValidationError(
+            f"{schema} missing required fields: {', '.join(missing)}"
+        )
+
+
+def _string_list(document: dict[str, Any], schema: str, fields: Iterable[str]) -> None:
+    for field in fields:
+        value = document[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ArtifactValidationError(f"{schema} field {field} must be a string list")
+
+
+def _validate_exploration(document: dict[str, Any]) -> None:
+    schema = "shipfactory.exploration/v1"
+    required = {
+        "schema", "intent_sha256", "base_sha", "repo_tree_sha", "references",
+        "direct_callers", "constraints", "untrusted_directives", "unknowns",
+    }
+    _require_keys(document, schema, required)
+    for field in ("intent_sha256", "base_sha", "repo_tree_sha"):
+        if not isinstance(document[field], str) or not document[field]:
+            raise ArtifactValidationError(f"{schema} field {field} must be a string")
+    if not isinstance(document["references"], list):
+        raise ArtifactValidationError(f"{schema} references must be a list")
+    _string_list(document, schema, ("constraints", "untrusted_directives", "unknowns"))
+    if not isinstance(document["direct_callers"], list):
+        raise ArtifactValidationError(f"{schema} direct_callers must be a list")
+    statuses = {"existing", "proposed", "generated", "external"}
+    for index, reference in enumerate(document["references"]):
+        if not isinstance(reference, dict) or reference.get("status") not in statuses:
+            raise ArtifactValidationError(f"{schema} reference {index} has invalid status")
+        if not isinstance(reference.get("id"), str) or not isinstance(reference.get("kind"), str):
+            raise ArtifactValidationError(f"{schema} reference {index} has invalid identity")
+        if reference["status"] == "existing":
+            _require_keys(
+                reference, f"{schema} reference {index}",
+                {"path", "git_blob_sha", "start_line", "end_line", "text_sha256"},
+            )
+        if reference["status"] == "proposed":
+            _require_keys(
+                reference, f"{schema} reference {index}",
+                {"path", "reason", "intended_parent_directory"},
+            )
+
+
+def _validate_task_spec(document: dict[str, Any]) -> None:
+    schema = "shipfactory.task-spec/v1"
+    required = {
+        "schema", "intent_artifact_id", "problem", "non_goals", "requirements",
+        "target_files", "forbidden_paths", "risk_tags", "acceptance_cases",
+        "rollback_notes", "assumptions", "clarifications",
+    }
+    _require_keys(document, schema, required)
+    for field in ("intent_artifact_id", "problem", "rollback_notes"):
+        if not isinstance(document[field], str):
+            raise ArtifactValidationError(f"{schema} field {field} must be a string")
+    for field in (
+        "non_goals", "target_files", "forbidden_paths", "risk_tags",
+        "acceptance_cases", "assumptions", "clarifications",
+    ):
+        if not isinstance(document[field], list):
+            raise ArtifactValidationError(f"{schema} field {field} must be a list")
+    if not isinstance(document["requirements"], list):
+        raise ArtifactValidationError(f"{schema} requirements must be a list")
+    ids: set[str] = set()
+    for requirement in document["requirements"]:
+        if (not isinstance(requirement, dict)
+                or set(requirement) != {"id", "behavior", "oracle", "risk"}
+                or not all(isinstance(requirement[key], str) for key in requirement)):
+            raise ArtifactValidationError(f"{schema} has invalid requirement")
+        if requirement["id"] in ids:
+            raise ArtifactValidationError(f"{schema} has duplicate requirement id")
+        ids.add(requirement["id"])
+
+
+def _validate_plan(document: dict[str, Any]) -> None:
+    schema = "shipfactory.plan/v1"
+    required = {
+        "schema", "task_spec_sha256", "base_sha", "nodes", "integration_order",
+        "shared_file_overlaps", "residual_risks",
+    }
+    _require_keys(document, schema, required)
+    if not isinstance(document["task_spec_sha256"], str) or not isinstance(document["base_sha"], str):
+        raise ArtifactValidationError(f"{schema} revision fields must be strings")
+    if not isinstance(document["nodes"], list):
+        raise ArtifactValidationError(f"{schema} nodes must be a list")
+    nodes: dict[str, dict[str, Any]] = {}
+    node_keys = {
+        "id", "title", "needs", "kind", "requirements", "allowed_paths",
+        "expected_outputs", "test_cases", "risk_tags",
+    }
+    for node in document["nodes"]:
+        if not isinstance(node, dict) or set(node) != node_keys:
+            raise ArtifactValidationError(f"{schema} has invalid node shape")
+        if not isinstance(node["id"], str) or node["id"] in nodes:
+            raise ArtifactValidationError(f"{schema} has invalid or duplicate node id")
+        for field in ("needs", "requirements", "allowed_paths", "expected_outputs", "test_cases", "risk_tags"):
+            if not isinstance(node[field], list) or not all(isinstance(x, str) for x in node[field]):
+                raise ArtifactValidationError(f"{schema} node {node['id']} field {field} is invalid")
+        nodes[node["id"]] = node
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visiting:
+            raise ArtifactValidationError(f"{schema} dependency cycle")
+        if node_id in visited:
+            return
+        visiting.add(node_id)
+        for parent in nodes[node_id]["needs"]:
+            if parent not in nodes:
+                raise ArtifactValidationError(f"{schema} unknown node need {parent!r}")
+            visit(parent)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    for node_id in nodes:
+        visit(node_id)
+
+
+_VALIDATORS = {
+    ("exploration", 1): _validate_exploration,
+    ("task-spec", 1): _validate_task_spec,
+    ("plan", 1): _validate_plan,
+}
+
+
+def _validate_document(document: Any, *, kind: str, schema: str) -> int:
+    version = _schema_version(schema)
+    validator = _VALIDATORS.get((kind, version))
+    if validator is None:
+        raise ArtifactValidationError(
+            f"unsupported artifact kind/schema_version {kind!r}/v{version}"
+        )
+    if not isinstance(document, dict):
+        raise ArtifactValidationError(f"{schema} candidate must contain a JSON object")
+    if document.get("schema") != schema:
+        raise ArtifactValidationError(
+            f"artifact schema mismatch: expected {schema!r}, got {document.get('schema')!r}"
+        )
+    validator(document)
+    return version
+
+
+def _candidate_parts(path: str) -> tuple[str, ...]:
+    parsed = PurePosixPath(path)
+    if (parsed.is_absolute() or len(parsed.parts) < 2
+            or parsed.parts[0] != ".shipfactory-output"
+            or ".." in parsed.parts or "\\" in path):
+        raise ArtifactValidationError(
+            "candidate path must stay under .shipfactory-output/"
+        )
+    return parsed.parts
+
+
+def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> bytes:
+    """Open every candidate component with O_NOFOLLOW semantics."""
+    parts = _candidate_parts(candidate_path)
+    descriptors: list[int] = []
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        current = os.open(workspace, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        descriptors.append(current)
+        for part in parts[:-1]:
+            try:
+                current = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow,
+                    dir_fd=current,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ArtifactValidationError(
+                        f"candidate path contains a symlink: {candidate_path}"
+                    ) from exc
+                raise
+            descriptors.append(current)
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.EMLINK}:
+                raise ArtifactValidationError(
+                    f"candidate path is a symlink: {candidate_path}"
+                ) from exc
+            if exc.errno == errno.ENOENT:
+                raise ArtifactValidationError(
+                    f"candidate path is missing: {candidate_path}"
+                ) from exc
+            raise
+        descriptors.append(fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactValidationError(f"candidate path is not a regular file: {candidate_path}")
+        if info.st_size > int(max_bytes):
+            raise ArtifactValidationError(
+                f"artifact size {info.st_size} exceeds configured ceiling {int(max_bytes)}"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, int(max_bytes) + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > int(max_bytes):
+                raise ArtifactValidationError(
+                    f"artifact size exceeds configured ceiling {int(max_bytes)}"
+                )
+        return b"".join(chunks)
+    except ArtifactValidationError:
+        raise
+    except OSError as exc:
+        raise ArtifactValidationError(f"candidate open failed: {exc}") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _git(workspace: Path, *args: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args], cwd=workspace, text=True,
+            stderr=subprocess.PIPE, timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ArtifactValidationError(f"repository validation failed: {exc}") from exc
+
+
+def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:
+    document = document or {}
+    current_head = _git(workspace, "rev-parse", "HEAD")
+    base_sha = document.get("base_sha") or current_head
+    head_sha = document.get("head_sha") or current_head
+    repo_tree_sha = document.get("repo_tree_sha") or _git(workspace, "rev-parse", "HEAD^{tree}")
+    for label, value, suffix in (
+        ("base_sha", base_sha, "^{commit}"),
+        ("head_sha", head_sha, "^{commit}"),
+        ("repo_tree_sha", repo_tree_sha, "^{tree}"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ArtifactValidationError(f"repository reference {label} is missing")
+        try:
+            subprocess.run(
+                ["git", "cat-file", "-e", value + suffix], cwd=workspace,
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ArtifactValidationError(
+                f"repository reference {label}={value!r} is absent from worktree repo"
+            ) from exc
+    return base_sha, head_sha, repo_tree_sha
+
+
+def _storage_path(instance_id: str, step_id: str, activation: int, kind: str) -> Path:
+    for label, value in (("instance", instance_id), ("step", step_id), ("kind", kind)):
+        if not value or value in {".", ".."} or "/" in value or "\\" in value:
+            raise ArtifactValidationError(f"unsafe artifact {label} path segment")
+    return (
+        store._db_path().parent / "artifacts" / instance_id / step_id
+        / str(int(activation)) / f"{kind}.json"
+    )
+
+
+def _copy_once(path: Path, data: bytes) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = path.read_bytes()
+        if hashlib.sha256(existing).digest() != hashlib.sha256(data).digest():
+            raise ArtifactValidationError(
+                "sealed artifact path already contains different bytes"
+            )
+        return existing
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path.read_bytes()
+
+
+def _row_by_id(ident: str) -> dict[str, Any] | None:
+    with store._connect() as db:
+        row = db.execute("SELECT * FROM artifacts WHERE id=?", (ident,)).fetchone()
+    return dict(row) if row else None
+
+
+def _verified_row(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("state") != "sealed" or not row.get("sealed_path"):
+        raise ArtifactValidationError(f"artifact {row.get('id')} is not sealed")
+    try:
+        data = Path(row["sealed_path"]).read_bytes()
+    except OSError as exc:
+        raise ArtifactValidationError(f"sealed artifact read failed: {exc}") from exc
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != row.get("sha256"):
+        raise ArtifactValidationError(
+            f"sealed artifact sha256 mismatch: expected {row.get('sha256')}, got {actual}"
+        )
+    if len(data) != row.get("size_bytes"):
+        raise ArtifactValidationError("sealed artifact size mismatch")
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactValidationError("sealed artifact is not valid JSON") from exc
+    schema = f"shipfactory.{row['kind']}/v{int(row['schema_version'])}"
+    _validate_document(document, kind=row["kind"], schema=schema)
+    return row
+
+
+def read_artifact(ident: str) -> dict[str, Any]:
+    """Read a sealed row and verify its bytes, size, and schema again."""
+    row = _row_by_id(ident)
+    if row is None:
+        raise ArtifactMissing(f"artifact {ident!r} is missing")
+    return _verified_row(row)
+
+
+def seal_artifact(
+    *, instance_id: str, step_id: str, activation: int, run_id: int | None,
+    output: dict[str, Any], workspace: str | Path, producer: str,
+    trust_domain: str | None = None,
+    max_bytes: int = DEFAULT_ARTIFACT_MAX_BYTES,
+) -> dict[str, Any]:
+    """Seal one predetermined v2 output, preserving failures and retries."""
+    store.init_db()
+    kind = output["kind"]
+    schema = output["schema"]
+    candidate_path = output["path"]
+    version = _schema_version(schema)
+    ident = artifact_id(instance_id, step_id, activation, kind)
+    existing = _row_by_id(ident)
+    if existing and existing["state"] == "sealed":
+        return _verified_row(existing)
+    if existing and existing["state"] == "rejected":
+        raise ArtifactValidationError(existing["validation_error"] or "artifact rejected")
+
+    worktree = Path(workspace)
+    fallback_base, fallback_head, fallback_tree = _repository_identity(worktree)
+    with store._connect() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO artifacts"
+            "(id,instance_id,step_id,activation,run_id,kind,schema_version,state,"
+            "candidate_path,producer,trust_domain,base_sha,head_sha,repo_tree_sha,created_at) "
+            "VALUES(?,?,?,?,?,?,?,'candidate',?,?,?,?,?,?,?)",
+            (
+                ident, instance_id, step_id, int(activation), run_id, kind, version,
+                candidate_path, producer, trust_domain, fallback_base, fallback_head,
+                fallback_tree, store._now(),
+            ),
+        )
+    try:
+        data = _read_candidate(worktree, candidate_path, int(max_bytes))
+        try:
+            document = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ArtifactValidationError("candidate is not valid JSON") from exc
+        _validate_document(document, kind=kind, schema=schema)
+        base_sha, head_sha, tree_sha = _repository_identity(worktree, document)
+        sealed_path = _storage_path(instance_id, step_id, activation, kind)
+        sealed = _copy_once(sealed_path, data)
+        digest = hashlib.sha256(sealed).hexdigest()
+        size = len(sealed)
+        with store._connect() as db:
+            changed = db.execute(
+                "UPDATE artifacts SET state='sealed',sealed_path=?,sha256=?,size_bytes=?,"
+                "base_sha=?,head_sha=?,repo_tree_sha=?,validation_error=NULL,sealed_at=? "
+                "WHERE id=? AND state='candidate'",
+                (
+                    str(sealed_path), digest, size, base_sha, head_sha, tree_sha,
+                    store._now(), ident,
+                ),
+            ).rowcount
+            if changed != 1:
+                row = db.execute("SELECT * FROM artifacts WHERE id=?", (ident,)).fetchone()
+                if row is None or row["state"] != "sealed":
+                    raise ArtifactValidationError("artifact seal lost candidate state")
+        row = _row_by_id(ident)
+        assert row is not None
+        return _verified_row(row)
+    except Exception as exc:
+        error = str(exc)[:2000] or exc.__class__.__name__
+        with store._connect() as db:
+            db.execute(
+                "UPDATE artifacts SET state='rejected',validation_error=? "
+                "WHERE id=? AND state='candidate'",
+                (error, ident),
+            )
+        if isinstance(exc, ArtifactValidationError):
+            raise
+        raise ArtifactValidationError(error) from exc
+
+
+def record_artifact_edge(parent_artifact_id: str, child_artifact_id: str,
+                         relation: str) -> None:
+    """Record one immutable derivation relation idempotently."""
+    if not all(isinstance(value, str) and value for value in (
+        parent_artifact_id, child_artifact_id, relation,
+    )):
+        raise ValueError("artifact edge values must be nonempty strings")
+    store.init_db()
+    with store._connect() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO artifact_edges"
+            "(parent_artifact_id,child_artifact_id,relation) VALUES(?,?,?)",
+            (parent_artifact_id, child_artifact_id, relation),
+        )
+
+
+def input_artifacts(db: Any, instance_id: str,
+                    definition: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve and verify the latest sealed artifacts declared as inputs."""
+    resolved: list[dict[str, Any]] = []
+    for item in definition.get("inputs", []):
+        producer = db.execute(
+            "SELECT activation FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "AND state='done' ORDER BY activation DESC LIMIT 1",
+            (instance_id, item["from"]),
+        ).fetchone()
+        row = None
+        if producer is not None:
+            row = db.execute(
+                "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? "
+                "AND activation=? AND kind=? AND state='sealed'",
+                (instance_id, item["from"], producer["activation"], item["kind"]),
+            ).fetchone()
+        if row is None:
+            if item["required"]:
+                raise ArtifactMissing(
+                    f"artifact_missing:{item['from']}:{item['kind']}"
+                )
+            continue
+        try:
+            resolved.append(_verified_row(dict(row)))
+        except ArtifactValidationError as exc:
+            if item["required"]:
+                raise ArtifactMissing(
+                    f"artifact_missing:{item['from']}:{item['kind']}: {exc}"
+                ) from exc
+    return resolved
+
+
+def output_artifacts(db: Any, instance_id: str, step_id: str, activation: int,
+                     definition: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve and verify every output required before v2 completion."""
+    resolved: list[dict[str, Any]] = []
+    for item in definition.get("outputs", []):
+        row = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? "
+            "AND activation=? AND kind=? AND state='sealed'",
+            (instance_id, step_id, int(activation), item["kind"]),
+        ).fetchone()
+        if row is None:
+            raise ArtifactMissing(f"declared output {item['kind']} is not sealed")
+        resolved.append(_verified_row(dict(row)))
+    return resolved
+
+
+def seal_declared_outputs_for_task(
+    *, task_id: str, run_id: int, workspace: str | Path,
+    max_bytes: int = DEFAULT_ARTIFACT_MAX_BYTES,
+) -> list[dict[str, Any]]:
+    """Seal one v2 task's outputs after exit and before board completion."""
+    store.init_db()
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT s.*,i.recipe_id,i.recipe_version,v.normalized_yaml "
+            "FROM recipe_steps s JOIN recipe_instances i ON i.id=s.instance_id "
+            "JOIN recipe_versions v ON v.id=i.recipe_id AND v.version=i.recipe_version "
+            "WHERE s.kanban_task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        recipe = json.loads(row["normalized_yaml"])
+        if recipe.get("schema") != "shipfactory.recipe/v2":
+            return []
+        definition = next(item for item in recipe["steps"] if item["id"] == row["step_id"])
+        inputs = input_artifacts(db, row["instance_id"], definition)
+    sealed: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for output in definition["outputs"]:
+        try:
+            child = seal_artifact(
+                instance_id=row["instance_id"], step_id=row["step_id"],
+                activation=int(row["activation"]), run_id=int(run_id), output=output,
+                workspace=workspace, producer=f"run:{int(run_id)}",
+                max_bytes=int(max_bytes),
+            )
+            sealed.append(child)
+            for parent in inputs:
+                record_artifact_edge(parent["id"], child["id"], "derived-from")
+        except ArtifactValidationError as exc:
+            failures.append(f"{output['kind']}: {exc}")
+    if failures:
+        raise ArtifactValidationError("; ".join(failures))
+    return sealed
+
+
+__all__ = [
+    "ArtifactMissing", "ArtifactValidationError", "DEFAULT_ARTIFACT_MAX_BYTES",
+    "artifact_id", "artifact_is_stale", "artifact_set_hash", "input_artifacts",
+    "output_artifacts", "read_artifact", "record_artifact_edge", "seal_artifact",
+    "seal_declared_outputs_for_task",
+]

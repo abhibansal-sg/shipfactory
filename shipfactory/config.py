@@ -22,6 +22,7 @@ RECIPE_RUNTIME_DEFAULTS = {
     "max_workers": 2,
     "watchdog_subprocess_timeout_seconds": 120,
     "watchdog_tick_timeout_seconds": 120,
+    "artifact_max_bytes": 2 * 1024 * 1024,
 }
 
 
@@ -203,6 +204,7 @@ def validate(cfg) -> None:
         "max_workers",
         "watchdog_subprocess_timeout_seconds",
         "watchdog_tick_timeout_seconds",
+        "artifact_max_bytes",
         "board_day_token_ceiling",
         "dispatcher_max_in_progress",
     ):
