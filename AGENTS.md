@@ -103,12 +103,17 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   until the spec is fixed.
 - Failure limit: after 2 consecutive non-success attempts the dispatcher
   auto-blocks the task. Reset `consecutive_failures` when re-readying.
+- `--require-recipes` startup aborts (unreadable config, recipes disabled,
+  startup-guard failure) now persist a `daemon_require_recipes_fail_closed`
+  telemetry record before raising (finding #31, adversarial lane review
+  §2.0.6/#10) — a fail-closed abort must leave a trace, not just a nonzero
+  exit code that vanishes with the process.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#30 so far). When you fix one: commit message
+- Findings get numbers (#22–#31 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

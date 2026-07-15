@@ -71,6 +71,27 @@ def daemon_lock(boards: Sequence[str]):
             handle.close()
 
 
+def _record_require_recipes_incident(reason: str, error: Exception | None) -> None:
+    """Persist a fail-closed require-recipes abort (finding #31).
+
+    A ``--require-recipes`` startup abort previously just raised and let the
+    process exit nonzero — the failure left no trace once the crashed
+    process's stderr scrolled away. Review §2.0.6 and AGENTS.md A0-7 both
+    require a persisted incident for every fail-closed path, not merely a
+    nonzero exit code.
+    """
+    try:
+        from shipfactory import telemetry
+
+        telemetry.append_jsonl({
+            "event": "daemon_require_recipes_fail_closed",
+            "reason": reason,
+            "error": str(error) if error is not None else None,
+        })
+    except Exception:
+        logger.exception("Factory could not persist a require-recipes incident record")
+
+
 def validate_recipe_mode(*, required: bool = False) -> Any:
     """Load and validate recipe authority before any board is opened."""
     from shipfactory.config import FactoryConfigError, load_seats
@@ -80,13 +101,20 @@ def validate_recipe_mode(*, required: bool = False) -> Any:
         cfg = load_seats()
     except (ImportError, FileNotFoundError, OSError, FactoryConfigError) as exc:
         if required:
+            _record_require_recipes_incident("config_unreadable", exc)
             raise RuntimeError(f"recipe configuration is required: {exc}") from exc
         return None
     recipes = cfg.recipes or {}
     if required and not recipes.get("enabled"):
+        _record_require_recipes_incident("recipes_not_enabled", None)
         raise RuntimeError("recipe configuration is required but recipes.enabled is false")
     if recipes.get("enabled"):
-        startup_guard(cfg)
+        try:
+            startup_guard(cfg)
+        except Exception as exc:
+            if required:
+                _record_require_recipes_incident("startup_guard_failed", exc)
+            raise
     return cfg
 
 
