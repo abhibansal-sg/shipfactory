@@ -21,6 +21,7 @@ import json
 import multiprocessing
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -285,18 +286,43 @@ def test_five_processes_race_to_claim_one_event_exactly_one_applies(tmp_path, ka
 # --- 2. two daemon launches -------------------------------------------------
 
 
-def test_sigkill_daemon_holder_releases_lock_for_next_launch(tmp_path):
-    """Review §2.0.6 #2: a SIGKILLed daemon does not wedge the singleton lock.
+def _last_tick(shipfactory_db: Path, board: str) -> str | None:
+    """Read one board's most recent persisted daemon tick, raw off disk."""
+    if not shipfactory_db.exists():
+        return None
+    conn = sqlite3.connect(shipfactory_db, timeout=5.0)
+    try:
+        row = conn.execute(
+            "SELECT result FROM runs WHERE task_id='__shipfactory_daemon__' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    ticks = json.loads(row[0]).get("last_tick_at")
+    return ticks.get(board) if isinstance(ticks, dict) else None
 
-    A second launch while the first is healthy is already covered by the A0
-    lane (real refusal). The adversarial case is the opposite failure mode:
-    an ungraceful daemon death must not leave a stale advisory lock that
-    blocks every future launch forever.
+
+def test_second_daemon_refused_while_first_is_alive_and_ticking(tmp_path):
+    """Review §2.0.6 #2: the true single-live-daemon invariant.
+
+    Cross-lab review finding #3: the prior version of this test SIGKILLed
+    the first daemon *before* starting the second, so it only ever
+    exercised lock cleanup after an ungraceful death — never the actual
+    concurrent-daemon case. This version launches the second daemon WHILE
+    the first is alive and holding the lock, and asserts both halves of the
+    real invariant: the second refuses before ever opening its board, AND
+    the first keeps ticking throughout (its lock was never disturbed by the
+    refused second launch). The lock-cleanup-after-crash guarantee still
+    matters in its own right, so it is retained as the second half of this
+    test: after the live-refusal assertions, the first daemon is SIGKILLed
+    and a following launch is confirmed to succeed.
     """
     env = os.environ | {
         "HERMES_HOME": str(tmp_path),
         "PYTHONPATH": os.pathsep.join((str(ROOT), str(HERMES))),
     }
+    shipfactory_db = tmp_path / "shipfactory" / "shipfactory.db"
     first = subprocess.Popen(
         [sys.executable, str(ROOT / "shipfactory" / "cli.py"), "daemon",
          "--board", "first", "--interval", "0.1"],
@@ -314,15 +340,52 @@ def test_sigkill_daemon_holder_releases_lock_for_next_launch(tmp_path):
         else:
             pytest.fail("first daemon never acquired its lock")
 
-        os.kill(first.pid, signal.SIGKILL)
-        assert first.wait(10) == -signal.SIGKILL
+        deadline = time.monotonic() + 10
+        baseline = None
+        while time.monotonic() < deadline:
+            baseline = _last_tick(shipfactory_db, "first")
+            if baseline is not None:
+                break
+            if first.poll() is not None:
+                pytest.fail(f"first daemon exited early with {first.returncode}")
+            time.sleep(0.05)
+        else:
+            pytest.fail("first daemon never recorded a tick")
 
+        # The second daemon launches while the first is still alive and
+        # holding the lock -- the real concurrent case, not a post-mortem one.
         second = subprocess.run(
             [sys.executable, str(ROOT / "shipfactory" / "cli.py"), "daemon",
              "--board", "second", "--once"],
             text=True, capture_output=True, env=env, timeout=15,
         )
-        assert second.returncode == 0
+        assert second.returncode != 0
+        assert "already running" in second.stderr
+        board_paths = list(tmp_path.rglob("kanban.db"))
+        assert not any("second" in path.parts for path in board_paths)
+        assert first.poll() is None, "first daemon must still be alive after the refused launch"
+
+        deadline = time.monotonic() + 10
+        advanced = False
+        while time.monotonic() < deadline:
+            latest = _last_tick(shipfactory_db, "first")
+            if latest is not None and latest > baseline:
+                advanced = True
+                break
+            if first.poll() is not None:
+                pytest.fail(f"first daemon exited early with {first.returncode}")
+            time.sleep(0.05)
+        assert advanced, "first daemon stopped ticking during the refused second launch"
+
+        os.kill(first.pid, signal.SIGKILL)
+        assert first.wait(10) == -signal.SIGKILL
+
+        third = subprocess.run(
+            [sys.executable, str(ROOT / "shipfactory" / "cli.py"), "daemon",
+             "--board", "second", "--once"],
+            text=True, capture_output=True, env=env, timeout=15,
+        )
+        assert third.returncode == 0
         board_paths = list(tmp_path.rglob("kanban.db"))
         assert any("second" in path.parts for path in board_paths)
     finally:
