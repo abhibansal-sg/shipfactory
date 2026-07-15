@@ -22,7 +22,10 @@ _INPUT_V2 = {"from", "kind", "required"}
 _OUTPUT_V2 = {"kind", "schema", "path"}
 _BUDGETS_V1 = {"max_activations", "max_step_activations", "max_tokens"}
 _BUDGETS_V2 = {"max_activations", "max_tokens", "step_activation_caps", "token_pools"}
-_PRIMITIVES = {"agent_task", "review_gate", "approval_gate", "notify", "wait_for_event"}
+_PRIMITIVES = {
+    "agent_task", "review_gate", "approval_gate", "notify", "wait_for_event",
+    "verification",
+}
 _PARAM_TYPES = {"string", "integer", "boolean", "enum", "datetime"}
 _AGENT_REQUIRED = {"seat", "instructions", "execution_profile", "workspace"}
 
@@ -125,8 +128,12 @@ def _validate_v2_io(step: dict[str, Any]) -> None:
         if not isinstance(kind, str) or not _ID.fullmatch(kind) or kind in kinds:
             _error(f"invalid or duplicate v2 output kind in step {ident!r}")
         kinds.add(kind)
-        if (not isinstance(schema, str)
-                or not re.fullmatch(rf"shipfactory\.{re.escape(kind)}/v[1-9][0-9]*", schema)):
+        expected_schema = (
+            r"shipfactory\.evidence/v[1-9][0-9]*"
+            if kind == "evidence-bundle"
+            else rf"shipfactory\.{re.escape(kind)}/v[1-9][0-9]*"
+        )
+        if not isinstance(schema, str) or not re.fullmatch(expected_schema, schema):
             _error(f"v2 output schema does not match kind {kind!r}")
         if not isinstance(path, str) or "\\" in path:
             _error(f"invalid v2 output path in step {ident!r}")
@@ -233,8 +240,21 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
             if step["optional"]: _error("approval_gate cannot be optional")
         elif primitive == "notify":
             if set(params) != {"target", "message"}: _error("notify params are exact")
-        else:
+        elif primitive == "wait_for_event":
             if set(params) - {"event", "due_at"} or not isinstance(params.get("event"), str) or (params["event"] == "timer" and not params.get("due_at")): _error("invalid wait_for_event params")
+        else:
+            if not v2:
+                _error("verification requires shipfactory.recipe/v2")
+            if set(params) != {"manifest", "profile", "environment"}:
+                _error("verification params are exact")
+            if (not all(isinstance(params[field], str) and params[field]
+                        for field in ("manifest", "profile", "environment"))
+                    or params["environment"] != "app"):
+                _error("verification requires manifest, profile, and environment: app")
+            if (len(step["outputs"]) != 1
+                    or step["outputs"][0]["kind"] != "evidence-bundle"
+                    or step["outputs"][0]["schema"] != "shipfactory.evidence/v1"):
+                _error("verification must declare one shipfactory.evidence/v1 evidence-bundle")
         for value in [step["title"], *params.values()]:
             if not _substitution_names(value) <= set(parameters): _error(f"missing parameter substitution in {step['id']}")
     if v2:

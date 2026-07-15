@@ -1,4 +1,4 @@
-"""The five v1 primitive activation rules and strict review verdict parsing."""
+"""Recipe primitive activation rules and strict review verdict parsing."""
 from __future__ import annotations
 
 import json
@@ -65,5 +65,9 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
                     instance_id=instance["id"], step_id=step["step_id"],
                     activation=int(step["activation"]),
                 )
+        return None
+    if primitive == "verification":
+        # The advancer journals this non-model action directly; it has no
+        # kanban task, seat, executor, or model activation.
         return None
     raise RuntimeError(f"unknown primitive {primitive}")

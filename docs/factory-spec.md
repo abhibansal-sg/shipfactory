@@ -510,7 +510,7 @@ Nested runtime recipes SHALL NOT exist in v1. Every instantiated recipe graph SH
 
 #### 17.4 Primitive registry
 
-Exactly five primitives SHALL ship:
+Exactly six primitives SHALL ship (the sixth is the SF-9 amendment in §17.16):
 
 1. `agent_task`
 
@@ -539,6 +539,10 @@ Exactly five primitives SHALL ship:
 5. `wait_for_event`
 
    Required param: `event`. Optional param: `due_at`. Activation creates an unassigned task parked as `blocked(kind=needs_input)` with no claim/PID. A matching idempotent event completes it. If `event: timer`, `due_at` is required and the daemon emits the successful timer event. For every other event, expiry at `due_at` blocks the instance with `event_timeout`.
+
+6. `verification`
+
+   Recipe-v2-only required params: `manifest`, `profile`, and `environment` (`app`). It has no seat, creates no model task, and invokes no model. Activation journals a Factory action whose runner executes the trusted-base-pinned manifest as bounded supervised child processes. The step completes only from a sealed `shipfactory.evidence/v1` bundle bound to its exact input revision, base/head/tree SHAs, environment identity, cases, attempts, and evidence item hashes.
 
 No primitive MAY poll with a model.
 
@@ -790,3 +794,61 @@ Every future §17 amendment commit body SHALL include a `Sync-Impact` section
 listing each affected template and recipe. Each entry SHALL carry `✅` when
 propagated in that commit or `⚠` with the explicit pending reason. Omitting an
 affected artifact from that list is a spec violation.
+
+#### 17.16 Deterministic verification and sealed evidence (SF-9, 2026-07-16)
+
+SF-9 ratifies `verification` as the sixth §17 primitive. This is a machine
+primitive amendment, not a model gate: it SHALL have no seat and SHALL NOT
+invoke a model. The action runner SHALL execute manifest cases as bounded,
+process-group-supervised children with durable action identity.
+
+The repository manifest SHALL use `shipfactory.verification/v1`, SHALL be read
+by Git blob SHA from the recipe instance's trusted base commit, and SHALL use
+argv arrays only. Shell interpolation and unknown drivers SHALL fail closed.
+Every case SHALL cover at least one requirement ID, and every required
+requirement SHALL be covered. A candidate change to the verification manifest
+or its runner is control-plane risk and SHALL NOT replace the trusted machinery
+used to evaluate that same candidate. Protected cases from the previous trusted
+revision SHALL run in addition to candidate cases.
+
+Verification profiles are operator-owned configuration. They bound runtime,
+the single permitted infrastructure retry, total evidence bytes, log bytes,
+capture controls, and browser slots. Deterministic failures SHALL NOT retry.
+An infrastructure failure MAY retry once; both attempts remain persisted, and
+green-after-retry evidence is not Phase-B-eligible unless policy later permits
+flake recovery.
+
+The normative persistence is `evidence_bundles`, `evidence_items`, and
+`verification_cases` as specified by external program review §2.4.4 and
+numbered migration 9. Evidence bytes SHALL live below
+`$HERMES_HOME/shipfactory/runs/<instance>/<step>/<activation>/evidence/`, publish
+through a same-directory fsynced temporary file and atomic rename, and be served
+only by opaque evidence item ID. The bundle hash SHALL cover base/head/tree
+SHAs, manifest blob SHA, input revision, case metadata, commands, exit codes,
+timestamps, environment identity, and every item hash. Exact item membership is
+an invariant: a foreign or copied item invalidates the bundle.
+
+The verification state machine is:
+
+```text
+ready -> preparing_environment -> running -> collecting -> redacting -> sealing -> done
+preparing_environment -> blocked(environment_failed)
+running               -> blocked(test_failed | test_timeout | test_infrastructure_error)
+collecting            -> blocked(evidence_missing)
+redacting             -> blocked(redaction_failed)
+sealing               -> failed(evidence_invariant)
+```
+
+Immediately before and after cases run, the workspace SHALL be clean, `HEAD`
+SHALL equal the built change-set `head_sha`, and the recomputed tree SHALL equal
+its `tree_sha`. Any mutation invalidates the bundle. Captured output SHALL pass
+through secret-pattern redaction before sealing, with `redaction_state`
+persisted. A verification step becomes `done` only after bundle integrity is
+re-read successfully and every required candidate and protected case passed.
+
+Sync-Impact:
+
+- ✅ `docs/factory-spec.md`: primitive registry, persistence, state, retry, and commit-binding law updated here.
+- ⚠ `recipes/dev-pipeline@1.yaml` through `recipes/dev-pipeline@5.yaml`: published bytes are immutable and intentionally unchanged.
+- ⚠ `recipes/dev-pipeline@6.yaml`: intentionally deferred until WS1+WS4 integration; this lane does not publish it.
+- ✅ `recipes/templates/`: no existing template defines verification, so no template content changes are required in this amendment.

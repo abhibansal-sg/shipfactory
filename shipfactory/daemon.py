@@ -53,6 +53,10 @@ def daemon_lock(boards: Sequence[str]):
             handle.seek(0)
             owner = handle.read().strip() or "unknown owner"
             raise RuntimeError(f"ShipFactory daemon already running: {owner}") from exc
+        # Publish lock ownership only after the Factory schema is ready. Tests
+        # and operators use the non-empty lock record as the daemon-ready
+        # signal; migration 9 made the old lock-before-schema race observable.
+        store.init_db()
         record = {
             "pid": os.getpid(),
             "process_start_identity": _process_start_identity(),
@@ -283,6 +287,11 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
             result_environments = None
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
+            try:
+                from shipfactory.verification import restore_runs as restore_verification_runs
+                restore_verification_runs()
+            except ImportError:
+                pass
             from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             recipe_board = board or cfg.company
@@ -290,6 +299,19 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                 "profiles": recipes_cfg["execution_profiles"],
                 "board": recipe_board,
             }
+            try:
+                apply_parameters = inspect.signature(apply_events).parameters
+                from shipfactory.config import (
+                    environment_runtime_config, verification_profiles_config,
+                )
+                if "verification_profiles" in apply_parameters:
+                    event_kwargs["verification_profiles"] = verification_profiles_config(
+                        recipes_cfg
+                    )
+                if "environment_config" in apply_parameters:
+                    event_kwargs["environment_config"] = environment_runtime_config(recipes_cfg)
+            except (ImportError, TypeError, ValueError):
+                pass
             try:
                 if "board_day_token_ceiling" in inspect.signature(apply_events).parameters:
                     event_kwargs["board_day_token_ceiling"] = int(

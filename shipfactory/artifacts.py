@@ -1083,6 +1083,34 @@ def input_artifacts(db: Any, instance_id: str,
     instance = dict(instance_row)
     resolved: list[dict[str, Any]] = []
     for item in declared:
+        if item["kind"] == "evidence-bundle":
+            evidence = db.execute(
+                "SELECT * FROM evidence_bundles WHERE instance_id=? AND step_id=? "
+                "AND state='done' ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+                (instance_id, item["from"]),
+            ).fetchone()
+            if evidence is None:
+                if item["required"]:
+                    raise ArtifactMissing(
+                        f"artifact_missing:{item['from']}:{item['kind']}"
+                    )
+                continue
+            evidence = dict(evidence)
+            if evidence["base_sha"] != instance.get("base_sha"):
+                if item["required"]:
+                    raise ArtifactStale(
+                        f"artifact_stale:{item['from']}:{item['kind']}"
+                    )
+                continue
+            from shipfactory.verification import verify_evidence_bundle
+            verify_evidence_bundle(evidence["id"], db=db)
+            resolved.append({
+                "id": evidence["id"], "kind": "evidence-bundle",
+                "sha256": evidence["bundle_sha256"], "base_sha": evidence["base_sha"],
+                "head_sha": evidence["head_sha"], "repo_tree_sha": evidence["tree_sha"],
+                "state": "sealed", "sealed_at": evidence["sealed_at"],
+            })
+            continue
         producer = db.execute(
             "SELECT activation FROM recipe_steps WHERE instance_id=? AND step_id=? "
             "AND state='done' ORDER BY activation DESC LIMIT 1",

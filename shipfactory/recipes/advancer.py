@@ -187,7 +187,8 @@ def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict
 def _summary(db: Any, instance: dict[str, Any]) -> str:
     states = [x["state"] for x in _latest(db, instance["id"])]
     if instance["status"] in {"cancelling", "cancelled", "failed", "done"}: return instance["status"]
-    if any(x in {"blocked", "failed"} for x in states): return "blocked"
+    if any(x == "failed" for x in states): return "failed"
+    if any(x == "blocked" for x in states): return "blocked"
     if any(x == "running" or x == "ready" for x in states): return "running"
     # notify waiting remains running; human controls are distinguished.
     rows = _latest(db, instance["id"])
@@ -612,10 +613,14 @@ def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, A
     return inserted
 
 def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None,
-              board_day_token_ceiling: int = 10**18) -> dict[str, Any]:
+              board_day_token_ceiling: int = 10**18,
+              verification_profiles: dict[str, dict[str, Any]] | None = None,
+              environment_config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Idempotently reconcile every nonterminal activation with kanban/outbox."""
     from hermes_cli import kanban_db
     profiles = profiles or {"standard": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 50000}}
+    verification_profiles = verification_profiles or {}
+    environment_config = environment_config or {}
     with store._connect() as db:
         initial = _instance(db, instance_id)
         if not initial: raise ValueError("unknown recipe instance")
@@ -636,6 +641,38 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
 
             # Observe external task state before dependency readiness.
             for step in _latest(db, instance_id):
+                if (step["state"] == "waiting"
+                        and defs[step["step_id"]]["primitive"] == "verification"):
+                    from shipfactory.verification import verify_evidence_bundle
+                    bundle = db.execute(
+                        "SELECT * FROM evidence_bundles WHERE instance_id=? AND step_id=? "
+                        "AND activation=?",
+                        (instance_id, step["step_id"], int(step["activation"])),
+                    ).fetchone()
+                    if bundle and bundle["state"] in {"done", "blocked", "failed"}:
+                        try:
+                            verify_evidence_bundle(bundle["id"], db=db)
+                        except Exception as exc:
+                            changed |= _transition(
+                                db, instance, step, "failed", f"evidence:{bundle['id']}",
+                                reason=f"evidence_invariant: {exc}",
+                            )
+                        else:
+                            target = "done" if bundle["state"] == "done" else bundle["state"]
+                            if target == "done":
+                                db.execute(
+                                    "UPDATE recipe_steps SET output_artifact_set_hash=?,updated_at=? "
+                                    "WHERE instance_id=? AND step_id=? AND activation=?",
+                                    (hashlib.sha256(
+                                        f"evidence-bundle:{bundle['bundle_sha256']}".encode()
+                                     ).hexdigest(), store._now(), instance_id,
+                                     step["step_id"], int(step["activation"])),
+                                )
+                            changed |= _transition(
+                                db, instance, step, target, f"evidence:{bundle['id']}",
+                                reason=bundle["invalid_reason"],
+                            )
+                    continue
                 # notify steps have no kanban task — observe outbox delivery
                 # instead (shakedown finding #19: notify parked in waiting
                 # forever; nothing transitioned it after delivery).
@@ -796,6 +833,100 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 if step["state"] != "ready": continue
                 definition = defs[sid]; primitive = definition["primitive"]
                 instance = _instance(db, instance_id)
+                if primitive == "verification":
+                    from shipfactory.verification import load_verification_manifest
+                    profile_name = _bind_text(definition["params"]["profile"], params)
+                    profile = verification_profiles.get(profile_name)
+                    if profile is None:
+                        changed |= _transition(
+                            db, instance, step, "failed", "profile",
+                            reason="missing verification profile",
+                        )
+                        continue
+                    workspace = None
+                    fallback_workspace = None
+                    for declared_input in definition.get("inputs", []):
+                        producer = latest.get(declared_input["from"])
+                        if producer and producer.get("kanban_task_id"):
+                            producer_task = kanban_db.get_task(conn, producer["kanban_task_id"])
+                            candidate_workspace = getattr(producer_task, "workspace_path", None)
+                            if candidate_workspace:
+                                fallback_workspace = fallback_workspace or candidate_workspace
+                                if declared_input["kind"] == "change-set":
+                                    workspace = candidate_workspace
+                                    break
+                    workspace = workspace or fallback_workspace
+                    if not workspace:
+                        changed |= _transition(
+                            db, instance, step, "failed", "workspace",
+                            reason="verification candidate workspace missing",
+                        )
+                        continue
+                    change_set = None
+                    required_requirement_ids: set[str] = set()
+                    for declared_input in definition.get("inputs", []):
+                        artifact = db.execute(
+                            "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? "
+                            "AND kind=? AND state='sealed' ORDER BY activation DESC LIMIT 1",
+                            (instance_id, declared_input["from"], declared_input["kind"]),
+                        ).fetchone()
+                        if artifact and declared_input["kind"] == "change-set":
+                            change_set = dict(artifact)
+                        if artifact and declared_input["kind"] == "task-spec":
+                            from shipfactory.artifacts import artifact_document
+                            spec = artifact_document(dict(artifact))
+                            required_requirement_ids.update(
+                                item["id"] for item in spec.get("requirements", [])
+                                if isinstance(item, dict) and isinstance(item.get("id"), str)
+                            )
+                    try:
+                        head_sha = (
+                            change_set.get("head_sha") if change_set else subprocess.check_output(
+                                ["git", "rev-parse", "HEAD"], cwd=workspace, text=True,
+                                stderr=subprocess.PIPE, timeout=10,
+                            ).strip()
+                        )
+                        tree_sha = (
+                            change_set.get("repo_tree_sha") if change_set else subprocess.check_output(
+                                ["git", "rev-parse", "HEAD^{tree}"], cwd=workspace, text=True,
+                                stderr=subprocess.PIPE, timeout=10,
+                            ).strip()
+                        )
+                        manifest_relpath = _bind_text(
+                            definition["params"]["manifest"], params,
+                        )
+                        pinned = load_verification_manifest(
+                            workspace, instance["base_sha"], manifest_relpath,
+                            required_requirement_ids=required_requirement_ids,
+                        )
+                    except Exception as exc:
+                        changed |= _transition(
+                            db, instance, step, "failed", "verification_manifest",
+                            reason=f"evidence_invariant: {exc}",
+                        )
+                        continue
+                    logical_key = hashlib.sha256(
+                        f"{instance_id}|{sid}|{step['activation']}|verification".encode()
+                    ).hexdigest()
+                    _plan_action(
+                        db, logical_key=logical_key, kind="verification_run",
+                        payload={
+                            "instance_id": instance_id, "step_id": sid,
+                            "activation": int(step["activation"]),
+                            "input_revision_hash": step.get("input_artifact_set_hash") or "none",
+                            "base_sha": instance["base_sha"], "head_sha": head_sha,
+                            "tree_sha": tree_sha, "workspace": str(workspace),
+                            "manifest_relpath": manifest_relpath,
+                            "manifest_blob_sha": pinned.blob_sha,
+                            "required_requirement_ids": sorted(required_requirement_ids),
+                            "profile": profile, "environment": "app",
+                            "environment_config": environment_config,
+                        },
+                        instance_id=instance_id, step_id=sid,
+                        activation=int(step["activation"]),
+                    )
+                    changed |= _transition(db, instance, step, "waiting", "activate")
+                    continue
                 if primitive in {"agent_task", "review_gate"}:
                     profile_name = _bind_text(
                         definition["params"]["execution_profile"], params,
@@ -1104,6 +1235,14 @@ def _execute_action(conn: Any, row: dict[str, Any]) -> tuple[str, dict[str, Any]
             "probe": "sent",
             "duplicate_risk": "transport_has_no_probe_or_idempotency_token",
         }, None
+    if kind == "verification_run":
+        if not _current_action_target(row):
+            return "abandoned", {"probe": "stale_activation"}, None
+        from shipfactory.verification import run_action
+        result = run_action(payload)
+        if result["status"] == "pending":
+            return "retryable_failed", result, str(result.get("reason") or "verification pending")
+        return "succeeded", result, None
     return "terminal_failed", {}, f"unknown action kind {kind}"
 
 
@@ -1491,7 +1630,9 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
 
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None,
                  board: str | None = None,
-                 board_day_token_ceiling: int = 10**18) -> int:
+                 board_day_token_ceiling: int = 10**18,
+                 verification_profiles: dict[str, dict[str, Any]] | None = None,
+                 environment_config: dict[str, Any] | None = None) -> int:
     """Lease queued events one at a time, consume them, and reconcile instances."""
     count = 0
     owner = f"event:{os.getpid()}:{uuid.uuid4().hex}"
@@ -1519,7 +1660,20 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
         reconcile(
             conn, ident, profiles=profiles,
             board_day_token_ceiling=board_day_token_ceiling,
+            verification_profiles=verification_profiles,
+            environment_config=environment_config,
         )
+    ran_verification = run_action_intents(
+        conn, board=board, kinds={"verification_run"},
+    )
+    if ran_verification:
+        for ident in ids:
+            reconcile(
+                conn, ident, profiles=profiles,
+                board_day_token_ceiling=board_day_token_ceiling,
+                verification_profiles=verification_profiles,
+                environment_config=environment_config,
+            )
     return count
 
 def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, Any]:
