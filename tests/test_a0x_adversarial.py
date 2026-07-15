@@ -767,3 +767,97 @@ def test_require_recipes_unreadable_config_persists_incident_and_dispatches_noth
         assert incidents[0]["error"]
     finally:
         seats.chmod(0o644)
+
+
+def test_require_recipes_fail_closed_falls_back_to_incident_file_when_telemetry_unwritable(tmp_path):
+    """Cross-lab review finding #4: a durable record must survive even when
+    telemetry.jsonl itself cannot be written.
+
+    Makes ``telemetry.append_jsonl`` fail for real, no mock: pre-creates
+    ``telemetry.jsonl`` as a directory, so its real ``open(path, "a")`` call
+    raises ``IsADirectoryError``. Previously this exception was caught and
+    only logged, leaving the fail-closed abort with no durable record at
+    all. The fallback incident file under shipfactory/incidents/ must exist
+    with the same reason/error the happy-path telemetry record would carry.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores file permission bits")
+
+    state = tmp_path / "shipfactory"
+    state.mkdir(parents=True)
+    seats = state / "seats.yaml"
+    seats.write_text(
+        "company: test\nseats: {}\n"
+        "recipes: {enabled: true, execution_profiles: "
+        "{standard: {max_runtime_seconds: 1800, max_retries: 2, token_allowance: 1000}}}\n",
+        encoding="utf-8",
+    )
+    seats.chmod(0o000)
+    (state / "telemetry.jsonl").mkdir()
+    try:
+        env = os.environ | {
+            "HERMES_HOME": str(tmp_path),
+            "PYTHONPATH": os.pathsep.join((str(ROOT), str(HERMES))),
+        }
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "shipfactory" / "cli.py"), "daemon",
+             "--board", "must-not-open", "--once", "--require-recipes"],
+            text=True, capture_output=True, env=env, timeout=15,
+        )
+        assert result.returncode != 0
+        assert not list(tmp_path.rglob("kanban.db"))
+
+        incidents_dir = state / "incidents"
+        assert incidents_dir.is_dir()
+        incident_files = list(incidents_dir.glob("*.json"))
+        assert len(incident_files) == 1
+        incident = json.loads(incident_files[0].read_text(encoding="utf-8"))
+        assert incident["event"] == "daemon_require_recipes_fail_closed"
+        assert incident["reason"] == "config_unreadable"
+        assert incident["error"]
+    finally:
+        seats.chmod(0o644)
+
+
+def test_require_recipes_fail_closed_reports_double_persistence_failure_on_stderr(tmp_path):
+    """Cross-lab review finding #4: if both telemetry AND the incident-file
+    fallback fail for real, the double failure must be visible on stderr
+    rather than silently swallowed.
+
+    Real, non-mocked double failure: ``telemetry.jsonl`` is pre-created as
+    a directory (breaks telemetry), and ``shipfactory/incidents`` is
+    pre-created as a plain *file* rather than a directory, so the fallback's
+    own ``mkdir(parents=True, exist_ok=True)`` genuinely raises
+    ``FileExistsError``.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores file permission bits")
+
+    state = tmp_path / "shipfactory"
+    state.mkdir(parents=True)
+    seats = state / "seats.yaml"
+    seats.write_text(
+        "company: test\nseats: {}\n"
+        "recipes: {enabled: true, execution_profiles: "
+        "{standard: {max_runtime_seconds: 1800, max_retries: 2, token_allowance: 1000}}}\n",
+        encoding="utf-8",
+    )
+    seats.chmod(0o000)
+    (state / "telemetry.jsonl").mkdir()
+    (state / "incidents").write_text("not a directory", encoding="utf-8")
+    try:
+        env = os.environ | {
+            "HERMES_HOME": str(tmp_path),
+            "PYTHONPATH": os.pathsep.join((str(ROOT), str(HERMES))),
+        }
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "shipfactory" / "cli.py"), "daemon",
+             "--board", "must-not-open", "--once", "--require-recipes"],
+            text=True, capture_output=True, env=env, timeout=15,
+        )
+        assert result.returncode != 0
+        assert not list(tmp_path.rglob("kanban.db"))
+        assert (state / "incidents").is_file()
+        assert "Factory fail-closed abort could not be persisted" in result.stderr
+    finally:
+        seats.chmod(0o644)

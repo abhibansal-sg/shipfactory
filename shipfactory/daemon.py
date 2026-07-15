@@ -11,6 +11,7 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,29 @@ def daemon_lock(boards: Sequence[str]):
             handle.close()
 
 
+def _incidents_dir() -> Path:
+    home = os.environ.get("HERMES_HOME")
+    if not home:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    return Path(home) / "shipfactory" / "incidents"
+
+
+def _write_incident_fallback(record: dict[str, Any]) -> None:
+    """Durable last-resort incident record when telemetry itself is unwritable.
+
+    Written atomically (temp file + ``os.replace``) so a crash mid-write
+    never leaves a half-written incident file behind.
+    """
+    incidents_dir = _incidents_dir()
+    incidents_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = incidents_dir / f"{stamp}-{os.getpid()}.json"
+    tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+
+
 def _record_require_recipes_incident(reason: str, error: Exception | None) -> None:
     """Persist a fail-closed require-recipes abort (finding #31).
 
@@ -79,17 +103,44 @@ def _record_require_recipes_incident(reason: str, error: Exception | None) -> No
     process's stderr scrolled away. Review §2.0.6 and AGENTS.md A0-7 both
     require a persisted incident for every fail-closed path, not merely a
     nonzero exit code.
+
+    Cross-lab review (finding #4): the original version of this function
+    caught a telemetry-write failure and only logged it, so the abort could
+    still leave no durable record at all — the exact gap this function
+    exists to close. On a real telemetry-write failure, fall back to an
+    atomic incident file under ``$HERMES_HOME/shipfactory/incidents/``.
+    Only if *both* persistence paths fail do we give up, and even then we
+    write to stderr so the failure is not silent.
     """
+    record = {
+        "event": "daemon_require_recipes_fail_closed",
+        "reason": reason,
+        "error": str(error) if error is not None else None,
+    }
     try:
         from shipfactory import telemetry
 
-        telemetry.append_jsonl({
-            "event": "daemon_require_recipes_fail_closed",
-            "reason": reason,
-            "error": str(error) if error is not None else None,
-        })
-    except Exception:
-        logger.exception("Factory could not persist a require-recipes incident record")
+        telemetry.append_jsonl(record)
+        return
+    except Exception as telemetry_exc:
+        # `except ... as name` deletes `name` once the block exits, so save
+        # a repr now for use in the fallback branch below.
+        telemetry_error = repr(telemetry_exc)
+        logger.exception("Factory could not persist a require-recipes incident to telemetry")
+
+    try:
+        _write_incident_fallback(record)
+    except Exception as fallback_exc:
+        logger.critical(
+            "Factory require-recipes incident lost: telemetry=%s fallback=%r",
+            telemetry_error, fallback_exc,
+        )
+        print(
+            "Factory fail-closed abort could not be persisted: "
+            f"telemetry write failed ({telemetry_error}) and incident-file "
+            f"fallback also failed ({fallback_exc!r})",
+            file=sys.stderr,
+        )
 
 
 def validate_recipe_mode(*, required: bool = False) -> Any:
