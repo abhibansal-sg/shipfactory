@@ -28,7 +28,10 @@ def _client() -> TestClient:
 
 def _seed() -> None:
     store.init_db()
-    now = "2026-07-14T00:00:00+00:00"
+    # Dynamic timestamp: the /costs endpoint defaults to since_days=1, so a
+    # hardcoded date turns this test into a time bomb the day after it's written.
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
     recipe = {
         "id": "factory-shakedown",
         "version": 1,
