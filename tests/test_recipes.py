@@ -14,6 +14,7 @@ from shipfactory.cli import _recipe_gate, _reroute
 from shipfactory.config import FactoryConfig
 from shipfactory.recipes.advancer import (
     advance_key,
+    apply_events,
     cancel,
     event,
     reconcile,
@@ -399,7 +400,11 @@ steps:
     assert task.status == "blocked" and task.claim_lock is None and task.worker_pid is None
 
     result = _recipe_gate(kanban_conn, "human", "approve", "approve", "")
-    assert result["status"] == "done"
+    assert result["status"] == "waiting_gate"
+    assert result["decision_id"] == result["key"]
+    assert kanban_db.get_task(kanban_conn, gate["kanban_task_id"]).status == "blocked"
+    apply_events(kanban_conn, profiles=PROFILES)
+    assert _instance("human")["status"] == "done"
     assert kanban_db.get_task(kanban_conn, gate["kanban_task_id"]).status == "done"
 
 
@@ -533,7 +538,8 @@ def test_root_collector_completes_once_after_two_sibling_successes(tmp_path, kan
     assert len(completed) == 1
     with store._connect() as db:
         assert db.execute(
-            "SELECT COUNT(*) FROM advance_events WHERE source='root_collector' AND state='applied'"
+            "SELECT COUNT(*) FROM action_intents "
+            "WHERE kind='triage_root_completion' AND state='succeeded'"
         ).fetchone()[0] == 1
 
 

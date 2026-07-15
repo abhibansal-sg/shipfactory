@@ -153,31 +153,40 @@ def _daemon(args: argparse.Namespace) -> Any:
         for board in str(value).split(",")
         if board.strip()
     ))
-    if len(boards) <= 1:
-        # Preserve the original connection ownership and result shape for the
-        # no-board and single --board forms.
-        board = boards[0] if boards else None
-        conn = kanban_db.connect(board=board)
-        try:
+    served = daemon._served_boards(None, boards)
+    require_recipes = bool(getattr(args, "require_recipes", False))
+    with daemon.daemon_lock(served):
+        if require_recipes:
+            daemon.validate_recipe_mode(required=True)
+        if len(served) == 1:
+            # Preserve the original connection ownership and result shape for
+            # the no-board and single --board forms.
+            board = served[0]
+            conn = kanban_db.connect(board=board)
+            try:
+                result = daemon.run(
+                    conn,
+                    board=board,
+                    interval=args.interval,
+                    once=args.once,
+                    sync=bool(args.sync_interval),
+                    sync_interval=args.sync_interval,
+                    require_recipes=require_recipes,
+                    _lock_held=True,
+                )
+            finally:
+                conn.close()
+        else:
             result = daemon.run(
-                conn,
-                board=board,
+                None,
+                boards=served,
                 interval=args.interval,
                 once=args.once,
                 sync=bool(args.sync_interval),
                 sync_interval=args.sync_interval,
+                require_recipes=require_recipes,
+                _lock_held=True,
             )
-        finally:
-            conn.close()
-    else:
-        result = daemon.run(
-            None,
-            boards=boards,
-            interval=args.interval,
-            once=args.once,
-            sync=bool(args.sync_interval),
-            sync_interval=args.sync_interval,
-        )
     return _emit(result)
 
 
@@ -267,15 +276,18 @@ def _recipe(args: argparse.Namespace) -> Any:
             else:
                 answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances ORDER BY created_at DESC")]
         return _emit(answer)
+    if command == "event":
+        return _emit({"key": advancer.event(args.instance, args.step, json.loads(args.payload))})
+    if command in {"approve", "reject"}:
+        return _emit(_recipe_gate(None, args.instance, args.step, command, getattr(args, "reason", "")))
+    if command == "release":
+        return _emit(_recipe_release(None, args.instance, args.step, args.reason))
     conn = kanban_db.connect(board=getattr(args, "board", None))
     try:
-        if command == "event": return _emit({"key": advancer.event(args.instance, args.step, json.loads(args.payload))})
-        if command == "cancel": return _emit(advancer.cancel(conn, args.instance, dry_run=args.dry_run))
-        if command in {"approve", "reject"}:
-            return _emit(_recipe_gate(conn, args.instance, args.step, command, getattr(args, "reason", "")))
-        if command == "release":
-            return _emit(_recipe_release(conn, args.instance, args.step, args.reason))
-        if command == "reroute": return _emit(_reroute(conn, args))
+        if command == "cancel":
+            return _emit(advancer.cancel(conn, args.instance, dry_run=args.dry_run))
+        if command == "reroute":
+            return _emit(_reroute(conn, args))
     finally:
         conn.close()
 
@@ -287,11 +299,15 @@ def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reaso
         instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
         step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance_id, step_id)).fetchone()
         if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting": raise ValueError("approval gate is not waiting")
-    advancer.gate_decision(instance_id, step_id, decision, reason)
-    advancer.apply_events(conn)
+    key = advancer.gate_decision(instance_id, step_id, decision, reason)
     with store._connect() as db:
         updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
-    return {"instance_id": instance_id, "status": updated["status"] if updated else "unknown"}
+    return {
+        "instance_id": instance_id,
+        "decision_id": key,
+        "key": key,
+        "status": updated["status"] if updated else "unknown",
+    }
 
 
 def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> dict[str, Any]:
@@ -305,10 +321,14 @@ def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> d
         if not step or step["primitive"] != "review_gate" or step["state"] != "blocked" or step["blocked_reason"] != "review_stall":
             raise ValueError("review step is not parked for review_stall")
     key = advancer.release_review_stall(instance_id, step_id, reason)
-    advancer.apply_events(conn)
     with store._connect() as db:
         updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
-    return {"instance_id": instance_id, "status": updated["status"] if updated else "unknown", "key": key}
+    return {
+        "instance_id": instance_id,
+        "decision_id": key,
+        "status": updated["status"] if updated else "unknown",
+        "key": key,
+    }
 
 
 def _reroute(conn: Any, args: argparse.Namespace) -> dict[str, Any]:
@@ -354,7 +374,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     _handler(verbs, "seat-list", "list seats with profile model resolution", _seat_list)
     _handler(verbs, "org", "print the reporting tree", _org)
     p = _handler(verbs, "daemon", "run dispatch and watchdog ticks", _daemon)
-    p.add_argument("--board", action="append"); p.add_argument("--boards", action="append"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float)
+    p.add_argument("--board", action="append"); p.add_argument("--boards", action="append"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float); p.add_argument("--require-recipes", action="store_true")
     p = _handler(verbs, "verdict", "record a policy-stage verdict", _verdict)
     p.add_argument("task"); p.add_argument("--stage", required=True); p.add_argument("--outcome", choices=("approve", "request_changes"), required=True); p.add_argument("--body", required=True); p.add_argument("--seat", required=True)
     p = _handler(verbs, "policy", "show or set task policy", _policy); subs = p.add_subparsers(dest="policy_command", required=True)

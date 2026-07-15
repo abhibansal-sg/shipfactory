@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,109 @@ from typing import Any
 
 
 DAEMON_RUN_TASK_ID = "__shipfactory_daemon__"
+
+
+_BASE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, seat TEXT NOT NULL,
+  executor TEXT NOT NULL, model TEXT NOT NULL, pid INTEGER, started_at TEXT NOT NULL,
+  ended_at TEXT, exit_code INTEGER, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0,
+  tokens_total INTEGER DEFAULT 0, duration_s REAL, result TEXT);
+CREATE TABLE IF NOT EXISTS policies (task_id TEXT PRIMARY KEY, policy_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, stage_id TEXT NOT NULL,
+  stage_type TEXT NOT NULL, seat TEXT NOT NULL, outcome TEXT NOT NULL, body TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS monitors (
+  task_id TEXT PRIMARY KEY, next_check_at TEXT NOT NULL, timeout_at TEXT,
+  max_attempts INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+  recovery_policy TEXT NOT NULL, notes TEXT, scheduled_by TEXT,
+  interval_seconds INTEGER NOT NULL DEFAULT 300);
+CREATE TABLE IF NOT EXISTS watchdogs (
+  root_task_id TEXT PRIMARY KEY, agent TEXT NOT NULL, instructions TEXT NOT NULL, last_fingerprint TEXT);
+CREATE TABLE IF NOT EXISTS seat_state (seat TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS sync (
+  gh_number INTEGER PRIMARY KEY, task_id TEXT NOT NULL, gh_updated TEXT, k_updated TEXT, last_synced_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS recipe_versions (
+  id TEXT NOT NULL, version INTEGER NOT NULL, hash TEXT NOT NULL, status TEXT NOT NULL,
+  normalized_yaml TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id, version));
+CREATE TABLE IF NOT EXISTS recipe_instances (
+  id TEXT PRIMARY KEY, board TEXT NOT NULL, collector_task_id TEXT NOT NULL,
+  recipe_id TEXT NOT NULL, recipe_version INTEGER NOT NULL, recipe_hash TEXT NOT NULL,
+  status TEXT NOT NULL, parameters_json TEXT NOT NULL, activation_count INTEGER NOT NULL DEFAULT 0,
+  tokens_charged INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS recipe_steps (
+  instance_id TEXT NOT NULL, step_id TEXT NOT NULL, activation INTEGER NOT NULL,
+  primitive TEXT NOT NULL, state TEXT NOT NULL, kanban_task_id TEXT UNIQUE,
+  input_revision_hash TEXT, output_revision INTEGER, finding_count INTEGER, blocked_reason TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(instance_id, step_id, activation),
+  FOREIGN KEY(instance_id) REFERENCES recipe_instances(id));
+CREATE TABLE IF NOT EXISTS advance_events (
+  key TEXT PRIMARY KEY, instance_id TEXT, source TEXT NOT NULL, payload_json TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, applied_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_advance_events_pending ON advance_events(state, created_at);
+CREATE TABLE IF NOT EXISTS budget_charges (
+  key TEXT PRIMARY KEY, board TEXT NOT NULL, utc_day TEXT NOT NULL, instance_id TEXT NOT NULL,
+  step_id TEXT NOT NULL, activation INTEGER NOT NULL, tokens INTEGER NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_budget_charges_day ON budget_charges(board, utc_day);
+CREATE TABLE IF NOT EXISTS outbox (
+  key TEXT PRIMARY KEY, target TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
+CREATE TABLE IF NOT EXISTS triage_selections (
+  id TEXT PRIMARY KEY, source_task_id TEXT NOT NULL UNIQUE, board TEXT NOT NULL, lease_until TEXT,
+  ranked_json TEXT NOT NULL, chosen_recipe TEXT, parameters_json TEXT, skip_steps_json TEXT,
+  outcome TEXT, root_collector_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+"""
+
+
+_A0_MIGRATION_STATEMENTS = (
+    "ALTER TABLE advance_events ADD COLUMN lease_owner TEXT",
+    "ALTER TABLE advance_events ADD COLUMN lease_until TEXT",
+    "ALTER TABLE advance_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE advance_events ADD COLUMN expected_activation INTEGER",
+    "ALTER TABLE advance_events ADD COLUMN expected_state TEXT",
+    "ALTER TABLE advance_events ADD COLUMN outcome TEXT",
+    "ALTER TABLE advance_events ADD COLUMN last_error TEXT",
+    "ALTER TABLE outbox ADD COLUMN lease_owner TEXT",
+    "ALTER TABLE outbox ADD COLUMN lease_until TEXT",
+    """CREATE TABLE action_intents (
+    key             TEXT PRIMARY KEY,
+    logical_key     TEXT NOT NULL,
+    attempt         INTEGER NOT NULL,
+    instance_id     TEXT,
+    step_id         TEXT,
+    activation      INTEGER,
+    kind            TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    lease_owner     TEXT,
+    lease_until     TEXT,
+    started_at      TEXT,
+    finished_at     TEXT,
+    result_json     TEXT,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL,
+    UNIQUE(logical_key, attempt)
+)""",
+    """CREATE INDEX idx_action_intents_ready
+ON action_intents(state, lease_until, created_at)""",
+    """CREATE TABLE resource_leases (
+    key               TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL,
+    units             INTEGER NOT NULL,
+    instance_id       TEXT,
+    step_id           TEXT,
+    activation        INTEGER,
+    state             TEXT NOT NULL,
+    lease_until       TEXT,
+    metadata_json     TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    released_at       TEXT
+)""",
+)
+_A0_MIGRATION_TEXT = ";\n".join(_A0_MIGRATION_STATEMENTS) + ";\n"
+_MIGRATIONS = ((1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),)
 
 
 def _now() -> str:
@@ -59,72 +163,87 @@ def _rows(cursor: sqlite3.Cursor) -> list[dict]:
 
 
 def init_db() -> None:
-    """Create all Factory tables idempotently."""
+    """Create the base schema and transactionally apply verified migrations."""
     with _connect() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS runs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, seat TEXT NOT NULL,
-          executor TEXT NOT NULL, model TEXT NOT NULL, pid INTEGER, started_at TEXT NOT NULL,
-          ended_at TEXT, exit_code INTEGER, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0,
-          tokens_total INTEGER DEFAULT 0, duration_s REAL, result TEXT);
-        CREATE TABLE IF NOT EXISTS policies (task_id TEXT PRIMARY KEY, policy_json TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS decisions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, stage_id TEXT NOT NULL,
-          stage_type TEXT NOT NULL, seat TEXT NOT NULL, outcome TEXT NOT NULL, body TEXT NOT NULL, at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS monitors (
-          task_id TEXT PRIMARY KEY, next_check_at TEXT NOT NULL, timeout_at TEXT,
-          max_attempts INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
-          recovery_policy TEXT NOT NULL, notes TEXT, scheduled_by TEXT,
-          interval_seconds INTEGER NOT NULL DEFAULT 300);
-        CREATE TABLE IF NOT EXISTS watchdogs (
-          root_task_id TEXT PRIMARY KEY, agent TEXT NOT NULL, instructions TEXT NOT NULL, last_fingerprint TEXT);
-        CREATE TABLE IF NOT EXISTS seat_state (seat TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS sync (
-          gh_number INTEGER PRIMARY KEY, task_id TEXT NOT NULL, gh_updated TEXT, k_updated TEXT, last_synced_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS recipe_versions (
-          id TEXT NOT NULL, version INTEGER NOT NULL, hash TEXT NOT NULL, status TEXT NOT NULL,
-          normalized_yaml TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id, version));
-        CREATE TABLE IF NOT EXISTS recipe_instances (
-          id TEXT PRIMARY KEY, board TEXT NOT NULL, collector_task_id TEXT NOT NULL,
-          recipe_id TEXT NOT NULL, recipe_version INTEGER NOT NULL, recipe_hash TEXT NOT NULL,
-          status TEXT NOT NULL, parameters_json TEXT NOT NULL, activation_count INTEGER NOT NULL DEFAULT 0,
-          tokens_charged INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS recipe_steps (
-          instance_id TEXT NOT NULL, step_id TEXT NOT NULL, activation INTEGER NOT NULL,
-          primitive TEXT NOT NULL, state TEXT NOT NULL, kanban_task_id TEXT UNIQUE,
-          input_revision_hash TEXT, output_revision INTEGER, finding_count INTEGER, blocked_reason TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          PRIMARY KEY(instance_id, step_id, activation),
-          FOREIGN KEY(instance_id) REFERENCES recipe_instances(id));
-        CREATE TABLE IF NOT EXISTS advance_events (
-          key TEXT PRIMARY KEY, instance_id TEXT, source TEXT NOT NULL, payload_json TEXT NOT NULL,
-          state TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, applied_at TEXT);
-        CREATE INDEX IF NOT EXISTS idx_advance_events_pending ON advance_events(state, created_at);
-        CREATE TABLE IF NOT EXISTS budget_charges (
-          key TEXT PRIMARY KEY, board TEXT NOT NULL, utc_day TEXT NOT NULL, instance_id TEXT NOT NULL,
-          step_id TEXT NOT NULL, activation INTEGER NOT NULL, tokens INTEGER NOT NULL, created_at TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_budget_charges_day ON budget_charges(board, utc_day);
-        CREATE TABLE IF NOT EXISTS outbox (
-          key TEXT PRIMARY KEY, target TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
-          attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
-        CREATE TABLE IF NOT EXISTS triage_selections (
-          id TEXT PRIMARY KEY, source_task_id TEXT NOT NULL UNIQUE, board TEXT NOT NULL, lease_until TEXT,
-          ranked_json TEXT NOT NULL, chosen_recipe TEXT, parameters_json TEXT, skip_steps_json TEXT,
-          outcome TEXT, root_collector_task_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        """)
-        monitor_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(monitors)")
-        }
-        if "interval_seconds" not in monitor_columns:
-            conn.execute(
-                "ALTER TABLE monitors ADD COLUMN interval_seconds INTEGER NOT NULL DEFAULT 300"
-            )
-        recipe_step_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(recipe_steps)")
-        }
-        if "finding_count" not in recipe_step_columns:
-            conn.execute("ALTER TABLE recipe_steps ADD COLUMN finding_count INTEGER")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # executescript commits implicitly, so execute the bootstrap DDL one
+            # statement at a time inside our explicit transaction.
+            for statement in _BASE_SCHEMA.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            # Normalize the two pre-migration legacy schemas that shipped
+            # before schema_migrations existed. These are bootstrap upgrades,
+            # not A0 migrations; all subsequent changes are numbered below.
+            monitor_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(monitors)")
+            }
+            if "interval_seconds" not in monitor_columns:
+                conn.execute(
+                    "ALTER TABLE monitors ADD COLUMN interval_seconds INTEGER NOT NULL DEFAULT 300"
+                )
+            step_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(recipe_steps)")
+            }
+            if "finding_count" not in step_columns:
+                conn.execute("ALTER TABLE recipe_steps ADD COLUMN finding_count INTEGER")
+            conn.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )""")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        for version, name, migration in _MIGRATIONS:
+            checksum = hashlib.sha256(migration.encode("utf-8")).hexdigest()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+                ).fetchall()
+                existing = next((row for row in rows if row["version"] == version), None)
+                if existing is not None:
+                    if existing["name"] != name or existing["checksum"] != checksum:
+                        raise RuntimeError(f"schema migration {version} checksum mismatch")
+                    conn.commit()
+                    continue
+                prior = max((int(row["version"]) for row in rows), default=0)
+                if prior != version - 1:
+                    raise RuntimeError(
+                        f"schema migration {version} requires prior version {version - 1}, found {prior}"
+                    )
+                event_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(advance_events)")
+                }
+                outbox_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(outbox)")
+                }
+                existing_tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                migration_artifacts = (
+                    "lease_owner" in event_columns
+                    or "lease_owner" in outbox_columns
+                    or bool({"action_intents", "resource_leases"} & existing_tables)
+                )
+                if migration_artifacts:
+                    raise RuntimeError(f"schema migration {version} is partially applied")
+                for statement in _A0_MIGRATION_STATEMENTS:
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)",
+                    (version, name, checksum, _now()),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
 
 def record_run_start(task_id, seat, executor, model, pid) -> int:
