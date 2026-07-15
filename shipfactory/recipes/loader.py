@@ -20,6 +20,8 @@ _STEP_V1 = {"id", "primitive", "title", "needs", "optional", "params"}
 _STEP_V2 = {"id", "primitive", "title", "needs", "optional", "inputs", "outputs", "params"}
 _INPUT_V2 = {"from", "kind", "required"}
 _OUTPUT_V2 = {"kind", "schema", "path"}
+_BUDGETS_V1 = {"max_activations", "max_step_activations", "max_tokens"}
+_BUDGETS_V2 = {"max_activations", "max_tokens", "step_activation_caps", "token_pools"}
 _PRIMITIVES = {"agent_task", "review_gate", "approval_gate", "notify", "wait_for_event"}
 _PARAM_TYPES = {"string", "integer", "boolean", "enum", "datetime"}
 _AGENT_REQUIRED = {"seat", "instructions", "execution_profile", "workspace"}
@@ -156,7 +158,26 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
         if spec.get("type") not in _PARAM_TYPES or not isinstance(spec.get("required"), bool): _error(f"invalid parameter {name!r}")
         if spec["type"] == "enum" and (not isinstance(spec.get("values"), list) or not spec["values"]): _error(f"enum {name!r} requires values")
     budgets = document["budgets"]
-    if not isinstance(budgets, dict) or set(budgets) != {"max_activations", "max_step_activations", "max_tokens"} or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in budgets.values()): _error("invalid budgets")
+    expected_budgets = _BUDGETS_V2 if v2 else _BUDGETS_V1
+    if not isinstance(budgets, dict) or set(budgets) != expected_budgets:
+        _error("invalid budgets")
+    for field in ("max_activations", "max_tokens"):
+        value = budgets.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            _error("invalid budgets")
+    if v2:
+        for field in ("step_activation_caps", "token_pools"):
+            values = budgets[field]
+            if (not isinstance(values, dict)
+                    or (field == "token_pools" and not values)
+                    or any(not isinstance(name, str) or not _ID.fullmatch(name)
+                           or not isinstance(value, int) or isinstance(value, bool) or value < 1
+                           for name, value in values.items())):
+                _error(f"invalid v2 budget field {field}")
+    else:
+        value = budgets.get("max_step_activations")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            _error("invalid budgets")
     steps = document["steps"]
     if not isinstance(steps, list) or not steps: _error("steps must be nonempty list")
     known: dict[str, dict[str, Any]] = {}
@@ -216,6 +237,23 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
             if set(params) - {"event", "due_at"} or not isinstance(params.get("event"), str) or (params["event"] == "timer" and not params.get("due_at")): _error("invalid wait_for_event params")
         for value in [step["title"], *params.values()]:
             if not _substitution_names(value) <= set(parameters): _error(f"missing parameter substitution in {step['id']}")
+    if v2:
+        step_caps = budgets["step_activation_caps"]
+        expected_caps = {
+            step["id"] for step in steps
+            if step["primitive"] in {"agent_task", "review_gate"}
+        }
+        if set(step_caps) != expected_caps:
+            _error("v2 step_activation_caps must name every agent and review step exactly")
+        pools = budgets["token_pools"]
+        for step in steps:
+            if step["primitive"] not in {"agent_task", "review_gate"}:
+                continue
+            profile = step["params"]["execution_profile"]
+            if not _templated(profile) and profile not in pools:
+                _error(
+                    f"v2 step {step['id']!r} execution_profile must name a token pool"
+                )
     # directed cycle check and v1 shared-workspace total ordering rule
     visiting: set[str] = set(); visited: set[str] = set()
     def visit(node: str) -> None:
@@ -292,6 +330,9 @@ def bind_parameters(recipe: Recipe, provided: dict[str, Any], skip_steps: list[s
                 _error(f"unknown seat {seat!r}")
             if profiles is not None and profile not in profiles:
                 _error(f"unknown profile {profile!r}")
+            if (recipe.document["schema"] == "shipfactory.recipe/v2"
+                    and profile not in recipe.document["budgets"]["token_pools"]):
+                _error(f"execution profile {profile!r} has no v2 token pool")
             if workspace not in {"worktree", "shared"}:
                 _error("workspace must be worktree or shared")
         elif step["primitive"] == "approval_gate" and seats is not None:

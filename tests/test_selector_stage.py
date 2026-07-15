@@ -272,7 +272,9 @@ def test_selector_stage_budget_refusal_parks_before_model_call(
     store.init_db()
     with store._connect() as db:
         db.execute(
-            "INSERT INTO budget_charges VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO budget_charges"
+            "(key,board,utc_day,instance_id,step_id,activation,tokens,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
             ("prior", "test", day, "prior", "work", 1, 1, store._now()),
         )
     result = selector_stage.run_stage(kanban_conn, "test")

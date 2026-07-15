@@ -141,12 +141,36 @@ def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
         )
 
 def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any],
-           profile: dict[str, Any], board_day_token_ceiling: int) -> str | None:
+           profile: dict[str, Any], profile_name: str,
+           board_day_token_ceiling: int) -> str | None:
     allowance = int(profile["token_allowance"]); budgets = recipe["budgets"]; day = datetime.now(timezone.utc).date().isoformat()
-    if instance["activation_count"] + 1 > budgets["max_activations"]: return "activation_fuse"
+    v2 = recipe.get("schema") == "shipfactory.recipe/v2"
+    exhausted = "budget_exhausted" if v2 else "activation_fuse"
+    if instance["activation_count"] + 1 > budgets["max_activations"]:
+        return f"{exhausted}:max_activations" if v2 else exhausted
     count = db.execute("SELECT COUNT(*) FROM recipe_steps WHERE instance_id=? AND step_id=? AND primitive IN ('agent_task','review_gate')", (instance["id"], step["step_id"])).fetchone()[0]
-    if count > budgets["max_step_activations"]: return "activation_fuse"
-    if instance["tokens_charged"] + allowance > budgets["max_tokens"]: return "instance_budget"
+    step_cap = (
+        budgets["step_activation_caps"][step["step_id"]]
+        if v2 else budgets["max_step_activations"]
+    )
+    if count > step_cap:
+        return (
+            f"budget_exhausted:step_activation_cap:{step['step_id']}"
+            if v2 else "activation_fuse"
+        )
+    if instance["tokens_charged"] + allowance > budgets["max_tokens"]:
+        return "budget_exhausted:max_tokens" if v2 else "instance_budget"
+    if v2:
+        pool_limit = budgets["token_pools"].get(profile_name)
+        if pool_limit is None:
+            return f"budget_exhausted:unknown_token_pool:{profile_name}"
+        pool_charged = int(db.execute(
+            "SELECT COALESCE(SUM(tokens),0) FROM budget_charges "
+            "WHERE instance_id=? AND token_pool=?",
+            (instance["id"], profile_name),
+        ).fetchone()[0])
+        if pool_charged + allowance > int(pool_limit):
+            return f"budget_exhausted:token_pool:{profile_name}"
     charge_key = advance_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"], "admit", str(step["activation"]))
     before = db.total_changes
     if not store.admit_budget_charge(
@@ -154,6 +178,7 @@ def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict
         instance_id=instance["id"], step_id=step["step_id"],
         activation=step["activation"], tokens=allowance,
         ceiling=board_day_token_ceiling,
+        token_pool=profile_name if v2 else None,
     ):
         return "board_day_budget"
     if db.total_changes > before: db.execute("UPDATE recipe_instances SET activation_count=activation_count+1,tokens_charged=tokens_charged+?,updated_at=? WHERE id=?", (allowance, store._now(), instance["id"]))
@@ -199,6 +224,18 @@ def _review_stalled(db: Any, instance_id: str, step: dict[str, Any], count: int)
     ).fetchone()
     return bool(previous and previous["finding_count"] is not None and count >= 0
                 and int(previous["finding_count"]) >= 0 and count >= int(previous["finding_count"]))
+
+
+def _review_approval_blocker(db: Any, instance_id: str,
+                             definition: dict[str, Any]) -> str | None:
+    """Return a factory-enforced reason that forbids a review approval."""
+    if definition.get("primitive") != "review_gate":
+        return None
+    from shipfactory.artifacts import input_artifacts, task_spec_has_clarifications
+    for artifact in input_artifacts(db, instance_id, definition):
+        if artifact["kind"] == "task-spec" and task_spec_has_clarifications(artifact):
+            return "clarifications_nonempty"
+    return None
 
 def _result_one_liner(value: str | None) -> str | None:
     in_frontmatter = False
@@ -488,6 +525,13 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
     defs = {x["id"]: x for x in recipe["steps"]}
     if target not in defs or defs[target]["primitive"] != "agent_task":
         raise ValueError("review change target must be an upstream agent_task")
+    if recipe.get("schema") == "shipfactory.recipe/v2":
+        declared_targets = {
+            item["from"] for item in defs[rejecting_step].get("inputs", [])
+            if defs[item["from"]]["primitive"] == "agent_task"
+        }
+        if declared_targets and target not in declared_targets:
+            raise ValueError("review change target is not its declared artifact producer")
     parents = {item["id"]: set(item["needs"]) for item in recipe["steps"]}
     def upstream(node: str) -> set[str]:
         return parents[node] | set().union(*(upstream(x) for x in parents[node])) if parents[node] else set()
@@ -643,6 +687,21 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     if step["primitive"] == "review_gate":
                         try:
                             verdict = parse_verdict(task.result or "")
+                            if verdict["outcome"] == "approve":
+                                approval_blocker = _review_approval_blocker(
+                                    db, instance_id, definition,
+                                )
+                                if approval_blocker:
+                                    changed |= _transition(
+                                        db, instance, step, "blocked",
+                                        f"kanban:{task.id}", reason=approval_blocker,
+                                    )
+                                    db.execute(
+                                        "UPDATE recipe_instances SET status='blocked',"
+                                        "blocked_reason=?,updated_at=? WHERE id=?",
+                                        (approval_blocker, store._now(), instance_id),
+                                    )
+                                    continue
                             if verdict["outcome"] == "request_changes":
                                 finding_count = _verdict_finding_count(verdict["body"])
                                 db.execute(
@@ -738,12 +797,15 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 definition = defs[sid]; primitive = definition["primitive"]
                 instance = _instance(db, instance_id)
                 if primitive in {"agent_task", "review_gate"}:
-                    profile = profiles.get(_bind_text(definition["params"]["execution_profile"], params))
+                    profile_name = _bind_text(
+                        definition["params"]["execution_profile"], params,
+                    )
+                    profile = profiles.get(profile_name)
                     if not profile:
                         changed |= _transition(db, instance, step, "failed", "profile", reason="missing execution profile")
                         continue
                     fuse = _admit(
-                        db, instance, recipe, step, profile,
+                        db, instance, recipe, step, profile, profile_name,
                         int(board_day_token_ceiling),
                     )
                     if fuse:
@@ -1211,7 +1273,12 @@ def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "
     )
 
 def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
-    """Queue an audited operator release for a parked review-stall gate."""
+    """Queue an audited release for a recoverable blocked review gate.
+
+    ``clarifications_nonempty`` uses the same enqueue-only operator surface as
+    ``review_stall``.  Applying that decision creates a fresh spec producer
+    activation; it never treats the blocked approval as permission to proceed.
+    """
     if not str(reason).strip():
         raise ValueError("operator release requires a reason")
     with store._connect() as db:
@@ -1220,9 +1287,10 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
+    recoverable = {"review_stall", "clarifications_nonempty"}
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
-            or step["blocked_reason"] != "review_stall"):
-        raise ValueError("review step is not parked for review_stall")
+            or step["blocked_reason"] not in recoverable):
+        raise ValueError("review step is not parked for operator-recoverable review block")
     return enqueue(
         instance_id,
         "operator_release",
@@ -1367,19 +1435,37 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _finish_event(db, row, "discarded", "unknown_gate_decision")
                 return
             if row["source"] == "operator_release":
+                recoverable = {"review_stall", "clarifications_nonempty"}
                 if (step["primitive"] != "review_gate" or step["state"] != "blocked"
-                        or step["blocked_reason"] != "review_stall"):
-                    _finish_event(db, row, "discarded", "review_gate_not_stalled")
+                        or step["blocked_reason"] not in recoverable):
+                    _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return
-                from hermes_cli import kanban_db
-                task = kanban_db.get_task(conn, step["kanban_task_id"])
-                verdict = parse_verdict(task.result if task else "")
-                if verdict["outcome"] != "request_changes":
-                    raise ValueError("review stall has no rejecting verdict")
                 recipe = recipe_for_instance(instance).document
+                blocked_reason = step["blocked_reason"]
+                if blocked_reason == "review_stall":
+                    from hermes_cli import kanban_db
+                    task = kanban_db.get_task(conn, step["kanban_task_id"])
+                    verdict = parse_verdict(task.result if task else "")
+                    if verdict["outcome"] != "request_changes":
+                        raise ValueError("review stall has no rejecting verdict")
+                    target = _resolve_target_step(
+                        db, instance["id"], recipe, verdict["target_step"],
+                    )
+                else:
+                    definition = next(
+                        item for item in recipe["steps"] if item["id"] == step["step_id"]
+                    )
+                    producers = [
+                        item["from"] for item in definition.get("inputs", [])
+                        if item.get("kind") == "task-spec" and item.get("required", False)
+                    ]
+                    if len(producers) != 1:
+                        raise ValueError(
+                            "clarifications block has no unique task-spec producer"
+                        )
+                    target = producers[0]
                 _invalidate_cone(
-                    db, instance, recipe,
-                    _resolve_target_step(db, instance["id"], recipe, verdict["target_step"]),
+                    db, instance, recipe, target,
                     step["step_id"], f"operator_release:{row['key']}",
                 )
                 _transition(
@@ -1390,7 +1476,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
                     (store._now(), instance["id"]),
                 )
-                _finish_event(db, row, "applied", "review_stall_released")
+                _finish_event(db, row, "applied", f"{blocked_reason}_released")
                 return
             _finish_event(db, row, "discarded", f"unknown_source:{row['source']}")
     except Exception as exc:

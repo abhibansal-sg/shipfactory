@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from shipfactory import store
 from shipfactory.recipes.advancer import reconcile
@@ -78,6 +79,15 @@ def _write_candidate(repo: Path, payload: dict) -> Path:
 
 
 def _v2_text(*, steps: str) -> str:
+    parsed_steps = yaml.safe_load("steps:\n" + steps)["steps"]
+    caps = {
+        step["id"]: 2 for step in parsed_steps
+        if step["primitive"] in {"agent_task", "review_gate"}
+    }
+    pools = {
+        step["params"]["execution_profile"]: 200000 for step in parsed_steps
+        if step["primitive"] in {"agent_task", "review_gate"}
+    } or {"standard": 200000}
     return f"""schema: shipfactory.recipe/v2
 id: artifact-test
 version: 1
@@ -86,7 +96,11 @@ description: artifact test
 intent_tags: [test]
 supersedes: null
 parameters: {{}}
-budgets: {{max_activations: 4, max_step_activations: 2, max_tokens: 200000}}
+budgets:
+  max_activations: 4
+  max_tokens: 200000
+  step_activation_caps: {json.dumps(caps)}
+  token_pools: {json.dumps(pools)}
 steps:
 {steps}
 """
@@ -117,7 +131,7 @@ def test_artifact_schema_migration_is_exact_and_numbered():
         instance_columns = {row["name"] for row in db.execute(
             "PRAGMA table_info(recipe_instances)"
         )}
-    assert versions[-1] == 5
+    assert versions[-1] == 6
     assert artifact_columns == [
         "id", "instance_id", "step_id", "activation", "run_id", "kind",
         "schema_version", "state", "candidate_path", "sealed_path", "sha256",
@@ -127,6 +141,11 @@ def test_artifact_schema_migration_is_exact_and_numbered():
     assert edge_columns == ["parent_artifact_id", "child_artifact_id", "relation"]
     assert {"input_artifact_set_hash", "output_artifact_set_hash"} <= step_columns
     assert {"base_sha", "updated_base_at"} <= instance_columns
+    with store._connect() as db:
+        charge_columns = {row["name"] for row in db.execute(
+            "PRAGMA table_info(budget_charges)"
+        )}
+    assert "token_pool" in charge_columns
 
 
 def test_seal_is_idempotent_detects_tampering_and_stale_base(tmp_path):
