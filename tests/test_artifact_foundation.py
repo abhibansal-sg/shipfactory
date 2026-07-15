@@ -114,7 +114,10 @@ def test_artifact_schema_migration_is_exact_and_numbered():
         step_columns = {row["name"] for row in db.execute(
             "PRAGMA table_info(recipe_steps)"
         )}
-    assert versions[-1] == 4
+        instance_columns = {row["name"] for row in db.execute(
+            "PRAGMA table_info(recipe_instances)"
+        )}
+    assert versions[-1] == 5
     assert artifact_columns == [
         "id", "instance_id", "step_id", "activation", "run_id", "kind",
         "schema_version", "state", "candidate_path", "sealed_path", "sha256",
@@ -123,6 +126,7 @@ def test_artifact_schema_migration_is_exact_and_numbered():
     ]
     assert edge_columns == ["parent_artifact_id", "child_artifact_id", "relation"]
     assert {"input_artifact_set_hash", "output_artifact_set_hash"} <= step_columns
+    assert {"base_sha", "updated_base_at"} <= instance_columns
 
 
 def test_seal_is_idempotent_detects_tampering_and_stale_base(tmp_path):
@@ -152,6 +156,53 @@ def test_seal_is_idempotent_detects_tampering_and_stale_base(tmp_path):
     sealed.write_bytes(sealed.read_bytes() + b"tampered")
     with pytest.raises(ValueError, match="sha256"):
         read_artifact(first["id"])
+
+
+def test_torn_sealed_path_is_atomically_replaced_on_retry(tmp_path):
+    from shipfactory.artifacts import _storage_path, seal_artifact
+
+    repo, base_sha, tree_sha = _repo(tmp_path)
+    candidate = _write_candidate(repo, _exploration(base_sha, tree_sha))
+    sealed_path = _storage_path("torn", "explore", 1, "exploration")
+    sealed_path.parent.mkdir(parents=True, exist_ok=True)
+    sealed_path.write_bytes(b'{"schema":"shipfactory.exploration/v1"')
+
+    sealed = seal_artifact(
+        instance_id="torn", step_id="explore", activation=1, run_id=9,
+        output=_output(), workspace=repo, producer="run:9",
+    )
+
+    assert Path(sealed["sealed_path"]).read_bytes() == candidate.read_bytes()
+    assert sealed["state"] == "sealed"
+
+
+def test_validation_rejection_remains_terminal_after_candidate_is_fixed(tmp_path):
+    from shipfactory.artifacts import seal_artifact
+
+    repo, base_sha, tree_sha = _repo(tmp_path)
+    candidate = repo / ".shipfactory-output" / "exploration.json"
+    candidate.parent.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(_exploration(base_sha, tree_sha)), encoding="utf-8")
+    candidate.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        seal_artifact(
+            instance_id="rejected", step_id="explore", activation=1, run_id=10,
+            output=_output(), workspace=repo, producer="run:10",
+        )
+    candidate.unlink()
+    candidate.write_text(json.dumps(_exploration(base_sha, tree_sha)), encoding="utf-8")
+    with pytest.raises(ValueError, match="symlink"):
+        seal_artifact(
+            instance_id="rejected", step_id="explore", activation=1, run_id=10,
+            output=_output(), workspace=repo, producer="run:10",
+        )
+    with store._connect() as db:
+        row = db.execute("SELECT state FROM artifacts WHERE id=?", (
+            hashlib.sha256(b"rejected|explore|1|exploration").hexdigest(),
+        )).fetchone()
+    assert row["state"] == "rejected"
 
 
 @pytest.mark.parametrize("attack", ["symlink", "oversize", "wrong-worktree"])
@@ -205,7 +256,8 @@ def test_artifact_edges_record_derivation_once(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM artifact_edges").fetchone()[0] == 1
 
 
-def test_v2_loader_accepts_normative_shape(tmp_path):
+@pytest.mark.parametrize("access_mode", ["readonly", "workspace_write"])
+def test_v2_loader_accepts_normative_access_modes(tmp_path, access_mode):
     recipe = _load_v2(tmp_path, _v2_text(steps="""  - id: explore
     primitive: agent_task
     title: Explore
@@ -221,10 +273,33 @@ def test_v2_loader_accepts_normative_shape(tmp_path):
       instructions: explore
       execution_profile: standard
       workspace: worktree
-      access_mode: readonly
+      access_mode: ACCESS_MODE
       environment: source
-"""))
+""".replace("ACCESS_MODE", access_mode)))
     assert recipe.document["schema"] == "shipfactory.recipe/v2"
+
+
+@pytest.mark.parametrize(
+    "access_mode", ["readwrite", "write", "", None, 123, True, [], {}],
+)
+def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
+    steps = """  - id: explore
+    primitive: agent_task
+    title: Explore
+    needs: []
+    optional: false
+    inputs: []
+    outputs: []
+    params:
+      seat: explorer
+      instructions: explore
+      execution_profile: standard
+      workspace: worktree
+      access_mode: ACCESS_MODE
+      environment: source
+""".replace("ACCESS_MODE", json.dumps(access_mode))
+    with pytest.raises(RecipeError, match="readonly or workspace_write"):
+        _load_v2(tmp_path, _v2_text(steps=steps))
 
 
 @pytest.mark.parametrize(
@@ -305,14 +380,17 @@ def test_v2_advancer_hashes_sealed_outputs_and_inputs(tmp_path, kanban_conn):
     outputs: []
     params: {seat: developer, instructions: consume, execution_profile: standard, workspace: worktree, access_mode: readonly, environment: source}
 """))
-    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="v2")
+    repo, base_sha, tree_sha = _repo(tmp_path / "work")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={},
+        instance_id="v2", base_sha=base_sha,
+    )
     reconcile(kanban_conn, "v2", profiles=PROFILES)
     with store._connect() as db:
         explore = dict(db.execute(
             "SELECT * FROM recipe_steps WHERE instance_id='v2' AND step_id='explore'"
         ).fetchone())
 
-    repo, base_sha, tree_sha = _repo(tmp_path / "work")
     _write_candidate(repo, _exploration(base_sha, tree_sha))
     sealed = seal_artifact(
         instance_id="v2", step_id="explore", activation=1, run_id=11,
@@ -333,6 +411,105 @@ def test_v2_advancer_hashes_sealed_outputs_and_inputs(tmp_path, kanban_conn):
     assert explore["output_artifact_set_hash"] == expected
     assert consume["state"] == "running"
     assert consume["input_artifact_set_hash"] == expected
+
+
+def test_v2_stale_required_input_blocks_and_fresh_activation_recovers(
+    tmp_path, kanban_conn,
+):
+    from shipfactory.artifacts import seal_artifact
+
+    recipe = _load_v2(tmp_path, _v2_text(steps="""  - id: explore
+    primitive: notify
+    title: Explore
+    needs: []
+    optional: false
+    inputs: []
+    outputs:
+      - {kind: exploration, schema: shipfactory.exploration/v1, path: .shipfactory-output/exploration.json}
+    params: {target: x, message: y}
+  - id: consume
+    primitive: notify
+    title: Consume
+    needs: [explore]
+    optional: false
+    inputs: [{from: explore, kind: exploration, required: true}]
+    outputs: []
+    params: {target: x, message: y}
+"""))
+    repo, base_x, tree_x = _repo(tmp_path / "stale-work")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={},
+        instance_id="stale", base_sha=base_x,
+    )
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT base_sha,updated_base_at FROM recipe_instances WHERE id='stale'"
+        ).fetchone()
+    assert instance["base_sha"] == base_x
+    assert instance["updated_base_at"]
+    _write_candidate(repo, _exploration(base_x, tree_x))
+    seal_artifact(
+        instance_id="stale", step_id="explore", activation=1, run_id=12,
+        output=_output(), workspace=repo, producer="run:12",
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='done' "
+            "WHERE instance_id='stale' AND step_id='explore' AND activation=1"
+        )
+
+    (repo / "README.md").write_text("new trusted base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Artifact Test",
+        "GIT_AUTHOR_EMAIL": "artifact@example.invalid",
+        "GIT_COMMITTER_NAME": "Artifact Test",
+        "GIT_COMMITTER_EMAIL": "artifact@example.invalid",
+    }
+    subprocess.run(["git", "commit", "-qm", "move base"], cwd=repo, env=env, check=True)
+    base_y = _git(repo, "rev-parse", "HEAD")
+    tree_y = _git(repo, "rev-parse", "HEAD^{tree}")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_instances SET base_sha=?,updated_base_at=? WHERE id='stale'",
+            (base_y, store._now()),
+        )
+
+    reconcile(kanban_conn, "stale", profiles=PROFILES)
+    with store._connect() as db:
+        blocked = db.execute(
+            "SELECT state,blocked_reason FROM recipe_steps "
+            "WHERE instance_id='stale' AND step_id='consume' AND activation=1"
+        ).fetchone()
+    assert tuple(blocked) == ("blocked", "artifact_stale")
+
+    _write_candidate(repo, _exploration(base_y, tree_y))
+    seal_artifact(
+        instance_id="stale", step_id="explore", activation=2, run_id=13,
+        output=_output(), workspace=repo, producer="run:13",
+    )
+    now = store._now()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) "
+            "VALUES('stale','explore',2,'notify','done',?,?)",
+            (now, now),
+        )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) "
+            "VALUES('stale','consume',2,'notify','pending',?,?)",
+            (now, now),
+        )
+    reconcile(kanban_conn, "stale", profiles=PROFILES)
+    with store._connect() as db:
+        fresh = db.execute(
+            "SELECT state,blocked_reason,input_artifact_set_hash FROM recipe_steps "
+            "WHERE instance_id='stale' AND step_id='consume' AND activation=2"
+        ).fetchone()
+    assert fresh["state"] == "waiting"
+    assert fresh["blocked_reason"] is None
+    assert fresh["input_artifact_set_hash"]
 
 
 def test_v2_missing_required_input_blocks_activation(tmp_path, kanban_conn):

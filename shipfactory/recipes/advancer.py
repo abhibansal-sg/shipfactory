@@ -492,6 +492,22 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
     def upstream(node: str) -> set[str]:
         return parents[node] | set().union(*(upstream(x) for x in parents[node])) if parents[node] else set()
     if target not in upstream(rejecting_step): raise ValueError("review target is not transitive upstream")
+    # A reviewed producer may have advanced its worktree from base_sha to
+    # head_sha.  Rework is the point where that head legitimately becomes the
+    # instance base: every artifact in the new cone must be rebuilt against it.
+    target_artifact = db.execute(
+        "SELECT head_sha FROM artifacts WHERE instance_id=? AND step_id=? "
+        "AND state='sealed' AND head_sha IS NOT NULL "
+        "ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+        (instance["id"], target),
+    ).fetchone()
+    if target_artifact and target_artifact["head_sha"] != instance.get("base_sha"):
+        now = store._now()
+        db.execute(
+            "UPDATE recipe_instances SET base_sha=?,updated_base_at=?,updated_at=? WHERE id=?",
+            (target_artifact["head_sha"], now, now, instance["id"]),
+        )
+        instance["base_sha"] = target_artifact["head_sha"]
     # cone is every node on/after target that reaches the rejecting gate.
     children = {name: set() for name in defs}
     for name, needs in parents.items():
@@ -680,11 +696,18 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     if recipe.get("schema") == "shipfactory.recipe/v2":
                         from shipfactory.artifacts import (
                             ArtifactMissing,
+                            ArtifactStale,
                             artifact_set_hash,
                             input_artifacts,
                         )
                         try:
                             inputs = input_artifacts(db, instance_id, defs[step_id])
+                        except ArtifactStale:
+                            changed |= _transition(
+                                db, instance, step, "blocked", "artifacts",
+                                reason="artifact_stale",
+                            )
+                            continue
                         except ArtifactMissing:
                             changed |= _transition(
                                 db, instance, step, "blocked", "artifacts",

@@ -197,8 +197,10 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
             if (not _AGENT_REQUIRED <= set(params) or set(params) - allowed
                     or (not v2 and set(params) != _AGENT_REQUIRED)):
                 _error(f"{primitive} params are exact")
-            if "access_mode" in params and params["access_mode"] not in {"readonly", "readwrite"}:
-                _error("access_mode must be readonly or readwrite")
+            if ("access_mode" in params
+                    and (not isinstance(params["access_mode"], str)
+                         or params["access_mode"] not in ("readonly", "workspace_write"))):
+                _error("access_mode must be readonly or workspace_write")
             if "environment" in params and not isinstance(params["environment"], str):
                 _error("environment must be string")
             if not _templated(params["workspace"]) and params["workspace"] not in {"worktree", "shared"}: _error("workspace must be worktree or shared")

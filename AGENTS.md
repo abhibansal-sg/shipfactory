@@ -88,6 +88,11 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   review targeting itself is unroutable and will stall (finding #29).
 - `_summary()` treats `superseded` rows as non-terminal; stale ones can pin
   an instance at `running` after its real steps finish.
+- Recipe instances persist their trusted `base_sha`; required v2 inputs from
+  an older base block visibly as `artifact_stale` and need a fresh activation.
+- Sealed artifact bytes publish through a same-directory fsynced temp file and
+  atomic rename. Validation rejection is terminal; interrupted sealing remains
+  retryable and must verify or safely replace any torn deterministic target.
 
 ## Operational pitfalls (learned the hard way)
 

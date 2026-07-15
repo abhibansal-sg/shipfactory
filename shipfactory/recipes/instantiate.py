@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import subprocess
 import uuid
+from pathlib import Path
 from typing import Any
 
 from shipfactory import store
@@ -23,7 +26,28 @@ def _render(value: Any, parameters: dict[str, Any]) -> Any:
     return value
 
 
-def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None, parent_tasks: list[str] | None = None, instance_id: str | None = None) -> dict[str, Any]:
+def current_base_sha(workspace: str | Path | None = None) -> str:
+    """Resolve the trusted Git base used for a new or rerouted instance."""
+    try:
+        value = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=workspace or Path.cwd(), text=True,
+            stderr=subprocess.PIPE, timeout=10,
+        ).strip().lower()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("recipe instance base_sha requires a Git workspace") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
+        raise ValueError("recipe instance base_sha is not a commit hash")
+    return value
+
+
+def _base_sha(value: str | None) -> str:
+    resolved = (value or current_base_sha()).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", resolved):
+        raise ValueError("recipe instance base_sha is not a commit hash")
+    return resolved
+
+
+def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None, parent_tasks: list[str] | None = None, instance_id: str | None = None, base_sha: str | None = None) -> dict[str, Any]:
     """Persist one pinned instance and its collector; the advancer creates work.
 
     No task is made ready by this function except the inert collector, which is
@@ -31,19 +55,20 @@ def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, 
     """
     from hermes_cli import kanban_db
     bound = bind_parameters(recipe, parameters, skip_steps)
+    base_sha = _base_sha(base_sha)
     instance_id = instance_id or str(uuid.uuid4())
     collector_key = f"recipe/{instance_id}/{recipe.hash}/collector"
     collector = kanban_db.create_blocked_task(conn, title=f"Recipe collector {recipe.key}", body="Inert Factory completion collector.", parents=parent_tasks or (), idempotency_key=collector_key, board=board, block_kind="needs_input", reason="recipe_collector")
     now = store._now(); skips = set(skip_steps or [])
     with store._connect() as db:
-        db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), now, now))
+        db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,base_sha,updated_base_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), base_sha, now, now, now))
         for step in recipe.document["steps"]:
             state = "skipped" if step["id"] in skips else "pending"
             db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance_id, step["id"], 1, step["primitive"], state, now, now))
-    return {"instance_id": instance_id, "collector_task_id": collector, "recipe": recipe.key, "parameters": bound}
+    return {"instance_id": instance_id, "collector_task_id": collector, "recipe": recipe.key, "parameters": bound, "base_sha": base_sha}
 
 
-def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None) -> dict[str, Any]:
+def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None, base_sha: str | None = None) -> dict[str, Any]:
     """Replace an instance's pinned graph while retaining its collector and id.
 
     Reroute is only an in-place operation before the first external activation.
@@ -51,6 +76,7 @@ def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[st
     so the old graph and its artifacts remain immutable audit history.
     """
     bound = bind_parameters(recipe, parameters, skip_steps)
+    base_sha = _base_sha(base_sha)
     now = store._now(); skips = set(skip_steps or [])
     with store._connect() as db:
         instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
@@ -66,10 +92,11 @@ def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[st
         db.execute("DELETE FROM recipe_steps WHERE instance_id=?", (instance_id,))
         db.execute(
             "UPDATE recipe_instances SET recipe_id=?,recipe_version=?,recipe_hash=?,status='running',"
-            "parameters_json=?,activation_count=0,tokens_charged=0,blocked_reason=NULL,updated_at=? WHERE id=?",
+            "parameters_json=?,base_sha=?,updated_base_at=?,activation_count=0,tokens_charged=0,"
+            "blocked_reason=NULL,updated_at=? WHERE id=?",
             (
                 recipe.document["id"], recipe.document["version"], recipe.hash,
-                json.dumps(bound, sort_keys=True), now, instance_id,
+                json.dumps(bound, sort_keys=True), base_sha, now, now, instance_id,
             ),
         )
         for step in recipe.document["steps"]:
@@ -84,6 +111,7 @@ def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[st
         "collector_task_id": instance["collector_task_id"],
         "recipe": recipe.key,
         "parameters": bound,
+        "base_sha": base_sha,
     }
 
 

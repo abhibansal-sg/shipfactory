@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import subprocess
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -23,6 +24,14 @@ class ArtifactValidationError(ValueError):
 
 class ArtifactMissing(ArtifactValidationError):
     """A required declared artifact is not sealed and readable."""
+
+
+class ArtifactStale(ArtifactValidationError):
+    """A required artifact was produced against an older instance base."""
+
+
+class ArtifactSealError(ArtifactValidationError):
+    """A recoverable daemon/filesystem failure interrupted artifact sealing."""
 
 
 def artifact_id(instance_id: str, step_id: str, activation: int, kind: str) -> str:
@@ -271,7 +280,7 @@ def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> byt
     except ArtifactValidationError:
         raise
     except OSError as exc:
-        raise ArtifactValidationError(f"candidate open failed: {exc}") from exc
+        raise ArtifactSealError(f"candidate open failed: {exc}") from exc
     finally:
         for descriptor in reversed(descriptors):
             try:
@@ -286,8 +295,10 @@ def _git(workspace: Path, *args: str) -> str:
             ["git", *args], cwd=workspace, text=True,
             stderr=subprocess.PIPE, timeout=10,
         ).strip()
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.CalledProcessError as exc:
         raise ArtifactValidationError(f"repository validation failed: {exc}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(f"repository validation unavailable: {exc}") from exc
 
 
 def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:
@@ -309,9 +320,13 @@ def _repository_identity(workspace: Path, document: dict[str, Any] | None = None
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=10,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except subprocess.CalledProcessError as exc:
             raise ArtifactValidationError(
                 f"repository reference {label}={value!r} is absent from worktree repo"
+            ) from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ArtifactSealError(
+                f"repository reference validation unavailable for {label}: {exc}"
             ) from exc
     return base_sha, head_sha, repo_tree_sha
 
@@ -327,25 +342,72 @@ def _storage_path(instance_id: str, step_id: str, activation: int, kind: str) ->
 
 
 def _copy_once(path: Path, data: bytes) -> bytes:
+    """Durably publish bytes through a same-directory atomic rename.
+
+    Matching bytes are adopted.  Different pre-existing bytes are treated as
+    an interrupted prior attempt and replaced only after the full candidate
+    has been fsynced under a unique temporary name.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        existing = path.read_bytes()
-        if hashlib.sha256(existing).digest() != hashlib.sha256(data).digest():
-            raise ArtifactValidationError(
-                "sealed artifact path already contains different bytes"
-            )
+        info = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise ArtifactSealError(f"sealed artifact verification failed: {exc}") from exc
+    else:
+        if stat.S_ISREG(info.st_mode):
+            try:
+                existing = path.read_bytes()
+            except OSError as exc:
+                raise ArtifactSealError(
+                    f"sealed artifact verification failed: {exc}"
+                ) from exc
+        else:
+            # Rename replaces a non-regular torn target without following it.
+            existing = None
+    if existing is not None and hashlib.sha256(existing).digest() == hashlib.sha256(data).digest():
         return existing
+
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd: int | None = None
     try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         view = memoryview(data)
         while view:
             written = os.write(fd, view)
+            if written <= 0:
+                raise ArtifactSealError("short write while sealing artifact")
             view = view[written:]
         os.fsync(fd)
-    finally:
         os.close(fd)
-    return path.read_bytes()
+        fd = None
+        os.rename(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except ArtifactSealError:
+        raise
+    except OSError as exc:
+        raise ArtifactSealError(f"artifact publish failed: {exc}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    try:
+        sealed = path.read_bytes()
+    except OSError as exc:
+        raise ArtifactSealError(f"sealed artifact verification failed: {exc}") from exc
+    if hashlib.sha256(sealed).digest() != hashlib.sha256(data).digest():
+        raise ArtifactSealError("sealed artifact differs from candidate")
+    return sealed
 
 
 def _row_by_id(ident: str) -> dict[str, Any] | None:
@@ -427,6 +489,29 @@ def seal_artifact(
         _validate_document(document, kind=kind, schema=schema)
         base_sha, head_sha, tree_sha = _repository_identity(worktree, document)
         sealed_path = _storage_path(instance_id, step_id, activation, kind)
+    except ArtifactSealError:
+        # Operational failures keep the durable candidate row retryable.
+        raise
+    except ArtifactValidationError as exc:
+        error = str(exc)[:2000] or exc.__class__.__name__
+        with store._connect() as db:
+            db.execute(
+                "UPDATE artifacts SET state='rejected',validation_error=? "
+                "WHERE id=? AND state='candidate'",
+                (error, ident),
+            )
+        raise
+
+    try:
+        # Rows predating migration 5 bind to their first validated artifact.
+        # Newly instantiated rows already have a trusted base, so this is a
+        # no-op in the normal path.
+        with store._connect() as db:
+            db.execute(
+                "UPDATE recipe_instances SET base_sha=?,updated_base_at=? "
+                "WHERE id=? AND base_sha IS NULL",
+                (base_sha, store._now(), instance_id),
+            )
         sealed = _copy_once(sealed_path, data)
         digest = hashlib.sha256(sealed).hexdigest()
         size = len(sealed)
@@ -443,21 +528,15 @@ def seal_artifact(
             if changed != 1:
                 row = db.execute("SELECT * FROM artifacts WHERE id=?", (ident,)).fetchone()
                 if row is None or row["state"] != "sealed":
-                    raise ArtifactValidationError("artifact seal lost candidate state")
+                    raise ArtifactSealError("artifact seal lost candidate state")
         row = _row_by_id(ident)
         assert row is not None
         return _verified_row(row)
     except Exception as exc:
         error = str(exc)[:2000] or exc.__class__.__name__
-        with store._connect() as db:
-            db.execute(
-                "UPDATE artifacts SET state='rejected',validation_error=? "
-                "WHERE id=? AND state='candidate'",
-                (error, ident),
-            )
-        if isinstance(exc, ArtifactValidationError):
+        if isinstance(exc, ArtifactSealError):
             raise
-        raise ArtifactValidationError(error) from exc
+        raise ArtifactSealError(error) from exc
 
 
 def record_artifact_edge(parent_artifact_id: str, child_artifact_id: str,
@@ -479,8 +558,17 @@ def record_artifact_edge(parent_artifact_id: str, child_artifact_id: str,
 def input_artifacts(db: Any, instance_id: str,
                     definition: dict[str, Any]) -> list[dict[str, Any]]:
     """Resolve and verify the latest sealed artifacts declared as inputs."""
+    declared = definition.get("inputs", [])
+    if not declared:
+        return []
+    instance_row = db.execute(
+        "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
+    ).fetchone()
+    if instance_row is None:
+        raise ArtifactStale("artifact_stale: recipe instance has no current base")
+    instance = dict(instance_row)
     resolved: list[dict[str, Any]] = []
-    for item in definition.get("inputs", []):
+    for item in declared:
         producer = db.execute(
             "SELECT activation FROM recipe_steps WHERE instance_id=? AND step_id=? "
             "AND state='done' ORDER BY activation DESC LIMIT 1",
@@ -499,8 +587,25 @@ def input_artifacts(db: Any, instance_id: str,
                     f"artifact_missing:{item['from']}:{item['kind']}"
                 )
             continue
+        artifact = dict(row)
         try:
-            resolved.append(_verified_row(dict(row)))
+            stale = artifact_is_stale(artifact, instance)
+        except ValueError as exc:
+            stale = True
+            stale_error = str(exc)
+        else:
+            stale_error = (
+                f"artifact base {artifact.get('base_sha')} does not match "
+                f"instance base {instance.get('base_sha')}"
+            )
+        if stale:
+            if item["required"]:
+                raise ArtifactStale(
+                    f"artifact_stale:{item['from']}:{item['kind']}: {stale_error}"
+                )
+            continue
+        try:
+            resolved.append(_verified_row(artifact))
         except ArtifactValidationError as exc:
             if item["required"]:
                 raise ArtifactMissing(
@@ -567,7 +672,8 @@ def seal_declared_outputs_for_task(
 
 
 __all__ = [
-    "ArtifactMissing", "ArtifactValidationError", "DEFAULT_ARTIFACT_MAX_BYTES",
+    "ArtifactMissing", "ArtifactSealError", "ArtifactStale",
+    "ArtifactValidationError", "DEFAULT_ARTIFACT_MAX_BYTES",
     "artifact_id", "artifact_is_stale", "artifact_set_hash", "input_artifacts",
     "output_artifacts", "read_artifact", "record_artifact_edge", "seal_artifact",
     "seal_declared_outputs_for_task",
