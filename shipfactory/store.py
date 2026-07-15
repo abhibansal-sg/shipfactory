@@ -135,15 +135,69 @@ _A1_FENCING_MIGRATION_STATEMENTS = (
     "ALTER TABLE runs ADD COLUMN task_attempt_id INTEGER",
 )
 _A1_FENCING_MIGRATION_TEXT = ";\n".join(_A1_FENCING_MIGRATION_STATEMENTS) + ";\n"
+_ARTIFACT_MIGRATION_STATEMENTS = (
+    """CREATE TABLE artifacts (
+    id                    TEXT PRIMARY KEY,
+    instance_id           TEXT NOT NULL,
+    step_id               TEXT NOT NULL,
+    activation            INTEGER NOT NULL,
+    run_id                INTEGER,
+    kind                  TEXT NOT NULL,
+    schema_version        INTEGER NOT NULL,
+    state                 TEXT NOT NULL,
+    candidate_path        TEXT,
+    sealed_path           TEXT,
+    sha256                TEXT,
+    size_bytes            INTEGER,
+    producer              TEXT NOT NULL,
+    trust_domain          TEXT,
+    base_sha              TEXT NOT NULL,
+    head_sha              TEXT,
+    repo_tree_sha         TEXT NOT NULL,
+    validation_error      TEXT,
+    created_at            TEXT NOT NULL,
+    sealed_at             TEXT,
+    UNIQUE(instance_id, step_id, activation, kind)
+)""",
+    """CREATE TABLE artifact_edges (
+    parent_artifact_id  TEXT NOT NULL,
+    child_artifact_id   TEXT NOT NULL,
+    relation            TEXT NOT NULL,
+    PRIMARY KEY(parent_artifact_id, child_artifact_id, relation)
+)""",
+    "ALTER TABLE recipe_steps ADD COLUMN input_artifact_set_hash TEXT",
+    "ALTER TABLE recipe_steps ADD COLUMN output_artifact_set_hash TEXT",
+)
+_ARTIFACT_MIGRATION_TEXT = ";\n".join(_ARTIFACT_MIGRATION_STATEMENTS) + ";\n"
+_INSTANCE_BASE_MIGRATION_STATEMENTS = (
+    "ALTER TABLE recipe_instances ADD COLUMN base_sha TEXT",
+    "ALTER TABLE recipe_instances ADD COLUMN updated_base_at TEXT",
+    """UPDATE recipe_instances
+SET base_sha=(
+        SELECT a.base_sha FROM artifacts a
+        WHERE a.instance_id=recipe_instances.id AND a.state='sealed'
+        ORDER BY a.sealed_at DESC,a.created_at DESC LIMIT 1
+    ),
+    updated_base_at=(
+        SELECT COALESCE(a.sealed_at,a.created_at) FROM artifacts a
+        WHERE a.instance_id=recipe_instances.id AND a.state='sealed'
+        ORDER BY a.sealed_at DESC,a.created_at DESC LIMIT 1
+    )""",
+)
+_INSTANCE_BASE_MIGRATION_TEXT = ";\n".join(_INSTANCE_BASE_MIGRATION_STATEMENTS) + ";\n"
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
     (3, "a1_worker_transition_attempt_fencing", _A1_FENCING_MIGRATION_TEXT),
+    (4, "sf5_artifact_revision_identity", _ARTIFACT_MIGRATION_TEXT),
+    (5, "sf5_instance_base_identity", _INSTANCE_BASE_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
     2: _A1_MIGRATION_STATEMENTS,
     3: _A1_FENCING_MIGRATION_STATEMENTS,
+    4: _ARTIFACT_MIGRATION_STATEMENTS,
+    5: _INSTANCE_BASE_MIGRATION_STATEMENTS,
 }
 
 
@@ -280,11 +334,27 @@ def init_db() -> None:
                         or {"state", "last_outcome"} & monitor_columns
                         or "idx_resource_leases_active" in indexes
                     )
-                else:
+                elif version == 3:
                     run_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(runs)"
                     )}
                     migration_artifacts = "task_attempt_id" in run_columns
+                elif version == 4:
+                    step_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_steps)"
+                    )}
+                    migration_artifacts = bool(
+                        {"artifacts", "artifact_edges"} & existing_tables
+                        or {"input_artifact_set_hash", "output_artifact_set_hash"}
+                        & step_columns
+                    )
+                else:
+                    instance_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_instances)"
+                    )}
+                    migration_artifacts = bool(
+                        {"base_sha", "updated_base_at"} & instance_columns
+                    )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:

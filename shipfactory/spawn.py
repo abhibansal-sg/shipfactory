@@ -127,6 +127,17 @@ def _runtime_max_workers(cfg: Any) -> int:
         return 2
 
 
+def _runtime_artifact_max_bytes() -> int:
+    """Return the validated operator limit, or the ratified 2 MiB default."""
+    try:
+        from shipfactory.config import load_seats, recipe_runtime_config
+        return int(recipe_runtime_config(getattr(load_seats(), "recipes", None))[
+            "artifact_max_bytes"
+        ])
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError, OSError):
+        return 2 * 1024 * 1024
+
+
 def _duration_since(started_at: str | None) -> float:
     try:
         started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
@@ -490,6 +501,20 @@ def reap_finished() -> list[dict]:
             result, summary = _parse_result(
                 get_executor(record["executor"]).extract_text(log_text), code,
             )
+        if result == "done" and hasattr(store, "_connect"):
+            try:
+                from shipfactory.artifacts import seal_declared_outputs_for_task
+                seal_declared_outputs_for_task(
+                    task_id=str(record["task_id"]), run_id=int(record["run_id"]),
+                    workspace=record["workspace_path"],
+                    max_bytes=_runtime_artifact_max_bytes(),
+                )
+            except Exception as exc:
+                # A v2 output is part of the worker protocol, not optional
+                # prose evidence. Fail closed before the board completion is
+                # journaled; the advancer later persists the visible step reason.
+                result = "blocked"
+                summary = f"worker_failed: artifact sealing rejected: {exc}"[:1000]
         usage = get_executor(record["executor"]).parse_usage(log_text)
         duration = (
             monotonic() - record["started"]
