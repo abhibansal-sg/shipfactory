@@ -6,7 +6,8 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from shipfactory import store
@@ -16,6 +17,9 @@ from .primitives import activate, parse_verdict
 
 TERMINAL = {"done", "skipped", "cancelled", "failed"}
 KANBAN_TERMINAL = {"done", "archived", "failed", "cancelled"}
+EVENT_TERMINAL = {"applied", "discarded", "failed"}
+ACTION_TERMINAL = {"succeeded", "terminal_failed", "abandoned"}
+_LEASE_SECONDS = 30
 
 _FINDING_COUNT = re.compile(r"(?im)^\s*(?:finding_count|findings)\s*[:=]\s*(\d+)\s*$")
 _FINDING_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:BLOCKER|WARNING)\b")
@@ -23,11 +27,19 @@ _FINDING_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:BLOCKER|WARNING)\b")
 def advance_key(instance_id: str, recipe_hash: str, step_id: str, activation: int, transition: str, source_id: str) -> str:
     return hashlib.sha256("|".join(map(str, (instance_id, recipe_hash, step_id, activation, transition, source_id))).encode()).hexdigest()
 
-def enqueue(instance_id: str, source: str, payload: dict[str, Any], *, key: str | None = None) -> str:
+def enqueue(instance_id: str, source: str, payload: dict[str, Any], *, key: str | None = None,
+            expected_activation: int | None = None,
+            expected_state: str | None = None) -> str:
     """Durably enqueue a hint.  It intentionally performs no flow mutation."""
     store.init_db(); key = key or hashlib.sha256((instance_id + "|" + source + "|" + json.dumps(payload, sort_keys=True)).encode()).hexdigest()
     with store._connect() as db:
-        db.execute("INSERT OR IGNORE INTO advance_events(key,instance_id,source,payload_json,state,created_at) VALUES(?,?,?,?, 'pending',?)", (key, instance_id, source, json.dumps(payload, sort_keys=True), store._now()))
+        db.execute(
+            "INSERT OR IGNORE INTO advance_events"
+            "(key,instance_id,source,payload_json,state,created_at,expected_activation,expected_state) "
+            "VALUES(?,?,?,?, 'pending',?,?,?)",
+            (key, instance_id, source, json.dumps(payload, sort_keys=True), store._now(),
+             expected_activation, expected_state),
+        )
     return key
 
 def startup_guard(config: Any) -> None:
@@ -53,8 +65,18 @@ def _instance(db: Any, instance_id: str) -> dict[str, Any] | None:
 def _transition(db: Any, instance: dict[str, Any], step: dict[str, Any], state: str, source: str, *, reason: str | None = None, task: str | None = None) -> bool:
     key = advance_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"], state, source)
     existing = db.execute("SELECT state FROM advance_events WHERE key=?", (key,)).fetchone()
-    if existing and existing["state"] == "applied": return False
-    db.execute("INSERT OR IGNORE INTO advance_events(key,instance_id,source,payload_json,state,created_at) VALUES(?,?,?,?, 'pending',?)", (key, instance["id"], source, "{}", store._now()))
+    if existing and existing["state"] in EVENT_TERMINAL:
+        return False
+    owner = f"transition:{os.getpid()}"
+    db.execute(
+        "INSERT OR IGNORE INTO advance_events"
+        "(key,instance_id,source,payload_json,state,created_at,lease_owner,lease_until,"
+        "attempt_count,expected_activation,expected_state) "
+        "VALUES(?,?,?,?, 'leased',?,?,?,?,?,?)",
+        (key, instance["id"], source, "{}", store._now(), owner,
+         (datetime.now(timezone.utc) + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
+         1, step["activation"], step["state"]),
+    )
     output_revision = None
     if state == "done" and step["primitive"] == "agent_task":
         output_revision = int(db.execute(
@@ -70,8 +92,32 @@ def _transition(db: Any, instance: dict[str, Any], step: dict[str, Any], state: 
             step["step_id"], step["activation"],
         ),
     )
-    db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), key))
+    db.execute(
+        "UPDATE advance_events SET state='applied',applied_at=?,outcome=?,"
+        "lease_owner=NULL,lease_until=NULL WHERE key=?",
+        (store._now(), f"step:{step['step_id']}:{step['activation']}:{state}", key),
+    )
     return True
+
+
+def _action_key(logical_key: str, attempt: int) -> str:
+    """Return a fresh stable key for one external-action attempt."""
+    return hashlib.sha256(f"{logical_key}|attempt|{attempt}".encode()).hexdigest()
+
+
+def _plan_action(db: Any, *, logical_key: str, kind: str, payload: dict[str, Any],
+                 instance_id: str | None = None, step_id: str | None = None,
+                 activation: int | None = None) -> str:
+    """Durably plan the first attempt for a logical external effect."""
+    key = _action_key(logical_key, 1)
+    db.execute(
+        "INSERT OR IGNORE INTO action_intents"
+        "(key,logical_key,attempt,instance_id,step_id,activation,kind,payload_json,state,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,'planned',?)",
+        (key, logical_key, 1, instance_id, step_id, activation, kind,
+         json.dumps(payload, sort_keys=True), store._now()),
+    )
+    return key
 
 def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any], profile: dict[str, Any]) -> str | None:
     allowance = int(profile["token_allowance"]); budgets = recipe["budgets"]; day = datetime.now(timezone.utc).date().isoformat()
@@ -451,13 +497,18 @@ def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, A
         step["activation"], "reactivate", source,
     )
     if db.execute(
-        "SELECT 1 FROM advance_events WHERE key=? AND state='applied'", (key,)
+        "SELECT 1 FROM advance_events WHERE key=? AND state IN ('applied','discarded','failed')", (key,)
     ).fetchone():
         return False
+    owner = f"transition:{os.getpid()}"
     db.execute(
         "INSERT OR IGNORE INTO advance_events"
-        "(key,instance_id,source,payload_json,state,created_at) VALUES(?,?,?,?, 'pending',?)",
-        (key, instance["id"], source, "{}", store._now()),
+        "(key,instance_id,source,payload_json,state,created_at,lease_owner,lease_until,"
+        "attempt_count,expected_activation,expected_state) "
+        "VALUES(?,?,?,?, 'leased',?,?,?,?,?,?)",
+        (key, instance["id"], source, "{}", store._now(), owner,
+         (datetime.now(timezone.utc) + timedelta(seconds=_LEASE_SECONDS)).isoformat(),
+         1, step["activation"], step["state"]),
     )
     activation = int(step["activation"]) + 1
     now = store._now()
@@ -469,7 +520,8 @@ def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, A
     )
     inserted = bool(db.execute("SELECT changes()").fetchone()[0])
     db.execute(
-        "UPDATE advance_events SET state='applied',applied_at=? WHERE key=?",
+        "UPDATE advance_events SET state='applied',applied_at=?,outcome='fresh_activation',"
+        "lease_owner=NULL,lease_until=NULL WHERE key=?",
         (store._now(), key),
     )
     return inserted
@@ -614,25 +666,303 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
         raise RuntimeError("recipe reconciliation did not reach a fixpoint")
     return {"instance_id": instance_id, "status": status}
 
-def deliver_outbox(*, now: str | None = None) -> int:
-    """Deliver queued notifications with bounded exponential backoff and no model."""
-    now = now or store._now(); delivered = 0
+def _action_matches_board(db: Any, row: dict[str, Any], board: str | None) -> bool:
+    if board is None:
+        return True
+    if row.get("instance_id"):
+        instance = db.execute(
+            "SELECT board FROM recipe_instances WHERE id=?", (row["instance_id"],)
+        ).fetchone()
+        return bool(instance and instance["board"] == board)
+    try:
+        return json.loads(row["payload_json"]).get("board") == board
+    except (TypeError, json.JSONDecodeError):
+        return False
+
+
+def _new_action_attempt(db: Any, row: dict[str, Any]) -> str:
+    """Insert, never overwrite, the next attempt for a retryable action."""
+    attempt = int(row["attempt"]) + 1
+    key = _action_key(row["logical_key"], attempt)
+    db.execute(
+        "INSERT OR IGNORE INTO action_intents"
+        "(key,logical_key,attempt,instance_id,step_id,activation,kind,payload_json,state,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,'planned',?)",
+        (key, row["logical_key"], attempt, row.get("instance_id"), row.get("step_id"),
+         row.get("activation"), row["kind"], row["payload_json"], store._now()),
+    )
+    return key
+
+
+def _claim_action(*, owner: str, board: str | None, kinds: set[str] | None,
+                  now: str) -> dict[str, Any] | None:
+    """Claim one ready action in a short Factory transaction."""
+    store.init_db()
     with store._connect() as db:
-        rows = [dict(r) for r in db.execute("SELECT * FROM outbox WHERE state='pending' AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT 50", (now,)).fetchall()]
-        for row in rows:
-            try:
-                subprocess.run(["hermes", "send", "--to", row["target"], row["message"]], check=True, capture_output=True, text=True, timeout=30)
-            except Exception as exc:
-                attempts = int(row["attempts"]) + 1
-                # Bounded backoff; terminal delivery failure remains auditable.
-                if attempts >= 8: db.execute("UPDATE outbox SET state='failed',attempts=?,last_error=? WHERE key=?", (attempts, str(exc)[:500], row["key"]))
-                else:
-                    from datetime import timedelta
-                    due = (datetime.now(timezone.utc) + timedelta(seconds=min(3600, 2 ** attempts))).isoformat()
-                    db.execute("UPDATE outbox SET attempts=?,next_attempt_at=?,last_error=? WHERE key=?", (attempts, due, str(exc)[:500], row["key"]))
+        db.execute("BEGIN IMMEDIATE")
+        expired = [dict(row) for row in db.execute(
+            "SELECT * FROM action_intents WHERE state='leased' AND lease_until<=? "
+            "ORDER BY lease_until,key", (now,),
+        ).fetchall()]
+        for row in expired:
+            db.execute(
+                "UPDATE action_intents SET state='retryable_failed',finished_at=?,"
+                "last_error='action lease expired',lease_owner=NULL,lease_until=NULL "
+                "WHERE key=? AND state='leased'",
+                (now, row["key"]),
+            )
+            if row["kind"] == "notification_delivery":
+                # DOUBLE-SEND RISK, deliberate policy: the transport has no
+                # probe or idempotency token, so a lease that expired after
+                # `hermes send` fired but before recording WILL resend on
+                # retry. A duplicate notification is annoying; a silently
+                # dropped one hides a parked gate from the operator. We
+                # choose duplicates, and record the risk on the intent so
+                # the audit trail says so.
+                db.execute(
+                    "UPDATE action_intents SET last_error="
+                    "'action lease expired; retry may double-send (no transport probe)' "
+                    "WHERE key=?",
+                    (row["key"],),
+                )
+                db.execute(
+                    "UPDATE outbox SET state='pending',lease_owner=NULL,lease_until=NULL "
+                    "WHERE key=? AND state='leased'",
+                    (json.loads(row["payload_json"])["outbox_key"],),
+                )
+
+        retryable = [dict(row) for row in db.execute(
+            "SELECT a.* FROM action_intents a WHERE a.state='retryable_failed' "
+            "AND NOT EXISTS (SELECT 1 FROM action_intents newer "
+            "WHERE newer.logical_key=a.logical_key AND newer.attempt>a.attempt) "
+            "ORDER BY a.created_at,a.key"
+        ).fetchall()]
+        for row in retryable:
+            if not _action_matches_board(db, row, board):
+                continue
+            if kinds is not None and row["kind"] not in kinds:
+                continue
+            if row["kind"] == "notification_delivery":
+                outbox_key = json.loads(row["payload_json"])["outbox_key"]
+                due = db.execute(
+                    "SELECT 1 FROM outbox WHERE key=? AND state='pending' AND next_attempt_at<=?",
+                    (outbox_key, now),
+                ).fetchone()
+                if not due:
+                    continue
+            _new_action_attempt(db, row)
+
+        candidates = [dict(row) for row in db.execute(
+            "SELECT * FROM action_intents WHERE state='planned' ORDER BY created_at,key"
+        ).fetchall()]
+        selected = None
+        for row in candidates:
+            if kinds is not None and row["kind"] not in kinds:
+                continue
+            if not _action_matches_board(db, row, board):
+                continue
+            if row["kind"] == "notification_delivery":
+                outbox_key = json.loads(row["payload_json"])["outbox_key"]
+                due = db.execute(
+                    "SELECT 1 FROM outbox WHERE key=? AND state='pending' AND next_attempt_at<=?",
+                    (outbox_key, now),
+                ).fetchone()
+                if not due:
+                    continue
+            selected = row
+            break
+        if selected is None:
+            return None
+        lease_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=_LEASE_SECONDS)
+        ).isoformat()
+        changed = db.execute(
+            "UPDATE action_intents SET state='leased',lease_owner=?,lease_until=?,started_at=? "
+            "WHERE key=? AND state='planned'",
+            (owner, lease_until, now, selected["key"]),
+        ).rowcount
+        if changed != 1:
+            return None
+        if selected["kind"] == "notification_delivery":
+            outbox_key = json.loads(selected["payload_json"])["outbox_key"]
+            changed = db.execute(
+                "UPDATE outbox SET state='leased',lease_owner=?,lease_until=? "
+                "WHERE key=? AND state='pending' AND next_attempt_at<=?",
+                (owner, lease_until, outbox_key, now),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(f"outbox {outbox_key} could not be leased")
+        selected.update({"lease_owner": owner, "lease_until": lease_until, "state": "leased"})
+        return selected
+
+
+def _current_action_target(row: dict[str, Any]) -> bool:
+    """Return whether an unperformed step-bound action is still current."""
+    if not row.get("instance_id") or not row.get("step_id"):
+        return True
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT activation,state FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1",
+            (row["instance_id"], row["step_id"]),
+        ).fetchone()
+    return bool(
+        step and int(step["activation"]) == int(row["activation"])
+        and step["state"] == "waiting"
+    )
+
+
+def _execute_action(conn: Any, row: dict[str, Any]) -> tuple[str, dict[str, Any], str | None]:
+    """Probe then perform one external effect with no Factory transaction held."""
+    from hermes_cli import kanban_db
+
+    payload = json.loads(row["payload_json"])
+    kind = row["kind"]
+    if kind in {"approval_gate_completion", "triage_root_completion"}:
+        task_id = payload["task_id"]
+        task = kanban_db.get_task(conn, task_id)
+        if task and task.status == "done":
+            return "succeeded", {"task_id": task_id, "probe": "already_done"}, None
+        if kind == "approval_gate_completion" and not _current_action_target(row):
+            return "abandoned", {"task_id": task_id, "probe": "stale_activation"}, None
+        if kind == "triage_root_completion":
+            links = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id=?", (task_id,)
+            ).fetchall()
+            parents = [kanban_db.get_task(conn, link["parent_id"]) for link in links]
+            if not links or not all(parent and parent.status == "done" for parent in parents):
+                return "abandoned", {"task_id": task_id, "probe": "parents_not_done"}, None
+        if task is None:
+            return "terminal_failed", {"task_id": task_id}, "kanban task missing"
+        if kind == "approval_gate_completion" and task.status == "blocked":
+            kanban_db.unblock_task(conn, task_id)
+        completed = kanban_db.complete_task(conn, task_id, summary=payload["summary"])
+        verified = kanban_db.get_task(conn, task_id)
+        if not completed or not verified or verified.status != "done":
+            return "retryable_failed", {"task_id": task_id, "complete_return": bool(completed)}, "kanban completion was not verified"
+        # Durability before recording: the effect must survive a crash that
+        # happens before the outcome row is written. Without this commit the
+        # caller's open kanban transaction rolls the completion back on
+        # process death and the recovery probe finds a still-blocked task —
+        # the exact crash-ambiguity this journal exists to remove.
+        conn.commit()
+        return "succeeded", {"task_id": task_id, "probe": "completed"}, None
+    if kind == "notification_delivery":
+        outbox_key = payload["outbox_key"]
+        with store._connect() as db:
+            outbox = db.execute("SELECT * FROM outbox WHERE key=?", (outbox_key,)).fetchone()
+        if outbox and outbox["state"] == "delivered":
+            return "succeeded", {"outbox_key": outbox_key, "probe": "already_delivered"}, None
+        if outbox is None:
+            return "terminal_failed", {"outbox_key": outbox_key}, "outbox row missing"
+        try:
+            subprocess.run(
+                ["hermes", "send", "--to", outbox["target"], outbox["message"]],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+        except Exception as exc:
+            return "retryable_failed", {
+                "outbox_key": outbox_key,
+                "duplicate_risk": "transport_has_no_probe_or_idempotency_token",
+            }, str(exc)[:500]
+        return "succeeded", {
+            "outbox_key": outbox_key,
+            "probe": "sent",
+            "duplicate_risk": "transport_has_no_probe_or_idempotency_token",
+        }, None
+    return "terminal_failed", {}, f"unknown action kind {kind}"
+
+
+def _record_action_outcome(row: dict[str, Any], state: str,
+                           result: dict[str, Any], error: str | None) -> None:
+    """Record an action result and make a failed logical effect retryable."""
+    now = store._now()
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute(
+            "UPDATE action_intents SET state=?,finished_at=?,result_json=?,last_error=?,"
+            "lease_owner=NULL,lease_until=NULL WHERE key=? AND state='leased' AND lease_owner=?",
+            (state, now, json.dumps(result, sort_keys=True), error, row["key"], row["lease_owner"]),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError(f"lost action lease for {row['key']}")
+        if row["kind"] == "notification_delivery":
+            outbox_key = json.loads(row["payload_json"])["outbox_key"]
+            outbox = db.execute("SELECT attempts FROM outbox WHERE key=?", (outbox_key,)).fetchone()
+            attempts = int(outbox["attempts"] if outbox else 0) + 1
+            if state == "succeeded":
+                db.execute(
+                    "UPDATE outbox SET state='delivered',attempts=?,delivered_at=?,last_error=NULL,"
+                    "lease_owner=NULL,lease_until=NULL WHERE key=?",
+                    (attempts, now, outbox_key),
+                )
+            elif attempts >= 8 or state == "terminal_failed":
+                db.execute(
+                    "UPDATE outbox SET state='failed',attempts=?,last_error=?,"
+                    "lease_owner=NULL,lease_until=NULL WHERE key=?",
+                    (attempts, error, outbox_key),
+                )
+                if state == "retryable_failed":
+                    db.execute(
+                        "UPDATE action_intents SET state='terminal_failed' WHERE key=?",
+                        (row["key"],),
+                    )
             else:
-                db.execute("UPDATE outbox SET state='delivered',attempts=attempts+1,delivered_at=? WHERE key=?", (store._now(), row["key"])); delivered += 1
-    return delivered
+                due = (
+                    datetime.now(timezone.utc) + timedelta(seconds=min(3600, 2 ** attempts))
+                ).isoformat()
+                db.execute(
+                    "UPDATE outbox SET state='pending',attempts=?,next_attempt_at=?,last_error=?,"
+                    "lease_owner=NULL,lease_until=NULL WHERE key=?",
+                    (attempts, due, error, outbox_key),
+                )
+        if state == "retryable_failed" and row["kind"] != "notification_delivery":
+            _new_action_attempt(db, row)
+
+
+def run_action_intents(conn: Any, *, board: str | None = None,
+                       kinds: set[str] | None = None, limit: int = 100) -> int:
+    """Run leased external effects outside Factory write transactions."""
+    # Transaction-scope guard: _execute_action commits the kanban connection
+    # at the effect boundary (durability before outcome recording). If the
+    # caller hands us a connection with an open write transaction, that
+    # commit would flush the caller's unrelated in-flight work early —
+    # refuse instead of silently widening the commit scope.
+    if conn is not None and getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "run_action_intents requires a transaction-clean connection; "
+            "caller has an open write transaction"
+        )
+    owner = f"action:{os.getpid()}:{uuid.uuid4().hex}"
+    succeeded = 0
+    for _ in range(limit):
+        row = _claim_action(owner=owner, board=board, kinds=kinds, now=store._now())
+        if row is None:
+            break
+        state, result, error = _execute_action(conn, row)
+        _record_action_outcome(row, state, result, error)
+        if state == "succeeded":
+            succeeded += 1
+        elif state == "retryable_failed":
+            # Leave the fresh attempt for a later daemon tick; a tight retry
+            # loop can amplify an external outage and defeats bounded backoff.
+            break
+    return succeeded
+
+
+def deliver_outbox(conn: Any = None, *, board: str | None = None,
+                   now: str | None = None) -> int:
+    """Lease and deliver notifications without holding a Factory transaction."""
+    if conn is None:
+        from hermes_cli import kanban_db
+        conn = kanban_db.connect(board=board)
+        try:
+            return run_action_intents(
+                conn, board=board, kinds={"notification_delivery"}
+            )
+        finally:
+            conn.close()
+    return run_action_intents(conn, board=board, kinds={"notification_delivery"})
 
 def reconcile_root_collectors(conn: Any, *, board: str | None = None) -> int:
     """Explicitly finish triage root collectors once every sibling collector is done.
@@ -641,10 +971,10 @@ def reconcile_root_collectors(conn: Any, *, board: str | None = None) -> int:
     a parent; the selection-scoped key makes restart reconciliation harmless.
     """
     from hermes_cli import kanban_db
-    completed = 0
+    planned = 0
     with store._connect() as db:
         query = (
-            "SELECT id,root_collector_task_id FROM triage_selections "
+            "SELECT id,board,root_collector_task_id FROM triage_selections "
             "WHERE root_collector_task_id IS NOT NULL"
         )
         args: tuple[Any, ...] = ()
@@ -658,108 +988,258 @@ def reconcile_root_collectors(conn: Any, *, board: str | None = None) -> int:
             if not links: continue
             tasks = [kanban_db.get_task(conn, row["parent_id"]) for row in links]
             if not all(task and task.status == "done" for task in tasks): continue
-            key = hashlib.sha256(f"{selection['id']}|complete_root|siblings_done".encode()).hexdigest()
-            if db.execute("SELECT 1 FROM advance_events WHERE key=? AND state='applied'", (key,)).fetchone(): continue
-            db.execute("INSERT OR REPLACE INTO advance_events(key,instance_id,source,payload_json,state,created_at,applied_at) VALUES(?,?,?,'{}','applied',?,?)", (key, None, "root_collector", store._now(), store._now()))
-            kanban_db.complete_task(conn, root, summary="all sibling recipe collectors complete"); completed += 1
+            logical_key = hashlib.sha256(
+                f"{selection['id']}|complete_root|siblings_done".encode()
+            ).hexdigest()
+            before = db.total_changes
+            _plan_action(
+                db, logical_key=logical_key, kind="triage_root_completion",
+                payload={"task_id": root, "summary": "all sibling recipe collectors complete",
+                         "board": selection.get("board")},
+            )
+            planned += int(db.total_changes > before)
+    completed = run_action_intents(
+        conn, board=board, kinds={"triage_root_completion"}
+    )
     return completed
 
 def event(instance_id: str, step_id: str, payload: dict[str, Any]) -> str:
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not isinstance(payload.get("type"), str): raise ValueError("event payload requires string id and type")
-    return enqueue(instance_id, "external_event", {"step_id": step_id, "payload": payload}, key=hashlib.sha256(f"{instance_id}|{step_id}|{payload['id']}".encode()).hexdigest())
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT activation,state FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1", (instance_id, step_id),
+        ).fetchone()
+    return enqueue(
+        instance_id, "external_event", {"step_id": step_id, "payload": payload},
+        key=hashlib.sha256(f"{instance_id}|{step_id}|{payload['id']}".encode()).hexdigest(),
+        expected_activation=int(step["activation"]) if step else None,
+        expected_state=step["state"] if step else None,
+    )
 
 def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "") -> str:
     """Queue a human gate decision for the recipe engine's single writer."""
     if decision not in {"approve", "reject"}:
         raise ValueError("gate decision must be approve or reject")
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT activation,state,primitive FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1", (instance_id, step_id),
+        ).fetchone()
+    if not step or step["primitive"] != "approval_gate" or step["state"] != "waiting":
+        raise ValueError("approval gate is not waiting")
     return enqueue(
         instance_id,
         "gate_decision",
         {"step_id": step_id, "decision": decision, "reason": reason},
+        expected_activation=int(step["activation"]), expected_state=step["state"],
     )
 
 def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
     """Queue an audited operator release for a parked review-stall gate."""
     if not str(reason).strip():
         raise ValueError("operator release requires a reason")
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT activation,state,primitive,blocked_reason FROM recipe_steps "
+            "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
+            (instance_id, step_id),
+        ).fetchone()
+    if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
+            or step["blocked_reason"] != "review_stall"):
+        raise ValueError("review step is not parked for review_stall")
     return enqueue(
         instance_id,
         "operator_release",
         {"step_id": step_id, "reason": str(reason).strip()},
+        expected_activation=int(step["activation"]), expected_state=step["state"],
     )
+
+
+def _claim_event(*, owner: str, board: str | None) -> dict[str, Any] | None:
+    """Lease exactly one pending event under ``BEGIN IMMEDIATE``."""
+    store.init_db()
+    now = store._now()
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "UPDATE advance_events SET state='pending',lease_owner=NULL,lease_until=NULL,"
+            "outcome='lease_expired' WHERE state='leased' AND lease_until<=?",
+            (now,),
+        )
+        query = (
+            "SELECT e.* FROM advance_events e LEFT JOIN recipe_instances i ON i.id=e.instance_id "
+            "WHERE e.state='pending'"
+        )
+        args: tuple[Any, ...] = ()
+        if board is not None:
+            query += " AND i.board=?"
+            args = (board,)
+        query += " ORDER BY e.created_at,e.key LIMIT 1"
+        row = db.execute(query, args).fetchone()
+        if row is None:
+            return None
+        lease_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=_LEASE_SECONDS)
+        ).isoformat()
+        changed = db.execute(
+            "UPDATE advance_events SET state='leased',lease_owner=?,lease_until=?,"
+            "attempt_count=attempt_count+1 WHERE key=? AND state='pending'",
+            (owner, lease_until, row["key"]),
+        ).rowcount
+        if changed != 1:
+            return None
+        value = dict(row)
+        value.update({"state": "leased", "lease_owner": owner, "lease_until": lease_until,
+                      "attempt_count": int(row["attempt_count"]) + 1})
+        return value
+
+
+def _finish_event(db: Any, row: dict[str, Any], state: str, outcome: str,
+                  error: str | None = None) -> None:
+    if state not in EVENT_TERMINAL:
+        raise ValueError(f"invalid terminal event state {state}")
+    changed = db.execute(
+        "UPDATE advance_events SET state=?,outcome=?,last_error=?,applied_at=?,"
+        "lease_owner=NULL,lease_until=NULL WHERE key=? AND state='leased' AND lease_owner=?",
+        (state, outcome, error, store._now(), row["key"], row["lease_owner"]),
+    ).rowcount
+    if changed != 1:
+        raise RuntimeError(f"lost advance-event lease for {row['key']}")
+
+
+def _matching_step(db: Any, instance_id: str, payload: dict[str, Any],
+                   row: dict[str, Any]) -> Any:
+    step = db.execute(
+        "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+        "ORDER BY activation DESC LIMIT 1", (instance_id, payload.get("step_id")),
+    ).fetchone()
+    if step is None:
+        return None
+    if row.get("expected_activation") is not None and int(step["activation"]) != int(row["expected_activation"]):
+        return None
+    if row.get("expected_state") is not None and step["state"] != row["expected_state"]:
+        return None
+    return step
+
+
+def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
+    """Consume one leased event, producing intents but no external commands."""
+    try:
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            raise ValueError("event payload is not an object")
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            leased = db.execute(
+                "SELECT 1 FROM advance_events WHERE key=? AND state='leased' AND lease_owner=?",
+                (row["key"], row["lease_owner"]),
+            ).fetchone()
+            if not leased:
+                return
+            instance = _instance(db, row["instance_id"])
+            if not instance:
+                _finish_event(db, row, "discarded", "instance_missing")
+                return
+            if instance["status"] in {"cancelling", "cancelled"}:
+                _finish_event(db, row, "discarded", f"instance_{instance['status']}")
+                return
+            step = _matching_step(db, instance["id"], payload, row)
+            if step is None:
+                _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
+                return
+            if row["source"] == "external_event":
+                defs = {item["id"]: item for item in recipe_for_instance(instance).document["steps"]}
+                definition = defs.get(payload.get("step_id"))
+                if (step["state"] != "waiting" or not definition
+                        or definition["primitive"] != "wait_for_event"
+                        or definition["params"]["event"] != payload.get("payload", {}).get("type")):
+                    _finish_event(db, row, "discarded", "event_does_not_match_wait")
+                    return
+                _transition(db, instance, dict(step), "done", payload["payload"]["id"])
+                _finish_event(db, row, "applied", "wait_completed")
+                # Resume-note comments are a kanban effect. Commit the Factory
+                # event first so no external command runs under its write txn.
+                db.commit()
+                _consume_resume_note(conn, step["kanban_task_id"])
+                return
+            if row["source"] == "gate_decision":
+                if step["primitive"] != "approval_gate" or step["state"] != "waiting":
+                    _finish_event(db, row, "discarded", "approval_gate_not_waiting")
+                    return
+                if payload.get("decision") == "approve":
+                    logical_key = hashlib.sha256(
+                        f"{row['key']}|approval_gate_completion".encode()
+                    ).hexdigest()
+                    action_key = _plan_action(
+                        db, logical_key=logical_key, kind="approval_gate_completion",
+                        payload={"task_id": step["kanban_task_id"],
+                                 "summary": "operator approved", "board": instance["board"]},
+                        instance_id=instance["id"], step_id=step["step_id"],
+                        activation=int(step["activation"]),
+                    )
+                    _finish_event(db, row, "applied", f"action_intent:{action_key}")
+                    return
+                if payload.get("decision") == "reject":
+                    reason = str(payload.get("reason") or "operator_rejected")
+                    _transition(db, instance, dict(step), "blocked", "operator_rejected", reason=reason)
+                    db.execute(
+                        "UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?",
+                        (reason, store._now(), instance["id"]),
+                    )
+                    _finish_event(db, row, "applied", "gate_rejected")
+                    return
+                _finish_event(db, row, "discarded", "unknown_gate_decision")
+                return
+            if row["source"] == "operator_release":
+                if (step["primitive"] != "review_gate" or step["state"] != "blocked"
+                        or step["blocked_reason"] != "review_stall"):
+                    _finish_event(db, row, "discarded", "review_gate_not_stalled")
+                    return
+                from hermes_cli import kanban_db
+                task = kanban_db.get_task(conn, step["kanban_task_id"])
+                verdict = parse_verdict(task.result if task else "")
+                if verdict["outcome"] != "request_changes":
+                    raise ValueError("review stall has no rejecting verdict")
+                recipe = recipe_for_instance(instance).document
+                _invalidate_cone(
+                    db, instance, recipe,
+                    _resolve_target_step(db, instance["id"], recipe, verdict["target_step"]),
+                    step["step_id"], f"operator_release:{row['key']}",
+                )
+                _transition(
+                    db, instance, dict(step), "blocked", f"operator_release:{row['key']}",
+                    reason="changes_requested",
+                )
+                db.execute(
+                    "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
+                    (store._now(), instance["id"]),
+                )
+                _finish_event(db, row, "applied", "review_stall_released")
+                return
+            _finish_event(db, row, "discarded", f"unknown_source:{row['source']}")
+    except Exception as exc:
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            leased = db.execute(
+                "SELECT 1 FROM advance_events WHERE key=? AND state='leased' AND lease_owner=?",
+                (row["key"], row["lease_owner"]),
+            ).fetchone()
+            if leased:
+                _finish_event(db, row, "failed", "event_application_failed", str(exc)[:500])
 
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None,
                  board: str | None = None) -> int:
-    """Claim queued events, apply only matching waits, then reconcile all instances."""
-    from hermes_cli import kanban_db
+    """Lease queued events one at a time, consume them, and reconcile instances."""
     count = 0
+    owner = f"event:{os.getpid()}:{uuid.uuid4().hex}"
+    for _ in range(100):
+        row = _claim_event(owner=owner, board=board)
+        if row is None:
+            break
+        _apply_claimed_event(conn, row)
+        count += 1
     with store._connect() as db:
-        event_query = (
-            "SELECT e.* FROM advance_events e "
-            "LEFT JOIN recipe_instances i ON i.id=e.instance_id "
-            "WHERE e.state='pending'"
-        )
-        event_args: tuple[Any, ...] = ()
-        if board is not None:
-            event_query += " AND i.board=?"
-            event_args = (board,)
-        event_query += " ORDER BY e.created_at LIMIT 100"
-        events = [dict(r) for r in db.execute(event_query, event_args).fetchall()]
-        for row in events:
-            payload = json.loads(row["payload_json"]); instance = _instance(db, row["instance_id"])
-            if not instance or instance["status"] in {"cancelling", "cancelled"}: db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); continue
-            if row["source"] == "external_event":
-                step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], payload["step_id"])).fetchone()
-                defs = {x["id"]: x for x in recipe_for_instance(instance).document["steps"]}
-                if step and step["state"] == "waiting" and defs[payload["step_id"]]["primitive"] == "wait_for_event" and defs[payload["step_id"]]["params"]["event"] == payload["payload"]["type"]:
-                    _consume_resume_note(conn, step["kanban_task_id"])
-                    _transition(db, instance, dict(step), "done", payload["payload"]["id"])
-            elif row["source"] == "gate_decision":
-                step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], payload.get("step_id"))).fetchone()
-                if step and step["primitive"] == "approval_gate" and step["state"] == "waiting":
-                    if payload.get("decision") == "approve":
-                        # The blocked kanban task is the canonical approval
-                        # signal; reconciliation observes its completion.
-                        # Gate tasks are created blocked/needs_input, and
-                        # complete_task only accepts running|ready — unblock
-                        # first or the approval is silently swallowed
-                        # (shakedown finding #30).
-                        kanban_db.unblock_task(conn, step["kanban_task_id"])
-                        if not kanban_db.complete_task(conn, step["kanban_task_id"], summary="operator approved"):
-                            raise ValueError(
-                                f"approval gate task {step['kanban_task_id']} could not be completed"
-                            )
-                    elif payload.get("decision") == "reject":
-                        reason = str(payload.get("reason") or "operator_rejected")
-                        _transition(db, instance, dict(step), "blocked", "operator_rejected", reason=reason)
-                        db.execute("UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?", (reason, store._now(), instance["id"]))
-            elif row["source"] == "operator_release":
-                step = db.execute(
-                    "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
-                    (instance["id"], payload.get("step_id")),
-                ).fetchone()
-                if (step and step["primitive"] == "review_gate" and step["state"] == "blocked"
-                        and step["blocked_reason"] == "review_stall"):
-                    task = kanban_db.get_task(conn, step["kanban_task_id"])
-                    verdict = parse_verdict(task.result if task else "")
-                    if verdict["outcome"] != "request_changes":
-                        raise ValueError("review stall has no rejecting verdict")
-                    recipe = recipe_for_instance(instance).document
-                    _invalidate_cone(
-                        db, instance, recipe,
-                        _resolve_target_step(db, instance["id"], recipe, verdict["target_step"]),
-                        step["step_id"],
-                        f"operator_release:{row['key']}",
-                    )
-                    _transition(
-                        db, instance, dict(step), "blocked", f"operator_release:{row['key']}",
-                        reason="changes_requested",
-                    )
-                    db.execute(
-                        "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
-                        (store._now(), instance["id"]),
-                    )
-            db.execute("UPDATE advance_events SET state='applied',applied_at=? WHERE key=?", (store._now(), row["key"])); count += 1
         query = (
             "SELECT id FROM recipe_instances WHERE status IN "
             "('running','waiting_gate','waiting_event','blocked','cancelling')"
@@ -768,7 +1248,11 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
         if board is not None:
             query += " AND board=?"
             args = (board,)
-        ids = [r[0] for r in db.execute(query, args).fetchall()]; db.commit()
+        ids = [r[0] for r in db.execute(query, args).fetchall()]
+    run_action_intents(
+        conn, board=board,
+        kinds={"approval_gate_completion"},
+    )
     for ident in ids: reconcile(conn, ident, profiles=profiles)
     return count
 

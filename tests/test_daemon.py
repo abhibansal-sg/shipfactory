@@ -59,7 +59,7 @@ def test_tick_runs_selector_after_advancer_stages(monkeypatch):
     advancer = types.ModuleType("shipfactory.recipes.advancer")
     advancer.startup_guard = lambda config: calls.append("guard")
     advancer.apply_events = lambda conn, profiles, board=None: calls.append("events") or 1
-    advancer.deliver_outbox = lambda: calls.append("outbox") or 2
+    advancer.deliver_outbox = lambda conn, board=None: calls.append("outbox") or 2
     advancer.reconcile_root_collectors = lambda conn, board=None: calls.append("roots") or 3
     selector = types.ModuleType("shipfactory.recipes.selector_stage")
     selector.run_stage = lambda conn, board: calls.append("selector") or {

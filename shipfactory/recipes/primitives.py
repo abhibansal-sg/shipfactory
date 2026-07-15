@@ -48,8 +48,22 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
         # txn on the same file (shakedown finding #17: 'database is locked').
         if db is not None:
             db.execute("INSERT OR IGNORE INTO outbox(key,target,message,state,attempts,next_attempt_at) VALUES(?,?,?,'pending',0,?)", (key, render(params["target"]), body, store._now()))
+            from .advancer import _plan_action
+            _plan_action(
+                db, logical_key=key, kind="notification_delivery",
+                payload={"outbox_key": key, "board": instance.get("board")},
+                instance_id=instance["id"], step_id=step["step_id"],
+                activation=int(step["activation"]),
+            )
         else:
             with store._connect() as fresh:
                 fresh.execute("INSERT OR IGNORE INTO outbox(key,target,message,state,attempts,next_attempt_at) VALUES(?,?,?,'pending',0,?)", (key, render(params["target"]), body, store._now()))
+                from .advancer import _plan_action
+                _plan_action(
+                    fresh, logical_key=key, kind="notification_delivery",
+                    payload={"outbox_key": key, "board": instance.get("board")},
+                    instance_id=instance["id"], step_id=step["step_id"],
+                    activation=int(step["activation"]),
+                )
         return None
     raise RuntimeError(f"unknown primitive {primitive}")

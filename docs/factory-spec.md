@@ -542,7 +542,9 @@ Factory SHALL persist:
 - `recipe_versions(id, version, hash, status, normalized_yaml)`.
 - `recipe_instances(id, board, collector_task_id, recipe_id, recipe_version, recipe_hash, status, parameters_json, activation_count, tokens_charged, blocked_reason, created_at, updated_at)`.
 - `recipe_steps(instance_id, step_id, activation, primitive, state, kanban_task_id, input_revision_hash, output_revision, blocked_reason, created_at, updated_at)`.
-- `advance_events(key, source, payload_json, state, created_at, applied_at)`.
+- `advance_events(key, source, payload_json, state, created_at, applied_at, lease_owner, lease_until, attempt_count, expected_activation, expected_state, outcome, last_error)` — A0 (2026-07-15): events are LEASED before application (`pending → leased → applied|discarded|failed` under `BEGIN IMMEDIATE`); an expired lease returns the row to `pending` without reinsertion; `applied`/`discarded`/`failed` keys are permanently terminal; stale/nonmatching events become `discarded` with a recorded reason, never a silent no-op.
+- `action_intents(key, logical_key, attempt, instance_id, step_id, activation, kind, payload_json, state, lease_owner, lease_until, started_at, finished_at, result_json, last_error, created_at)` — A0: every external effect (approval-gate kanban completion, triage-root collector completion, notification delivery) is journaled as an intent (`planned → leased → succeeded|retryable_failed|terminal_failed|abandoned`) and executed OUTSIDE factory write transactions. Retries insert a fresh `(logical_key, attempt+1)` key and PROBE the target system for prior success before re-acting; the consumed advance-event key is never replayed.
+- `schema_migrations(version, name, checksum, applied_at)` — A0: numbered transactional migrations; daemon startup fails on a partially-applied or checksum-mismatched migration.
 - `budget_charges(key, board, utc_day, instance_id, step_id, activation, tokens)`.
 - `outbox(key, target, message, state, attempts, next_attempt_at, delivered_at)`.
 - Triage selection rows containing the source task, ranked candidates, reasons, chosen version, parameters, skips, and reroute outcome.

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
+import json
 import os
 import logging
+import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 
@@ -15,6 +21,73 @@ logger = logging.getLogger(__name__)
 # changing the public daemon interface.
 _DB_HEALTH_EVERY_TICKS = 60
 _db_health_tick = 0
+
+
+def _process_start_identity() -> str:
+    """Return an OS-derived process-start identity robust to PID reuse."""
+    try:
+        return subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(os.getpid())],
+            text=True, timeout=2,
+        ).strip()
+    except Exception:
+        # The lock itself remains authoritative. This fallback is unique to
+        # this process launch even on minimal systems without ps(1).
+        return f"python-start:{time.time_ns()}"
+
+
+@contextmanager
+def daemon_lock(boards: Sequence[str]):
+    """Hold the process-wide ShipFactory daemon advisory lock."""
+    from shipfactory import store
+
+    path = store._db_path().parent / "daemon.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown owner"
+            raise RuntimeError(f"ShipFactory daemon already running: {owner}") from exc
+        record = {
+            "pid": os.getpid(),
+            "process_start_identity": _process_start_identity(),
+            "boards": list(boards),
+            "executable": str(Path(sys.executable).resolve()),
+        }
+        handle.seek(0)
+        handle.truncate()
+        json.dump(record, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def validate_recipe_mode(*, required: bool = False) -> Any:
+    """Load and validate recipe authority before any board is opened."""
+    from shipfactory.config import FactoryConfigError, load_seats
+    from shipfactory.recipes.advancer import startup_guard
+
+    try:
+        cfg = load_seats()
+    except (ImportError, FileNotFoundError, OSError, FactoryConfigError) as exc:
+        if required:
+            raise RuntimeError(f"recipe configuration is required: {exc}") from exc
+        return None
+    recipes = cfg.recipes or {}
+    if required and not recipes.get("enabled"):
+        raise RuntimeError("recipe configuration is required but recipes.enabled is false")
+    if recipes.get("enabled"):
+        startup_guard(cfg)
+    return cfg
 
 
 def _board_db_health_pass(conn, board: str | None) -> None:
@@ -45,7 +118,8 @@ def _board_db_health_pass(conn, board: str | None) -> None:
             logger.exception("Factory could not emit database-health telemetry")
 
 
-def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any]:
+def tick(conn, *, board: str | None = None, sync: bool = False,
+         require_recipes: bool = False) -> dict[str, Any]:
     """Run one dispatch, reaping, watchdog, and optional GitHub-sync cycle."""
     from hermes_cli.kanban_db import dispatch_once
     from shipfactory.spawn import shipfactory_spawn, reap_finished
@@ -53,13 +127,11 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
     dispatch_kwargs: dict[str, Any] = {}
     result_recipes = None
     result_selector = None
-    try:
-        from shipfactory.config import FactoryConfigError, load_seats
-        cfg = load_seats()
+    cfg = validate_recipe_mode(required=require_recipes)
+    if cfg is not None:
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
-            from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors, startup_guard
-            startup_guard(cfg)
+            from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             recipe_board = board or cfg.company
             result_recipes = {
@@ -68,7 +140,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
                     profiles=recipes_cfg["execution_profiles"],
                     board=recipe_board,
                 ),
-                "outbox": deliver_outbox(),
+                "outbox": deliver_outbox(conn, board=recipe_board),
                 "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
             }
             from shipfactory.config import selector_config
@@ -77,10 +149,6 @@ def tick(conn, *, board: str | None = None, sync: bool = False) -> dict[str, Any
                 result_selector = run_stage(conn, board or cfg.company)
             else:
                 result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
-    except (ImportError, FileNotFoundError, OSError, FactoryConfigError):
-        # Existing Factory installations without a seats file retain the old
-        # dispatch behavior; a configured recipe board is always fail-closed.
-        result_recipes = None
     # Finding #23 tick-order race: reap exited harnesses BEFORE dispatch_once,
     # whose claim watchdog otherwise sees a dead pid with an unfinalized task
     # and records a protocol violation — burning the failure fuse on workers
@@ -148,7 +216,8 @@ def _served_boards(board: str | None, boards: Sequence[str] | None) -> list[str]
 
 def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
         interval: float = 5.0, once: bool = False, sync: bool = False,
-        sync_interval: float | None = None) -> dict[str, Any] | None:
+        sync_interval: float | None = None, require_recipes: bool = False,
+        _lock_held: bool = False) -> dict[str, Any] | None:
     """Run one tick loop across one or more isolated board connections.
 
     A traditional single-board caller continues to pass its connection in
@@ -157,6 +226,13 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
     """
     from shipfactory import store
     board_names = _served_boards(board, boards)
+    if not _lock_held:
+        with daemon_lock(board_names):
+            return run(
+                conn, board=board, boards=board_names, interval=interval, once=once,
+                sync=sync, sync_interval=sync_interval,
+                require_recipes=require_recipes, _lock_held=True,
+            )
     first_board = board_names[0]
     owns_connections = conn is None
     if isinstance(conn, Mapping):
@@ -196,6 +272,7 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
                         board_conn,
                         board=board_name,
                         sync=do_sync,
+                        require_recipes=require_recipes,
                     )
                     store.record_daemon_tick(run_id, board_name)
                 except Exception as exc:
@@ -227,4 +304,4 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
                         logger.exception("Factory could not close a board connection")
 
 
-__all__ = ["tick", "run"]
+__all__ = ["daemon_lock", "tick", "run", "validate_recipe_mode"]
