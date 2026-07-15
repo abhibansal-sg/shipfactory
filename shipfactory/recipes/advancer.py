@@ -712,6 +712,19 @@ def _claim_action(*, owner: str, board: str | None, kinds: set[str] | None,
                 (now, row["key"]),
             )
             if row["kind"] == "notification_delivery":
+                # DOUBLE-SEND RISK, deliberate policy: the transport has no
+                # probe or idempotency token, so a lease that expired after
+                # `hermes send` fired but before recording WILL resend on
+                # retry. A duplicate notification is annoying; a silently
+                # dropped one hides a parked gate from the operator. We
+                # choose duplicates, and record the risk on the intent so
+                # the audit trail says so.
+                db.execute(
+                    "UPDATE action_intents SET last_error="
+                    "'action lease expired; retry may double-send (no transport probe)' "
+                    "WHERE key=?",
+                    (row["key"],),
+                )
                 db.execute(
                     "UPDATE outbox SET state='pending',lease_owner=NULL,lease_until=NULL "
                     "WHERE key=? AND state='leased'",
@@ -910,6 +923,16 @@ def _record_action_outcome(row: dict[str, Any], state: str,
 def run_action_intents(conn: Any, *, board: str | None = None,
                        kinds: set[str] | None = None, limit: int = 100) -> int:
     """Run leased external effects outside Factory write transactions."""
+    # Transaction-scope guard: _execute_action commits the kanban connection
+    # at the effect boundary (durability before outcome recording). If the
+    # caller hands us a connection with an open write transaction, that
+    # commit would flush the caller's unrelated in-flight work early —
+    # refuse instead of silently widening the commit scope.
+    if conn is not None and getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "run_action_intents requires a transaction-clean connection; "
+            "caller has an open write transaction"
+        )
     owner = f"action:{os.getpid()}:{uuid.uuid4().hex}"
     succeeded = 0
     for _ in range(limit):

@@ -180,14 +180,32 @@ def on_complete(task_id: str, board: str, assignee: str, summary: str) -> dict[s
         except Exception as exc:
             recipe_lookup_error = exc
     recipes_enabled = False
+    recipes_enabled_error = None
     try:
         cfg = _module("shipfactory.config").load_seats()
         recipes_enabled = bool((getattr(cfg, "recipes", {}) or {}).get("enabled"))
-    except Exception:
-        # Legacy module-contract fixtures and unconfigured installations do
-        # not have recipe authority. A configured recipe board is handled
-        # below and never reaches legacy policy mutations.
+    except FileNotFoundError:
+        # Unconfigured installation: genuinely no recipe authority.
         recipes_enabled = False
+    except Exception as exc:
+        # Any OTHER config failure is indistinguishable from a recipe-enabled
+        # board whose config is temporarily unreadable. Fail CLOSED: treating
+        # it as disabled would let legacy policy mutate a recipe task — the
+        # exact authority bypass A0 exists to kill.
+        recipes_enabled_error = exc
+    if recipes_enabled_error is not None:
+        try:
+            _module("shipfactory.telemetry").append_jsonl({
+                "event": "recipe_config_load_failure",
+                "task_id": task_id,
+                "board": board,
+                "error": str(recipes_enabled_error),
+            })
+        except Exception:
+            pass
+        raise RuntimeError(
+            "recipe configuration unreadable; legacy policy is fenced"
+        ) from recipes_enabled_error
     if recipe_lookup_error is not None and recipes_enabled:
         try:
             _module("shipfactory.telemetry").append_jsonl({
