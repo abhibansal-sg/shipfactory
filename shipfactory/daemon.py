@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import inspect
 import json
 import os
 import logging
@@ -197,28 +198,93 @@ def _board_db_health_pass(conn, board: str | None) -> None:
             logger.exception("Factory could not emit database-health telemetry")
 
 
+def _requeue_capacity_claim(conn: Any, task: Any) -> bool:
+    """Return a just-claimed Hermes task to its source queue without a failure."""
+    from hermes_cli import kanban_db
+
+    task_id = str(task.id)
+    failure_row = conn.execute(
+        "SELECT consecutive_failures,last_failure_error FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    source_status = "ready"
+    task_attempt_id = getattr(task, "current_run_id", None)
+    if task_attempt_id is not None:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, int(task_attempt_id)),
+        ).fetchone()
+        if event and event["payload"]:
+            try:
+                if json.loads(event["payload"]).get("source_status") == "review":
+                    source_status = "review"
+            except (TypeError, json.JSONDecodeError):
+                pass
+    if not kanban_db.reclaim_task(
+        conn, task_id, reason="worker_slot capacity unavailable",
+    ):
+        return False
+    with kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status=?,consecutive_failures=?,last_failure_error=? "
+            "WHERE id=? AND status='ready'",
+            (
+                source_status,
+                int(failure_row["consecutive_failures"]) if failure_row else 0,
+                failure_row["last_failure_error"] if failure_row else None,
+                task_id,
+            ),
+        )
+    return True
+
+
 def tick(conn, *, board: str | None = None, sync: bool = False,
          require_recipes: bool = False) -> dict[str, Any]:
     """Run one dispatch, reaping, watchdog, and optional GitHub-sync cycle."""
     from hermes_cli.kanban_db import dispatch_once
-    from shipfactory.spawn import shipfactory_spawn, reap_finished
+    import shipfactory.spawn as spawn_module
+
+    shipfactory_spawn = spawn_module.shipfactory_spawn
+    reap_finished = spawn_module.reap_finished
+    capacity_signal = getattr(
+        spawn_module, "WorkerCapacityExhausted",
+        type("_NoCapacitySignal", (Exception,), {}),
+    )
 
     dispatch_kwargs: dict[str, Any] = {}
     result_recipes = None
     result_selector = None
     cfg = validate_recipe_mode(required=require_recipes)
+    max_workers = 2
     if cfg is not None:
+        try:
+            from shipfactory.config import recipe_runtime_config
+            runtime_cfg = recipe_runtime_config(cfg.recipes)
+        except ImportError:  # isolated compatibility stubs
+            runtime_cfg = {"max_workers": 2}
+        max_workers = int(runtime_cfg["max_workers"])
+        restore = getattr(spawn_module, "restore_running", None)
+        if restore is not None:
+            restore(max_workers=max_workers)
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
             from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             recipe_board = board or cfg.company
+            event_kwargs = {
+                "profiles": recipes_cfg["execution_profiles"],
+                "board": recipe_board,
+            }
+            try:
+                if "board_day_token_ceiling" in inspect.signature(apply_events).parameters:
+                    event_kwargs["board_day_token_ceiling"] = int(
+                        recipes_cfg.get("board_day_token_ceiling", 10**18)
+                    )
+            except (TypeError, ValueError):
+                pass
             result_recipes = {
-                "events": apply_events(
-                    conn,
-                    profiles=recipes_cfg["execution_profiles"],
-                    board=recipe_board,
-                ),
+                "events": apply_events(conn, **event_kwargs),
                 "outbox": deliver_outbox(conn, board=recipe_board),
                 "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
             }
@@ -233,7 +299,39 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     # and records a protocol violation — burning the failure fuse on workers
     # that completed perfectly. Reaping first finalizes their kanban state.
     reaped = reap_finished()
-    dispatched = dispatch_once(conn, spawn_fn=shipfactory_spawn, board=board, **dispatch_kwargs)
+    if cfg is not None and hasattr(conn, "execute"):
+        from shipfactory import store
+        available = store.available_resource_units("worker_slot", max_workers)
+        running = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='running'"
+        ).fetchone()[0])
+        dispatch_kwargs["max_spawn"] = running + available
+    capacity_deferred: set[str] = set()
+
+    def queue_safe_spawn(task, workspace: str, *, board=None):
+        try:
+            return shipfactory_spawn(task, workspace, board=board)
+        except capacity_signal:
+            try:
+                if _requeue_capacity_claim(conn, task):
+                    capacity_deferred.add(str(task.id))
+            except Exception:
+                # Capacity is a queue condition even when the best-effort
+                # claim release itself needs reconciliation on the next tick.
+                logger.exception("Factory could not requeue capacity-deferred task %s", task.id)
+            return None
+
+    dispatched = dispatch_once(
+        conn, spawn_fn=queue_safe_spawn, board=board, **dispatch_kwargs,
+    )
+    if capacity_deferred:
+        dispatched.spawned = [
+            item for item in dispatched.spawned if item[0] not in capacity_deferred
+        ]
+        dispatched.respawn_guarded.extend(
+            (task_id, "worker_slot_capacity")
+            for task_id in sorted(capacity_deferred)
+        )
     reaped += reap_finished()
     _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}

@@ -62,23 +62,16 @@ def _admit_selection(selection_id: str, board: str, allowance: int, ceiling: int
     day = datetime.now(timezone.utc).date().isoformat()
     with store._connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        daily = int(db.execute(
-            "SELECT COALESCE(SUM(tokens),0) FROM budget_charges WHERE board=? AND utc_day=?",
-            (board, day),
-        ).fetchone()[0])
-        if daily + allowance > ceiling:
-            return False
         activation = int(db.execute(
             "SELECT COUNT(*) FROM budget_charges WHERE instance_id=? AND step_id='selector'",
             (selection_id,),
         ).fetchone()[0]) + 1
         key = hashlib.sha256(f"{selection_id}|selector|{activation}|admit".encode()).hexdigest()
-        db.execute(
-            "INSERT INTO budget_charges(key,board,utc_day,instance_id,step_id,activation,tokens,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (key, board, day, selection_id, "selector", activation, allowance, store._now()),
+        return store.admit_budget_charge(
+            db, key=key, board=board, utc_day=day, instance_id=selection_id,
+            step_id="selector", activation=activation, tokens=allowance,
+            ceiling=ceiling,
         )
-    return True
 
 
 def _promote_for_parking(conn: Any, source_task_id: str) -> None:

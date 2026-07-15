@@ -119,19 +119,44 @@ def _plan_action(db: Any, *, logical_key: str, kind: str, payload: dict[str, Any
     )
     return key
 
-def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any], profile: dict[str, Any]) -> str | None:
+
+def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
+                           result: str, summary: str,
+                           process_start_token: str | None,
+                           task_attempt_id: int | None) -> str:
+    """Journal one reaped worker's board transition as a recoverable effect."""
+    store.init_db()
+    logical_key = hashlib.sha256(
+        f"run:{int(run_id)}|task:{task_id}|transition:{result}".encode()
+    ).hexdigest()
+    with store._connect() as db:
+        return _plan_action(
+            db, logical_key=logical_key, kind="worker_task_transition",
+            payload={"run_id": int(run_id), "task_id": task_id, "board": board,
+                     "result": result, "summary": summary,
+                     "process_start_token": process_start_token,
+                     "task_attempt_id": (
+                         int(task_attempt_id) if task_attempt_id is not None else None
+                     )},
+        )
+
+def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any],
+           profile: dict[str, Any], board_day_token_ceiling: int) -> str | None:
     allowance = int(profile["token_allowance"]); budgets = recipe["budgets"]; day = datetime.now(timezone.utc).date().isoformat()
     if instance["activation_count"] + 1 > budgets["max_activations"]: return "activation_fuse"
     count = db.execute("SELECT COUNT(*) FROM recipe_steps WHERE instance_id=? AND step_id=? AND primitive IN ('agent_task','review_gate')", (instance["id"], step["step_id"])).fetchone()[0]
     if count > budgets["max_step_activations"]: return "activation_fuse"
     if instance["tokens_charged"] + allowance > budgets["max_tokens"]: return "instance_budget"
-    daily = db.execute("SELECT COALESCE(SUM(tokens),0) FROM budget_charges WHERE board=? AND utc_day=?", (instance["board"], day)).fetchone()[0]
-    # Config may be absent in direct API tests; a published recipe's max is still enforced.
-    ceiling = int((os.environ.get("FACTORY_BOARD_DAY_TOKEN_CEILING") or 10**18))
-    if daily + allowance > ceiling: return "board_day_budget"
     charge_key = advance_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"], "admit", str(step["activation"]))
-    db.execute("INSERT OR IGNORE INTO budget_charges(key,board,utc_day,instance_id,step_id,activation,tokens,created_at) VALUES(?,?,?,?,?,?,?,?)", (charge_key, instance["board"], day, instance["id"], step["step_id"], step["activation"], allowance, store._now()))
-    if db.execute("SELECT changes()").fetchone()[0]: db.execute("UPDATE recipe_instances SET activation_count=activation_count+1,tokens_charged=tokens_charged+?,updated_at=? WHERE id=?", (allowance, store._now(), instance["id"]))
+    before = db.total_changes
+    if not store.admit_budget_charge(
+        db, key=charge_key, board=instance["board"], utc_day=day,
+        instance_id=instance["id"], step_id=step["step_id"],
+        activation=step["activation"], tokens=allowance,
+        ceiling=board_day_token_ceiling,
+    ):
+        return "board_day_budget"
+    if db.total_changes > before: db.execute("UPDATE recipe_instances SET activation_count=activation_count+1,tokens_charged=tokens_charged+?,updated_at=? WHERE id=?", (allowance, store._now(), instance["id"]))
     return None
 
 def _summary(db: Any, instance: dict[str, Any]) -> str:
@@ -526,7 +551,8 @@ def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, A
     )
     return inserted
 
-def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None,
+              board_day_token_ceiling: int = 10**18) -> dict[str, Any]:
     """Idempotently reconcile every nonterminal activation with kanban/outbox."""
     from hermes_cli import kanban_db
     profiles = profiles or {"standard": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 50000}}
@@ -637,7 +663,10 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     if not profile:
                         changed |= _transition(db, instance, step, "failed", "profile", reason="missing execution profile")
                         continue
-                    fuse = _admit(db, instance, recipe, step, profile)
+                    fuse = _admit(
+                        db, instance, recipe, step, profile,
+                        int(board_day_token_ceiling),
+                    )
                     if fuse:
                         changed |= _transition(db, instance, step, "blocked", "fuse", reason=fuse)
                         db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
@@ -818,6 +847,70 @@ def _execute_action(conn: Any, row: dict[str, Any]) -> tuple[str, dict[str, Any]
 
     payload = json.loads(row["payload_json"])
     kind = row["kind"]
+    if kind == "worker_task_transition":
+        task_id = payload["task_id"]
+        desired = payload["result"]
+        factory_run = store.run_row(int(payload["run_id"]))
+        task_attempt_id = payload.get("task_attempt_id")
+        identity_mismatch = (
+            factory_run is None
+            or factory_run["task_id"] != task_id
+            or factory_run.get("board") != payload.get("board")
+            or factory_run.get("process_start_token") != payload.get("process_start_token")
+            or factory_run.get("task_attempt_id") != task_attempt_id
+            or task_attempt_id is None
+        )
+        if identity_mismatch:
+            return "abandoned", {
+                "task_id": task_id,
+                "probe": "run_identity_mismatch",
+                "run_id": payload.get("run_id"),
+            }, "worker transition run identity missing or mismatched"
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            return "terminal_failed", {"task_id": task_id}, "kanban task missing"
+        status = task.status
+        if desired != "done" and status == "blocked":
+            return "succeeded", {"task_id": task_id, "probe": "already_blocked"}, None
+        if status in KANBAN_TERMINAL:
+            if (desired == "done" and status == "done") or (
+                desired != "done" and status == "blocked"
+            ):
+                return "succeeded", {"task_id": task_id, "probe": f"already_{status}"}, None
+            return "abandoned", {"task_id": task_id, "probe": f"terminal_{status}"}, None
+        if task.current_run_id != int(task_attempt_id):
+            return "abandoned", {
+                "task_id": task_id,
+                "probe": "task_attempt_mismatch",
+                "expected_task_attempt_id": int(task_attempt_id),
+                "observed_task_attempt_id": task.current_run_id,
+            }, "worker transition belongs to a superseded task attempt"
+        if desired == "done":
+            try:
+                changed = kanban_db.complete_task(
+                    conn, task_id, result=payload["summary"], summary=payload["summary"],
+                    expected_run_id=int(task_attempt_id),
+                )
+            except TypeError:
+                changed = kanban_db.complete_task(
+                    conn, task_id, summary=payload["summary"],
+                    expected_run_id=int(task_attempt_id),
+                )
+            expected = "done"
+        else:
+            changed = kanban_db.block_task(
+                conn, task_id, reason=payload["summary"],
+                expected_run_id=int(task_attempt_id),
+            )
+            expected = "blocked"
+        verified = kanban_db.get_task(conn, task_id)
+        if not changed or not verified or verified.status != expected:
+            return "retryable_failed", {
+                "task_id": task_id, "transition_return": bool(changed),
+                "observed_status": getattr(verified, "status", None),
+            }, f"kanban {expected} transition was not verified"
+        conn.commit()
+        return "succeeded", {"task_id": task_id, "probe": f"set_{expected}"}, None
     if kind in {"approval_gate_completion", "triage_root_completion"}:
         task_id = payload["task_id"]
         task = kanban_db.get_task(conn, task_id)
@@ -939,7 +1032,10 @@ def run_action_intents(conn: Any, *, board: str | None = None,
         row = _claim_action(owner=owner, board=board, kinds=kinds, now=store._now())
         if row is None:
             break
-        state, result, error = _execute_action(conn, row)
+        try:
+            state, result, error = _execute_action(conn, row)
+        except Exception as exc:
+            state, result, error = "retryable_failed", {}, str(exc)[:500]
         _record_action_outcome(row, state, result, error)
         if state == "succeeded":
             succeeded += 1
@@ -1229,7 +1325,8 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _finish_event(db, row, "failed", "event_application_failed", str(exc)[:500])
 
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None,
-                 board: str | None = None) -> int:
+                 board: str | None = None,
+                 board_day_token_ceiling: int = 10**18) -> int:
     """Lease queued events one at a time, consume them, and reconcile instances."""
     count = 0
     owner = f"event:{os.getpid()}:{uuid.uuid4().hex}"
@@ -1253,7 +1350,11 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
         conn, board=board,
         kinds={"approval_gate_completion"},
     )
-    for ident in ids: reconcile(conn, ident, profiles=profiles)
+    for ident in ids:
+        reconcile(
+            conn, ident, profiles=profiles,
+            board_day_token_ceiling=board_day_token_ceiling,
+        )
     return count
 
 def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, Any]:
@@ -1289,11 +1390,14 @@ def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, A
             "UPDATE recipe_instances SET status='cancelling',updated_at=? WHERE id=?",
             (store._now(), instance_id),
         )
-    # Factory-owned workers have their own process group and can be signalled by reap records.
-    from shipfactory.spawn import _RUNNING
-    for record in list(_RUNNING.values()):
-        if record["task_id"] in task_ids:
-            try: os.killpg(record["proc"].pid, 15)
+    # Factory-owned workers have their own process group and durable OS identity.
+    from shipfactory.spawn import _process_start_token
+    for record in store.nonterminal_runs():
+        pid = record.get("pid")
+        if (record["task_id"] in task_ids and pid
+                and record.get("process_start_token")
+                and _process_start_token(int(pid)) == record["process_start_token"]):
+            try: os.killpg(int(pid), 15)
             except ProcessLookupError: pass
     result = kanban_db.cancel_subtree(conn, selected, keep_blocked=[instance["collector_task_id"]])
     if result.get("refused"): return {**report, "status": "cancelling", "refused": result["refused"]}

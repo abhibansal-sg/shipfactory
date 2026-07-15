@@ -18,6 +18,11 @@ SELECTOR_DEFAULTS = {
     "max_per_tick": 3,
     "selection_allowance": 5_000,
 }
+RECIPE_RUNTIME_DEFAULTS = {
+    "max_workers": 2,
+    "watchdog_subprocess_timeout_seconds": 120,
+    "watchdog_tick_timeout_seconds": 120,
+}
 
 
 class FactoryConfigError(ValueError):
@@ -194,6 +199,19 @@ def validate(cfg) -> None:
                 or selector[field] < 1
             ):
                 raise FactoryConfigError(f"recipes.selector.{field} must be a positive integer")
+    for field in (
+        "max_workers",
+        "watchdog_subprocess_timeout_seconds",
+        "watchdog_tick_timeout_seconds",
+        "board_day_token_ceiling",
+        "dispatcher_max_in_progress",
+    ):
+        if field in recipes and (
+            not isinstance(recipes[field], int)
+            or isinstance(recipes[field], bool)
+            or recipes[field] < 1
+        ):
+            raise FactoryConfigError(f"recipes.{field} must be a positive integer")
 
 
 def selector_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
@@ -202,7 +220,16 @@ def selector_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
     return {**SELECTOR_DEFAULTS, **configured}
 
 
+def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, int]:
+    """Return validated operator-owned daemon limits with stable defaults."""
+    configured = recipes or {}
+    return {
+        key: int(configured.get(key, default))
+        for key, default in RECIPE_RUNTIME_DEFAULTS.items()
+    }
+
+
 __all__ = [
     "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS", "Seat",
-    "load_seats", "selector_config", "validate",
+    "load_seats", "recipe_runtime_config", "selector_config", "validate",
 ]

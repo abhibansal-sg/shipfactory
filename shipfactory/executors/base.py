@@ -21,7 +21,7 @@ class Executor(ABC):
 
     @abstractmethod
     def parse_usage(self, log_text: str) -> dict:
-        """Return input, output, and total token counts (zero when unknown)."""
+        """Return input, output, and total token counts (``None`` when unknown)."""
 
     @abstractmethod
     def identity_files(self, seat: "Seat", workspace: str) -> None:
@@ -73,13 +73,17 @@ def worktree_git_root(workspace: str) -> str | None:
     return str(gitdir)
 
 
-def token_usage(tokens_in: int = 0, tokens_out: int = 0) -> dict:
-    """Return the canonical Factory usage mapping with non-negative values."""
-    tokens_in, tokens_out = max(0, int(tokens_in)), max(0, int(tokens_out))
+def token_usage(tokens_in: int | None = None, tokens_out: int | None = None) -> dict:
+    """Return canonical usage while preserving absence as unknown."""
+    tokens_in = max(0, int(tokens_in)) if tokens_in is not None else None
+    tokens_out = max(0, int(tokens_out)) if tokens_out is not None else None
     return {
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
-        "tokens_total": tokens_in + tokens_out,
+        "tokens_total": (
+            tokens_in + tokens_out
+            if tokens_in is not None and tokens_out is not None else None
+        ),
     }
 
 

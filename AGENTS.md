@@ -108,6 +108,15 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   telemetry record before raising (finding #31, adversarial lane review
   §2.0.6/#10) — a fail-closed abort must leave a trace, not just a nonzero
   exit code that vanishes with the process.
+- Worker ownership is database-first: persist the run and acquire its
+  `worker_slot` lease before spawn, then bind PID + OS start token. On restart,
+  adopt only an exact token match; a live-looking reused PID is a crashed run.
+- Missing executor usage is `NULL`, never zero. Cost rollups expose known and
+  unknown run counts separately; admission remains backed by non-refundable
+  allowance charges from validated daemon configuration.
+- Reap-driven kanban transitions use `action_intents`. A failed complete/block
+  must leave a retryable attempt visible; direct best-effort board writes are
+  not an acceptable recovery path.
 
 ## Conventions
 
