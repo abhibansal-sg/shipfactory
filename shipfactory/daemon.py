@@ -255,6 +255,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     dispatch_kwargs: dict[str, Any] = {}
     result_recipes = None
     result_selector = None
+    result_environments = None
     cfg = validate_recipe_mode(required=require_recipes)
     max_workers = 2
     if cfg is not None:
@@ -267,6 +268,19 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
         restore = getattr(spawn_module, "restore_running", None)
         if restore is not None:
             restore(max_workers=max_workers)
+        # Environment sessions (SF-8) are reaped every cycle like any other
+        # supervised child — never run their bootstrap/app-up synchronously
+        # here. Lane C modules are optional at plugin import time.
+        try:
+            from shipfactory import environments
+            from shipfactory.config import environment_runtime_config
+            env_cfg = environment_runtime_config(cfg.recipes)
+            environments.restore_materializations()
+            materializations = environments.reap_materializations(env_cfg)
+            apps = environments.tick(env_cfg)
+            result_environments = {"materializations": materializations, "apps": apps["events"]}
+        except ImportError:
+            result_environments = None
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
             from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
@@ -339,6 +353,8 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
         result["recipes"] = result_recipes
     if result_selector is not None:
         result["selector"] = result_selector
+    if result_environments is not None:
+        result["environments"] = result_environments
     # Lane C modules are deliberately optional at plugin import time.
     try:
         from shipfactory import watchdog

@@ -27,6 +27,7 @@ shipfactory/          # the Python package (engine)
 ├── policy.py         # review/approval policy evaluation
 ├── watchdog.py       # stall detection + recovery
 ├── seats_admin.py    # seat CRUD ($HERMES_HOME/shipfactory/seats.yaml)
+├── environments.py   # SF-8: runtime manifest + materialization + app sessions
 └── telemetry.py      # cost/usage JSONL
 recipes/              # recipe definitions (dev-pipeline@N.yaml, templates/)
 dashboard/            # Hermes dashboard plugin (manifest.json, plugin_api.py, dist/)
@@ -122,6 +123,40 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
 - Reap-driven kanban transitions use `action_intents`. A failed complete/block
   must leave a retryable attempt visible; direct best-effort board writes are
   not an acceptable recovery path.
+- Environment sessions (`environments.py`, SF-8): the runtime manifest
+  (`.shipfactory/runtime.yaml`) and every script it references are read from
+  the trusted base commit by git blob SHA and materialized into a
+  Factory-owned scratch root before exec — the candidate workspace is never
+  consulted for script bytes, so a candidate that edits or symlinks its own
+  bootstrap/app-start script after validation has no effect (finding #32).
+  Materialization and app-up both spawn as `start_new_session=True` process
+  groups reaped across daemon ticks, mirroring the A1 worker-slot pattern:
+  DB row inserted (state `materializing`/`starting`, no pid) *before* Popen,
+  pid+OS-start-token attached only after spawn succeeds, so a daemon that
+  dies mid-spawn leaves an unambiguous pid-less row.
+- A daemon restart never optimistically resumes a mid-flight materialization
+  (bootstrap or seed) — it kills the child only if the OS start token still
+  matches (never a blind PID kill) and marks it `failed`, forcing a fresh
+  content-addressed rebuild on next demand. App sessions are adopted instead
+  (state carries over, healthcheck contract re-derived from the pinned
+  manifest, never trusted from a stale DB snapshot) because losing a healthy
+  app on every daemon bounce would be needlessly disruptive; a token
+  mismatch still crashes the row and releases its port lease rather than
+  guessing.
+- Ports are leased through the same A1 `resource_leases` table (`kind='port'`)
+  rather than a parallel table: the specific port number lives in
+  `metadata_json`, and the scan-for-a-free-port + insert happens inside the
+  same `BEGIN IMMEDIATE` writer transaction that already serializes
+  concurrent lease acquisition, so two sessions racing for one port range
+  never double-bind.
+- Testing adoption-after-restart within one pytest process is not the same
+  as a real daemon restart: a genuinely restarted daemon's old children get
+  reparented to init, which reaps zombies immediately, but a test that just
+  clears an in-memory dict is still the process's real OS parent — a killed
+  child sits as a zombie that still answers `ps`/`psutil` identity probes
+  with its original (still-matching) start token. Tests simulating this
+  must opportunistically `os.waitpid(-1, os.WNOHANG)` in their poll loop,
+  or they'll see a supposedly-dead process reported as still alive.
 
 ## Conventions
 

@@ -192,6 +192,65 @@ _PLANNING_BUDGET_MIGRATION_STATEMENTS = (
 _PLANNING_BUDGET_MIGRATION_TEXT = ";\n".join(
     _PLANNING_BUDGET_MIGRATION_STATEMENTS
 ) + ";\n"
+
+_ENVIRONMENT_SESSION_MIGRATION_STATEMENTS = (
+    """CREATE TABLE env_sessions (
+    id                    TEXT PRIMARY KEY,
+    key                   TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    candidate_sha         TEXT,
+    manifest_path         TEXT NOT NULL,
+    manifest_blob_sha     TEXT NOT NULL,
+    tracked_input_hash    TEXT NOT NULL,
+    workspace_path        TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    pid                   INTEGER,
+    process_start_token   TEXT,
+    control_plane_risk    INTEGER NOT NULL DEFAULT 0,
+    control_plane_paths   TEXT,
+    lease_key             TEXT,
+    stdout_path           TEXT,
+    stderr_path           TEXT,
+    created_at            TEXT NOT NULL,
+    started_at            TEXT,
+    finished_at           TEXT,
+    last_error            TEXT
+)""",
+    "CREATE INDEX idx_env_sessions_key ON env_sessions(key, created_at)",
+    """CREATE TABLE app_sessions (
+    id                    TEXT PRIMARY KEY,
+    env_session_id        TEXT NOT NULL,
+    request_key           TEXT NOT NULL,
+    workspace_path        TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    pid                   INTEGER,
+    process_start_token   TEXT,
+    port                  INTEGER,
+    port_lease_key        TEXT,
+    app_url               TEXT,
+    health_status         TEXT,
+    stdout_path           TEXT,
+    stderr_path           TEXT,
+    created_at            TEXT NOT NULL,
+    started_at            TEXT,
+    healthy_at            TEXT,
+    stopping_at           TEXT,
+    stopped_at            TEXT,
+    last_error            TEXT,
+    UNIQUE(request_key)
+)""",
+    "CREATE INDEX idx_app_sessions_state ON app_sessions(state)",
+)
+_ENVIRONMENT_SESSION_MIGRATION_TEXT = ";\n".join(_ENVIRONMENT_SESSION_MIGRATION_STATEMENTS) + ";\n"
+_ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS = (
+    "ALTER TABLE env_sessions ADD COLUMN network_enforcement_level TEXT",
+    "ALTER TABLE env_sessions ADD COLUMN output_cap_exceeded INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE app_sessions ADD COLUMN network_enforcement_level TEXT",
+    "ALTER TABLE app_sessions ADD COLUMN output_cap_exceeded INTEGER NOT NULL DEFAULT 0",
+)
+_ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT = (
+    ";\n".join(_ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -199,6 +258,8 @@ _MIGRATIONS = (
     (4, "sf5_artifact_revision_identity", _ARTIFACT_MIGRATION_TEXT),
     (5, "sf5_instance_base_identity", _INSTANCE_BASE_MIGRATION_TEXT),
     (6, "sf6_named_token_pool_charges", _PLANNING_BUDGET_MIGRATION_TEXT),
+    (7, "sf8_environment_sessions", _ENVIRONMENT_SESSION_MIGRATION_TEXT),
+    (8, "sf8_environment_enforcement_and_caps", _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -207,6 +268,8 @@ _MIGRATION_STATEMENTS = {
     4: _ARTIFACT_MIGRATION_STATEMENTS,
     5: _INSTANCE_BASE_MIGRATION_STATEMENTS,
     6: _PLANNING_BUDGET_MIGRATION_STATEMENTS,
+    7: _ENVIRONMENT_SESSION_MIGRATION_STATEMENTS,
+    8: _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS,
 }
 
 
@@ -364,7 +427,7 @@ def init_db() -> None:
                     migration_artifacts = bool(
                         {"base_sha", "updated_base_at"} & instance_columns
                     )
-                else:
+                elif version == 6:
                     charge_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(budget_charges)"
                     )}
@@ -374,6 +437,21 @@ def init_db() -> None:
                     migration_artifacts = bool(
                         "token_pool" in charge_columns
                         or "idx_budget_charges_pool" in indexes
+                    )
+                elif version == 7:
+                    migration_artifacts = bool(
+                        {"env_sessions", "app_sessions"} & existing_tables
+                    )
+                else:
+                    env_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(env_sessions)"
+                    )}
+                    app_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(app_sessions)"
+                    )}
+                    migration_artifacts = bool(
+                        {"network_enforcement_level", "output_cap_exceeded"}
+                        & (env_columns | app_columns)
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -858,6 +936,255 @@ def release_resource_lease(key: str) -> bool:
         ).rowcount == 1
 
 
+def acquire_port_lease(port_min: int, port_max: int, *, key: str, lease_seconds: int = 300,
+                       instance_id: str | None = None, step_id: str | None = None,
+                       activation: int | None = None,
+                       metadata: dict[str, Any] | None = None) -> int | None:
+    """Atomically bind one free port in ``[port_min, port_max]`` as a lease.
+
+    Reuses ``resource_leases`` (kind='port') so expiry/renewal/release share
+    the A1 governor rather than a parallel bookkeeping table. Unlike
+    ``acquire_resource_lease`` this must pick a specific port number, so the
+    scan-and-insert happens under the same ``BEGIN IMMEDIATE`` writer lock
+    that already serializes concurrent lease acquisition.
+    """
+    init_db()
+    port_min, port_max = int(port_min), int(port_max)
+    if port_min < 1 or port_max < port_min:
+        return None
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_until = (now_dt + timedelta(seconds=int(lease_seconds))).isoformat()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE resource_leases SET state='expired',released_at=? "
+            "WHERE state='active' AND lease_until IS NOT NULL AND lease_until<=?",
+            (now, now),
+        )
+        existing = conn.execute(
+            "SELECT state,metadata_json FROM resource_leases WHERE key=?", (key,),
+        ).fetchone()
+        if existing and existing["state"] == "active":
+            try:
+                port = int(json.loads(existing["metadata_json"])["port"])
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                return None
+            conn.execute(
+                "UPDATE resource_leases SET lease_until=? WHERE key=?",
+                (lease_until, key),
+            )
+            return port
+        used_ports: set[int] = set()
+        for row in conn.execute(
+            "SELECT metadata_json FROM resource_leases WHERE kind='port' AND state='active'"
+        ):
+            try:
+                used_ports.add(int(json.loads(row["metadata_json"])["port"]))
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+        port = next((p for p in range(port_min, port_max + 1) if p not in used_ports), None)
+        if port is None:
+            return None
+        meta = dict(metadata or {})
+        meta["port"] = port
+        conn.execute(
+            "INSERT INTO resource_leases(key,kind,units,instance_id,step_id,activation,state,"
+            "lease_until,metadata_json,created_at,released_at) VALUES(?,'port',1,?,?,?,'active',?,?,?,NULL)",
+            (key, instance_id, step_id, activation, lease_until,
+             json.dumps(meta, sort_keys=True), now),
+        )
+        return port
+
+
+def insert_env_session(id: str, *, key: str, base_sha: str, candidate_sha: str | None,
+                       manifest_path: str, manifest_blob_sha: str, tracked_input_hash: str,
+                       workspace_path: str, control_plane_risk: bool,
+                       control_plane_paths: list[str], lease_key: str | None,
+                       stdout_path: str | None, stderr_path: str | None) -> None:
+    """Persist a new materialization row before any bootstrap child spawns."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO env_sessions(id,key,base_sha,candidate_sha,manifest_path,"
+            "manifest_blob_sha,tracked_input_hash,workspace_path,state,control_plane_risk,"
+            "control_plane_paths,lease_key,stdout_path,stderr_path,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'materializing',?,?,?,?,?,?)",
+            (id, key, base_sha, candidate_sha, manifest_path, manifest_blob_sha,
+             tracked_input_hash, workspace_path, int(bool(control_plane_risk)),
+             json.dumps(sorted(control_plane_paths), sort_keys=True), lease_key,
+             stdout_path, stderr_path, _now()),
+        )
+
+
+def env_session_row(id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM env_sessions WHERE id=?", (id,)).fetchone()
+    return dict(row) if row else None
+
+
+def latest_env_session_for_key(key: str) -> dict[str, Any] | None:
+    """Return the most recent materialization row for a content-addressed key."""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM env_sessions WHERE key=? ORDER BY created_at DESC,id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_env_session_pid(id: str, pid: int) -> None:
+    """Persist the child pid the instant ``Popen`` returns.
+
+    Split from the start-token write (``mark_env_session_token``) so a
+    daemon crash during the up-to-two-second OS start-token observation
+    window still leaves the pid durable — recovery can then verify/kill the
+    real child instead of leaking an untracked orphan (review finding #2).
+    """
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE env_sessions SET pid=?,started_at=? WHERE id=? AND state='materializing'",
+            (int(pid), _now(), id),
+        ).rowcount
+        if changed != 1:
+            raise ValueError(f"unknown or terminal env_session {id}")
+
+
+def mark_env_session_token(id: str, token: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE env_sessions SET process_start_token=? WHERE id=?", (token, id),
+        )
+
+
+def update_env_session_network_enforcement(id: str, level: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE env_sessions SET network_enforcement_level=? WHERE id=?", (level, id),
+        )
+
+
+def mark_env_session_output_capped(id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE env_sessions SET output_cap_exceeded=1 WHERE id=?", (id,))
+
+
+def update_env_session_state(id: str, state: str, *, last_error: str | None = None) -> None:
+    terminal = state in {"ready", "failed"}
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE env_sessions SET state=?,last_error=?,finished_at=CASE WHEN ? THEN ? ELSE finished_at END "
+            "WHERE id=?",
+            (state, last_error, terminal, _now() if terminal else None, id),
+        )
+
+
+def nonterminal_env_sessions() -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        return _rows(conn.execute("SELECT * FROM env_sessions WHERE state='materializing'"))
+
+
+def insert_app_session(id: str, *, env_session_id: str, request_key: str, workspace_path: str,
+                       stdout_path: str | None, stderr_path: str | None) -> dict[str, Any]:
+    """Idempotently persist an app-session request keyed by ``request_key``."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO app_sessions(id,env_session_id,request_key,workspace_path,"
+            "state,stdout_path,stderr_path,created_at) VALUES(?,?,?,?,'starting',?,?,?)",
+            (id, env_session_id, request_key, workspace_path, stdout_path, stderr_path, _now()),
+        )
+        row = conn.execute(
+            "SELECT * FROM app_sessions WHERE request_key=?", (request_key,),
+        ).fetchone()
+    return dict(row)
+
+
+def app_session_row(id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM app_sessions WHERE id=?", (id,)).fetchone()
+    return dict(row) if row else None
+
+
+def app_session_by_request_key(request_key: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM app_sessions WHERE request_key=?", (request_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_app_session_bound(id: str, *, port: int, port_lease_key: str, app_url: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET port=?,port_lease_key=?,app_url=? WHERE id=?",
+            (int(port), port_lease_key, app_url, id),
+        )
+
+
+def mark_app_session_pid(id: str, pid: int) -> None:
+    """Persist the child pid the instant ``Popen`` returns (see finding #2)."""
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE app_sessions SET pid=?,started_at=? "
+            "WHERE id=? AND state IN ('starting','stopping')",
+            (int(pid), _now(), id),
+        ).rowcount
+        if changed != 1:
+            raise ValueError(f"unknown or terminal app_session {id}")
+
+
+def mark_app_session_token(id: str, token: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET process_start_token=? WHERE id=?", (token, id),
+        )
+
+
+def update_app_session_network_enforcement(id: str, level: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET network_enforcement_level=? WHERE id=?", (level, id),
+        )
+
+
+def mark_app_session_output_capped(id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE app_sessions SET output_cap_exceeded=1 WHERE id=?", (id,))
+
+
+def update_app_session_state(id: str, state: str, *, health_status: str | None = None,
+                             last_error: str | None = None) -> None:
+    now = _now()
+    stopping_at = now if state == "stopping" else None
+    stopped_at = now if state in {"stopped", "crashed"} else None
+    healthy_at = now if state == "healthy" else None
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET state=?,"
+            "health_status=COALESCE(?,health_status),"
+            "last_error=COALESCE(?,last_error),"
+            "healthy_at=COALESCE(?,healthy_at),"
+            "stopping_at=COALESCE(?,stopping_at),"
+            "stopped_at=COALESCE(?,stopped_at) "
+            "WHERE id=?",
+            (state, health_status, last_error, healthy_at, stopping_at, stopped_at, id),
+        )
+
+
+def nonterminal_app_sessions() -> list[dict[str, Any]]:
+    init_db()
+    with _connect() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM app_sessions WHERE state IN ('starting','healthy','stopping')"
+        ))
+
+
 def admit_budget_charge(db: sqlite3.Connection, *, key: str, board: str, utc_day: str, instance_id: str,
                         step_id: str, activation: int, tokens: int,
                         ceiling: int, token_pool: str | None = None) -> bool:
@@ -902,4 +1229,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "run_row", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "admit_budget_charge", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "run_row", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]

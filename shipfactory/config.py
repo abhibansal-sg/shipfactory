@@ -24,6 +24,19 @@ RECIPE_RUNTIME_DEFAULTS = {
     "watchdog_tick_timeout_seconds": 120,
     "artifact_max_bytes": 2 * 1024 * 1024,
 }
+ENVIRONMENT_RUNTIME_DEFAULTS = {
+    "manifest_path": ".shipfactory/runtime.yaml",
+    "port_min": 19000,
+    "port_max": 19031,
+    "max_sessions": 1,
+    "bootstrap_timeout_seconds": 600,
+    "startup_timeout_seconds": 90,
+    "shutdown_timeout_seconds": 15,
+    "max_output_bytes": 10485760,
+    "default_network": "deny",
+    "healthcheck_timeout_seconds": 2,
+    "healthcheck_probe_concurrency": 8,
+}
 
 
 class FactoryConfigError(ValueError):
@@ -214,6 +227,36 @@ def validate(cfg) -> None:
             or recipes[field] < 1
         ):
             raise FactoryConfigError(f"recipes.{field} must be a positive integer")
+    runtime = recipes.get("runtime", {}) or {}
+    if not isinstance(runtime, dict) or set(runtime) - set(ENVIRONMENT_RUNTIME_DEFAULTS):
+        raise FactoryConfigError("recipes.runtime has unknown keys")
+    for field in (
+        "port_min", "port_max", "max_sessions", "bootstrap_timeout_seconds",
+        "startup_timeout_seconds", "shutdown_timeout_seconds", "max_output_bytes",
+        "healthcheck_timeout_seconds", "healthcheck_probe_concurrency",
+    ):
+        if field in runtime and (
+            not isinstance(runtime[field], int)
+            or isinstance(runtime[field], bool)
+            or runtime[field] < 1
+        ):
+            raise FactoryConfigError(f"recipes.runtime.{field} must be a positive integer")
+    if "manifest_path" in runtime and (
+        not isinstance(runtime["manifest_path"], str) or not runtime["manifest_path"]
+    ):
+        raise FactoryConfigError("recipes.runtime.manifest_path must be a non-empty string")
+    if "default_network" in runtime and runtime["default_network"] not in ("allow", "deny"):
+        raise FactoryConfigError("recipes.runtime.default_network must be allow or deny")
+    if int(runtime.get("port_max", ENVIRONMENT_RUNTIME_DEFAULTS["port_max"])) < int(
+        runtime.get("port_min", ENVIRONMENT_RUNTIME_DEFAULTS["port_min"])
+    ):
+        raise FactoryConfigError("recipes.runtime.port_max must be >= port_min")
+
+
+def environment_runtime_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
+    """Return validated operator-owned environment-session limits (§2.1.1)."""
+    configured = dict(((recipes or {}).get("runtime", {}) or {}))
+    return {**ENVIRONMENT_RUNTIME_DEFAULTS, **configured}
 
 
 def selector_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
@@ -232,6 +275,8 @@ def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, int]:
 
 
 __all__ = [
-    "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS", "Seat",
-    "load_seats", "recipe_runtime_config", "selector_config", "validate",
+    "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS",
+    "ENVIRONMENT_RUNTIME_DEFAULTS", "Seat",
+    "load_seats", "recipe_runtime_config", "environment_runtime_config",
+    "selector_config", "validate",
 ]
