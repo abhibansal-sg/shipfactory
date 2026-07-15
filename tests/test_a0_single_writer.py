@@ -13,6 +13,18 @@ from pathlib import Path
 
 import pytest
 
+# Spawn-child import determinism: multiprocessing children re-execute this
+# module. If the checkout's PARENT directory appears on the child's sys.path
+# and the repo directory is itself named 'shipfactory' (it is, on the main
+# checkout), `import shipfactory` resolves to the repo-root PLUGIN SHIM
+# __init__.py instead of the inner package and dies on a circular import.
+# Pin the repo root ahead of everything so the inner package always wins.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if sys.path[0] != _REPO_ROOT:
+    if _REPO_ROOT in sys.path:
+        sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
+
 from shipfactory import daemon, policy, store
 from shipfactory.cli import _recipe_gate
 from shipfactory.recipes import advancer
