@@ -10,8 +10,11 @@ import re
 import stat
 import subprocess
 import uuid
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
+
+import yaml
 
 from shipfactory import store
 
@@ -103,9 +106,10 @@ def _validate_exploration(document: dict[str, Any]) -> None:
             raise ArtifactValidationError(f"{schema} field {field} must be a git hash")
     if not isinstance(document["references"], list):
         raise ArtifactValidationError(f"{schema} references must be a list")
-    _string_list(document, schema, ("constraints", "untrusted_directives", "unknowns"))
-    if not isinstance(document["direct_callers"], list):
-        raise ArtifactValidationError(f"{schema} direct_callers must be a list")
+    _string_list(
+        document, schema,
+        ("direct_callers", "constraints", "untrusted_directives", "unknowns"),
+    )
     statuses = {"existing", "proposed", "generated", "external"}
     for index, reference in enumerate(document["references"]):
         if not isinstance(reference, dict) or reference.get("status") not in statuses:
@@ -182,6 +186,79 @@ def _validate_task_spec(document: dict[str, Any]) -> None:
         ids.add(requirement["id"])
 
 
+def _plan_path(value: Any, *, label: str) -> str:
+    """Return a normalized repository-relative plan path or glob."""
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ArtifactValidationError(f"{label} must be a repository-relative path")
+    parsed = PurePosixPath(value)
+    if (parsed.is_absolute() or not parsed.parts or ".." in parsed.parts
+            or parsed.parts[0] == ".git"):
+        raise ArtifactValidationError(f"{label} must be a repository-relative path")
+    return parsed.as_posix()
+
+
+def _scope_prefix(path: str) -> str:
+    wildcard = min((path.find(char) for char in "*[" if char in path), default=-1)
+    return path if wildcard < 0 else path[:wildcard].rstrip("/")
+
+
+def _write_scopes_overlap(left: str, right: str) -> bool:
+    """Conservatively identify write scopes that can name the same path."""
+    if left == right or fnmatchcase(left, right) or fnmatchcase(right, left):
+        return True
+    left_prefix = _scope_prefix(left).rstrip("/")
+    right_prefix = _scope_prefix(right).rstrip("/")
+    if not left_prefix or not right_prefix:
+        return True
+    return (
+        left_prefix == right_prefix
+        or left_prefix.startswith(right_prefix + "/")
+        or right_prefix.startswith(left_prefix + "/")
+    )
+
+
+def _overlap_is_declared(declarations: set[str], left: str, right: str) -> bool:
+    return any(
+        declaration in {left, right}
+        or (_write_scopes_overlap(declaration, left)
+            and _write_scopes_overlap(declaration, right))
+        for declaration in declarations
+    )
+
+
+def _has_high_risk_tag(node: dict[str, Any]) -> bool:
+    normalized = {tag.strip().lower().replace("_", "-") for tag in node["risk_tags"]}
+    return "control-plane" in normalized or "high-risk" in normalized
+
+
+def _static_control_path(path: str) -> bool:
+    lowered = path.lower()
+    parts = PurePosixPath(lowered).parts
+    name = parts[-1] if parts else ""
+    stem = name.rsplit(".", 1)[0]
+    return (
+        lowered == ".shipfactory" or lowered.startswith(".shipfactory/")
+        or lowered == ".github/workflows" or lowered.startswith(".github/workflows/")
+        or "policy" in parts or stem in {"policy", "verification", "verify"}
+        or any(part in {"deploy", "deployment", "deployments"} for part in parts)
+        or stem.startswith("deploy")
+    )
+
+
+def _node_control_reason(
+    node: dict[str, Any], runtime_control_paths: set[str] | None = None,
+) -> str | None:
+    kind = node["kind"].strip().lower().replace("_", "-")
+    if kind in {"deploy", "deployment", "release"} or kind.startswith("deployment-"):
+        return f"deployment kind {node['kind']!r}"
+    for path in node["allowed_paths"]:
+        if _static_control_path(path):
+            return f"control path {path!r}"
+        if any(_write_scopes_overlap(path, control) for control in runtime_control_paths or ()):
+            return f"runtime-manifest script {path!r}"
+    return None
+
+
 def _validate_plan(document: dict[str, Any]) -> None:
     schema = "shipfactory.plan/v1"
     required = {
@@ -197,12 +274,13 @@ def _validate_plan(document: dict[str, Any]) -> None:
     if not isinstance(document["nodes"], list):
         raise ArtifactValidationError(f"{schema} nodes must be a list")
     nodes: dict[str, dict[str, Any]] = {}
-    node_keys = {
+    required_node_keys = {
         "id", "title", "needs", "kind", "requirements", "allowed_paths",
         "expected_outputs", "test_cases", "risk_tags",
     }
     for node in document["nodes"]:
-        if not isinstance(node, dict) or set(node) != node_keys:
+        if (not isinstance(node, dict)
+                or set(node) not in (required_node_keys, required_node_keys | {"budget"})):
             raise ArtifactValidationError(f"{schema} has invalid node shape")
         if (not isinstance(node["id"], str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", node["id"])
                 or node["id"] in nodes
@@ -212,7 +290,36 @@ def _validate_plan(document: dict[str, Any]) -> None:
         for field in ("needs", "requirements", "allowed_paths", "expected_outputs", "test_cases", "risk_tags"):
             if not isinstance(node[field], list) or not all(isinstance(x, str) for x in node[field]):
                 raise ArtifactValidationError(f"{schema} node {node['id']} field {field} is invalid")
+        if any(not value for field in ("allowed_paths", "expected_outputs", "test_cases")
+               for value in node[field]):
+            raise ArtifactValidationError(
+                f"{schema} node {node['id']} path/output/test fields must be nonempty strings"
+            )
+        node["allowed_paths"] = [
+            _plan_path(
+                path, label=f"{schema} node {node['id']} allowed_paths entry",
+            )
+            for path in node["allowed_paths"]
+        ]
+        if "budget" in node:
+            budget = node["budget"]
+            if (not isinstance(budget, dict)
+                    or set(budget) != {"token_pool", "tokens"}
+                    or not isinstance(budget["token_pool"], str)
+                    or not budget["token_pool"]
+                    or not isinstance(budget["tokens"], int)
+                    or isinstance(budget["tokens"], bool)
+                    or budget["tokens"] < 1):
+                raise ArtifactValidationError(
+                    f"{schema} node {node['id']} budget must contain a nonempty "
+                    "token_pool and positive integer tokens"
+                )
         nodes[node["id"]] = node
+    budgeted = {node_id for node_id, node in nodes.items() if "budget" in node}
+    if budgeted and budgeted != set(nodes):
+        raise ArtifactValidationError(
+            f"{schema} every node must declare budget when any node declares budget"
+        )
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -238,8 +345,43 @@ def _validate_plan(document: dict[str, Any]) -> None:
     if (len(set(document["integration_order"])) != len(document["integration_order"])
             or any(node_id not in nodes for node_id in document["integration_order"])):
         raise ArtifactValidationError(f"{schema} integration_order has unknown nodes")
-    if not isinstance(document["shared_file_overlaps"], list):
-        raise ArtifactValidationError(f"{schema} shared_file_overlaps must be a list")
+    _string_list(document, schema, ("shared_file_overlaps",))
+    overlaps = [
+        _plan_path(path, label=f"{schema} shared_file_overlaps entry")
+        for path in document["shared_file_overlaps"]
+    ]
+    if len(set(overlaps)) != len(overlaps):
+        raise ArtifactValidationError(f"{schema} shared_file_overlaps has duplicates")
+    declarations = set(overlaps)
+    observed: list[tuple[str, str]] = []
+    ordered_nodes = list(nodes.values())
+    for index, left_node in enumerate(ordered_nodes):
+        for right_node in ordered_nodes[index + 1:]:
+            for left_path in left_node["allowed_paths"]:
+                for right_path in right_node["allowed_paths"]:
+                    if not _write_scopes_overlap(left_path, right_path):
+                        continue
+                    observed.append((left_path, right_path))
+                    if not _overlap_is_declared(declarations, left_path, right_path):
+                        raise ArtifactValidationError(
+                            f"{schema} undeclared write overlap {left_path!r} between "
+                            f"nodes {left_node['id']!r} and {right_node['id']!r}; "
+                            "declare it in shared_file_overlaps"
+                        )
+    for declaration in declarations:
+        if not any(_overlap_is_declared({declaration}, left, right)
+                   for left, right in observed):
+            raise ArtifactValidationError(
+                f"{schema} shared_file_overlaps entry {declaration!r} "
+                "does not identify a node overlap"
+            )
+    for node in nodes.values():
+        reason = _node_control_reason(node)
+        if reason and not _has_high_risk_tag(node):
+            raise ArtifactValidationError(
+                f"{schema} node {node['id']} touches {reason} without a "
+                "control-plane or high-risk tag"
+            )
 
 
 _VALIDATORS = {
@@ -591,11 +733,115 @@ def _latest_sealed(db: Any, instance_id: str, kind: str) -> dict[str, Any] | Non
     return dict(row) if row else None
 
 
-def _validate_plan_context(document: dict[str, Any], instance_id: str) -> None:
-    """Validate plan coverage and revision binding against sealed inputs."""
+def _trusted_runtime_control_paths(workspace: Path, base_sha: str) -> set[str]:
+    """Read executable paths from the trusted runtime manifest, when present."""
+    try:
+        data = subprocess.check_output(
+            ["git", "show", f"{base_sha}:.shipfactory/runtime.yaml"],
+            cwd=workspace, stderr=subprocess.PIPE, timeout=10,
+        )
+    except subprocess.CalledProcessError:
+        return set()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(
+            f"runtime manifest inspection unavailable: {exc}"
+        ) from exc
+    try:
+        manifest = yaml.safe_load(data)
+    except yaml.YAMLError as exc:
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 trusted runtime manifest is invalid"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 trusted runtime manifest is not a mapping"
+        )
+    def manifest_value(section: str, field: str) -> Any:
+        value = manifest.get(section)
+        return value.get(field) if isinstance(value, dict) else None
+
+    argv_values = (
+        manifest_value("bootstrap", "argv"),
+        manifest_value("app", "start_argv"),
+        manifest_value("seed", "argv"),
+    )
+    paths: set[str] = set()
+    for argv in argv_values:
+        if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+            continue
+        executable = argv[0]
+        # Bare commands are supplied by the trusted environment, not repository
+        # scripts a plan can rewrite.
+        if "/" not in executable:
+            continue
+        paths.add(_repository_path(executable, label="runtime manifest script"))
+    return paths
+
+
+def _validate_plan_budget(
+    document: dict[str, Any], instance: dict[str, Any], recipe: dict[str, Any], db: Any,
+) -> None:
+    """Reject declared first-activation reservations that cannot be admitted."""
+    declarations = [node["budget"] for node in document["nodes"] if "budget" in node]
+    if not declarations:
+        return
+    budgets = recipe.get("budgets", {})
+    if recipe.get("schema") != "shipfactory.recipe/v2":
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 node budgets require a v2 recipe instance"
+        )
+    remaining_activations = int(budgets["max_activations"]) - int(instance["activation_count"])
+    if len(declarations) > remaining_activations:
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 budget infeasible: declared node first activations "
+            f"{len(declarations)} exceed instance remaining activations "
+            f"{remaining_activations}"
+        )
+    declared_total = sum(int(item["tokens"]) for item in declarations)
+    remaining_total = int(budgets["max_tokens"]) - int(instance["tokens_charged"])
+    if declared_total > remaining_total:
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 budget infeasible: declared node tokens "
+            f"{declared_total} exceed instance remaining tokens {remaining_total}"
+        )
+    declared_by_pool: dict[str, int] = {}
+    for item in declarations:
+        pool = item["token_pool"]
+        if pool not in budgets["token_pools"]:
+            raise ArtifactValidationError(
+                f"shipfactory.plan/v1 budget infeasible: unknown token pool {pool!r}"
+            )
+        declared_by_pool[pool] = declared_by_pool.get(pool, 0) + int(item["tokens"])
+    for pool, declared in sorted(declared_by_pool.items()):
+        charged = int(db.execute(
+            "SELECT COALESCE(SUM(tokens),0) FROM budget_charges "
+            "WHERE instance_id=? AND token_pool=?",
+            (instance["id"], pool),
+        ).fetchone()[0])
+        remaining = int(budgets["token_pools"][pool]) - charged
+        if declared > remaining:
+            raise ArtifactValidationError(
+                f"shipfactory.plan/v1 budget infeasible: token pool {pool!r} "
+                f"declares {declared} tokens but only {remaining} remain"
+            )
+
+
+def _validate_plan_context(
+    document: dict[str, Any], instance_id: str, workspace: Path,
+) -> None:
+    """Validate plan coverage, risk, budget, and revision binding."""
     with store._connect() as db:
         task_spec = _latest_sealed(db, instance_id, "task-spec")
         exploration = _latest_sealed(db, instance_id, "exploration")
+        instance_row = db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone()
+        if instance_row is None:
+            raise ArtifactValidationError("shipfactory.plan/v1 requires a recipe instance")
+        instance = dict(instance_row)
+        from shipfactory.recipes.instantiate import recipe_for_instance
+        recipe = recipe_for_instance(instance).document
+        _validate_plan_budget(document, instance, recipe, db)
     if task_spec is None:
         raise ArtifactValidationError("shipfactory.plan/v1 requires a sealed task-spec")
     if document["task_spec_sha256"].lower() != str(task_spec["sha256"]).lower():
@@ -607,6 +853,14 @@ def _validate_plan_context(document: dict[str, Any], instance_id: str) -> None:
         raise ArtifactValidationError(
             "shipfactory.plan/v1 base_sha differs from exploration or task-spec"
         )
+    runtime_control_paths = _trusted_runtime_control_paths(workspace, document["base_sha"])
+    for node in document["nodes"]:
+        reason = _node_control_reason(node, runtime_control_paths)
+        if reason and not _has_high_risk_tag(node):
+            raise ArtifactValidationError(
+                f"shipfactory.plan/v1 node {node['id']} touches {reason} without a "
+                "control-plane or high-risk tag"
+            )
     spec = artifact_document(task_spec)
     requirement_ids = {item["id"] for item in spec["requirements"]}
     covered: set[str] = set()
@@ -682,7 +936,7 @@ def seal_artifact(
         if kind == "exploration":
             _validate_exploration_repository(document, worktree)
         elif kind == "plan":
-            _validate_plan_context(document, instance_id)
+            _validate_plan_context(document, instance_id, worktree)
         sealed_path = _storage_path(instance_id, step_id, activation, kind)
     except ArtifactSealError:
         # Operational failures keep the durable candidate row retryable.

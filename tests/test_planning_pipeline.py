@@ -12,7 +12,7 @@ import pytest
 
 from shipfactory import store
 from shipfactory.artifacts import seal_artifact
-from shipfactory.recipes.advancer import reconcile
+from shipfactory.recipes.advancer import apply_events, reconcile, release_review_stall
 from shipfactory.recipes.instantiate import instantiate
 from shipfactory.recipes.loader import load_library
 
@@ -174,6 +174,35 @@ def _advance_to_spec_attack(
     return repo, base_sha
 
 
+def _advance_to_plan_draft(
+    tmp_path: Path, conn, instance_id: str,
+) -> tuple[Path, str, dict, dict]:
+    repo, base_sha = _advance_to_spec_attack(tmp_path, conn, instance_id)
+    spec_attack = _step(instance_id, "spec-attack")
+    _complete_review(conn, spec_attack["kanban_task_id"], "approve")
+    reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
+    with store._connect() as db:
+        task_spec = dict(db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND kind='task-spec'",
+            (instance_id,),
+        ).fetchone())
+    recipe = load_library(ROOT / "recipes", persist=False).get("dev-pipeline@5")
+    return repo, base_sha, task_spec, recipe.document["steps"][3]["outputs"][0]
+
+
+def _seal_plan_candidate(
+    repo: Path, instance_id: str, base_sha: str, task_spec: dict,
+    output: dict, mutate,
+):
+    document = _plan(base_sha, task_spec["sha256"])
+    mutate(document)
+    _candidate(repo, ".shipfactory-output/plan.json", document)
+    return seal_artifact(
+        instance_id=instance_id, step_id="plan-draft", activation=1, run_id=3,
+        output=output, workspace=repo, producer="run:3",
+    )
+
+
 def test_dev_pipeline_5_loads_and_published_predecessors_are_byte_pinned():
     for version, expected in PUBLISHED_SHA256.items():
         assert hashlib.sha256(
@@ -213,6 +242,21 @@ def test_exploration_existing_path_must_exist_at_base_sha(tmp_path):
         )
 
 
+def test_exploration_direct_callers_rejects_non_string_members(tmp_path):
+    repo, base_sha, tree_sha = _repo(tmp_path)
+    document = _exploration(base_sha, tree_sha)
+    document["direct_callers"] = [{"symbol": "caller"}, 12345, None]
+    _candidate(repo, ".shipfactory-output/exploration.json", document)
+    with pytest.raises(ValueError, match="direct_callers must be a string list"):
+        seal_artifact(
+            instance_id="bad-direct-callers", step_id="explore", activation=1,
+            run_id=1, output={
+                "kind": "exploration", "schema": "shipfactory.exploration/v1",
+                "path": ".shipfactory-output/exploration.json",
+            }, workspace=repo, producer="run:1",
+        )
+
+
 def test_spec_approval_is_blocked_while_clarifications_are_nonempty(tmp_path, kanban_conn):
     _advance_to_spec_attack(
         tmp_path, kanban_conn, "clarifications", clarifications=["Which API is authoritative?"],
@@ -226,6 +270,109 @@ def test_spec_approval_is_blocked_while_clarifications_are_nonempty(tmp_path, ka
             "SELECT status,blocked_reason FROM recipe_instances WHERE id='clarifications'"
         ).fetchone()
     assert tuple(instance) == ("blocked", "clarifications_nonempty")
+
+
+def test_operator_release_recovers_clarifications_with_fresh_spec_activation(
+    tmp_path, kanban_conn,
+):
+    _advance_to_spec_attack(
+        tmp_path, kanban_conn, "clarification-release",
+        clarifications=["Which API is authoritative?"],
+    )
+    gate = _step("clarification-release", "spec-attack")
+    _complete_review(kanban_conn, gate["kanban_task_id"], "approve")
+    reconcile(kanban_conn, "clarification-release", profiles=PIPELINE_PROFILES)
+    assert gate["activation"] == 1
+    assert _step("clarification-release", "spec-attack")["blocked_reason"] == "clarifications_nonempty"
+
+    key = release_review_stall(
+        "clarification-release", "spec-attack",
+        "operator requests a clarified specification",
+    )
+    with store._connect() as db:
+        queued = db.execute(
+            "SELECT state FROM advance_events WHERE key=?", (key,),
+        ).fetchone()
+        fresh_before_apply = db.execute(
+            "SELECT 1 FROM recipe_steps WHERE instance_id='clarification-release' "
+            "AND step_id='spec-draft' AND activation=2"
+        ).fetchone()
+    assert queued["state"] == "pending"
+    assert fresh_before_apply is None
+
+    apply_events(kanban_conn, profiles=PIPELINE_PROFILES)
+    assert _step("clarification-release", "spec-draft", 2)["state"] == "running"
+    assert _step("clarification-release", "spec-attack", 2)["state"] == "pending"
+    with store._connect() as db:
+        applied = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?", (key,),
+        ).fetchone()
+        instance = db.execute(
+            "SELECT status,blocked_reason FROM recipe_instances "
+            "WHERE id='clarification-release'"
+        ).fetchone()
+    assert tuple(applied) == ("applied", "clarifications_nonempty_released")
+    assert tuple(instance) == ("running", None)
+
+
+def test_plan_rejects_undeclared_shared_write_overlap(tmp_path, kanban_conn):
+    repo, base_sha, task_spec, output = _advance_to_plan_draft(
+        tmp_path, kanban_conn, "plan-overlap",
+    )
+
+    def overlap(document):
+        document["nodes"].append({
+            "id": "second-writer", "title": "Also write the shared file", "needs": [],
+            "kind": "logic", "requirements": ["REQ-1"],
+            "allowed_paths": ["shared/file.py"], "expected_outputs": ["change-set"],
+            "test_cases": ["TEST-REQ-1-B"], "risk_tags": ["control-plane"],
+        })
+        document["nodes"][0]["allowed_paths"] = ["shared/file.py"]
+        document["integration_order"].append("second-writer")
+
+    with pytest.raises(ValueError, match="undeclared write overlap 'shared/file.py'"):
+        _seal_plan_candidate(repo, "plan-overlap", base_sha, task_spec, output, overlap)
+
+
+def test_plan_rejects_deployment_control_without_high_risk_tag(tmp_path, kanban_conn):
+    repo, base_sha, task_spec, output = _advance_to_plan_draft(
+        tmp_path, kanban_conn, "plan-risk",
+    )
+
+    def unsafe_deployment(document):
+        document["nodes"][0].update({
+            "kind": "deployment",
+            "allowed_paths": [".github/workflows/deploy.yml"],
+            "risk_tags": [],
+        })
+
+    with pytest.raises(ValueError, match="without a control-plane or high-risk tag"):
+        _seal_plan_candidate(
+            repo, "plan-risk", base_sha, task_spec, output, unsafe_deployment,
+        )
+
+
+def test_plan_rejects_node_budgets_exceeding_remaining_pool(tmp_path, kanban_conn):
+    repo, base_sha, task_spec, output = _advance_to_plan_draft(
+        tmp_path, kanban_conn, "plan-budget",
+    )
+
+    def infeasible(document):
+        document["nodes"][0]["budget"] = {"token_pool": "build", "tokens": 70_000}
+        document["nodes"].append({
+            "id": "second-build", "title": "Build the second half", "needs": [],
+            "kind": "logic", "requirements": ["REQ-1"],
+            "allowed_paths": ["second.py"], "expected_outputs": ["change-set"],
+            "test_cases": ["TEST-REQ-1-B"], "risk_tags": [],
+            "budget": {"token_pool": "build", "tokens": 70_000},
+        })
+        document["integration_order"].append("second-build")
+
+    with pytest.raises(
+        ValueError,
+        match="token pool 'build' declares 140000 tokens but only 130000 remain",
+    ):
+        _seal_plan_candidate(repo, "plan-budget", base_sha, task_spec, output, infeasible)
 
 
 def test_spec_rejection_reactivates_only_the_spec_cone(tmp_path, kanban_conn):

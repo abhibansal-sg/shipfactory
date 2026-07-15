@@ -1273,7 +1273,12 @@ def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "
     )
 
 def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
-    """Queue an audited operator release for a parked review-stall gate."""
+    """Queue an audited release for a recoverable blocked review gate.
+
+    ``clarifications_nonempty`` uses the same enqueue-only operator surface as
+    ``review_stall``.  Applying that decision creates a fresh spec producer
+    activation; it never treats the blocked approval as permission to proceed.
+    """
     if not str(reason).strip():
         raise ValueError("operator release requires a reason")
     with store._connect() as db:
@@ -1282,9 +1287,10 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
+    recoverable = {"review_stall", "clarifications_nonempty"}
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
-            or step["blocked_reason"] != "review_stall"):
-        raise ValueError("review step is not parked for review_stall")
+            or step["blocked_reason"] not in recoverable):
+        raise ValueError("review step is not parked for operator-recoverable review block")
     return enqueue(
         instance_id,
         "operator_release",
@@ -1429,19 +1435,37 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _finish_event(db, row, "discarded", "unknown_gate_decision")
                 return
             if row["source"] == "operator_release":
+                recoverable = {"review_stall", "clarifications_nonempty"}
                 if (step["primitive"] != "review_gate" or step["state"] != "blocked"
-                        or step["blocked_reason"] != "review_stall"):
-                    _finish_event(db, row, "discarded", "review_gate_not_stalled")
+                        or step["blocked_reason"] not in recoverable):
+                    _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return
-                from hermes_cli import kanban_db
-                task = kanban_db.get_task(conn, step["kanban_task_id"])
-                verdict = parse_verdict(task.result if task else "")
-                if verdict["outcome"] != "request_changes":
-                    raise ValueError("review stall has no rejecting verdict")
                 recipe = recipe_for_instance(instance).document
+                blocked_reason = step["blocked_reason"]
+                if blocked_reason == "review_stall":
+                    from hermes_cli import kanban_db
+                    task = kanban_db.get_task(conn, step["kanban_task_id"])
+                    verdict = parse_verdict(task.result if task else "")
+                    if verdict["outcome"] != "request_changes":
+                        raise ValueError("review stall has no rejecting verdict")
+                    target = _resolve_target_step(
+                        db, instance["id"], recipe, verdict["target_step"],
+                    )
+                else:
+                    definition = next(
+                        item for item in recipe["steps"] if item["id"] == step["step_id"]
+                    )
+                    producers = [
+                        item["from"] for item in definition.get("inputs", [])
+                        if item.get("kind") == "task-spec" and item.get("required", False)
+                    ]
+                    if len(producers) != 1:
+                        raise ValueError(
+                            "clarifications block has no unique task-spec producer"
+                        )
+                    target = producers[0]
                 _invalidate_cone(
-                    db, instance, recipe,
-                    _resolve_target_step(db, instance["id"], recipe, verdict["target_step"]),
+                    db, instance, recipe, target,
                     step["step_id"], f"operator_release:{row['key']}",
                 )
                 _transition(
@@ -1452,7 +1476,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
                     (store._now(), instance["id"]),
                 )
-                _finish_event(db, row, "applied", "review_stall_released")
+                _finish_event(db, row, "applied", f"{blocked_reason}_released")
                 return
             _finish_event(db, row, "discarded", f"unknown_source:{row['source']}")
     except Exception as exc:
