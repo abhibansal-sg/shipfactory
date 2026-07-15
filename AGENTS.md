@@ -61,7 +61,22 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
 ## Engine invariants
 
 - `advance_events` keys are **permanently spent** — never replay an applied
-  event by re-inserting its key; enqueue a fresh event instead.
+  event by re-inserting its key; enqueue a fresh event instead. Since A0
+  (2026-07-15) events are additionally **leased**: `pending → leased →
+  applied|discarded|failed` under `BEGIN IMMEDIATE`; an expired lease
+  returns to `pending` without reinsertion; stale events are `discarded`
+  with a reason, never silently indistinguishable from success.
+- **External effects go through the `action_intents` journal** (A0):
+  gate completions, collector completions, and notification sends execute
+  OUTSIDE factory write transactions. A retry after a crash inserts a
+  fresh `(logical_key, attempt+1)` intent and PROBES the target first —
+  the kanban task may already be done, the message already sent. Never
+  perform an external effect directly inside an event-apply transaction.
+- **One daemon per machine** (A0): the daemon holds an exclusive flock on
+  `$HERMES_HOME/shipfactory/daemon.lock`; a second daemon exits before
+  opening any board. CLI and dashboard commands ENQUEUE only — approve/
+  reject/release return a queued decision id and the daemon tick applies
+  it. There is no synchronous apply path outside the daemon.
 - The advancer is the **single writer** for recipe-step state. Human/API
   decisions are *queued* (`gate_decision`, `operator_release`) and applied
   on the daemon tick — never mutate `recipe_steps` outside it except as an
