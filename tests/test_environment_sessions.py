@@ -79,6 +79,21 @@ trap '' TERM
 sleep 60
 """
 
+_HANGS_ON_HEALTHCHECK = """\
+#!/bin/sh
+PORT_VALUE="$2"
+exec python3 -c "
+import socket
+port = int('$PORT_VALUE')
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port))
+s.listen(50)
+while True:
+    s.accept()
+"
+"""
+
 
 def _write_repo(tmp_path: Path, *, bootstrap="#!/bin/sh\nexit 0\n", seed="#!/bin/sh\nexit 0\n",
                 app_start=_APP_SERVER, tracked_inputs=None, extra=None) -> Path:
@@ -218,6 +233,30 @@ def test_repeat_request_reuses_ready_materialization(tmp_path):
     assert second["id"] == first["id"]
 
 
+def test_materialization_key_includes_referenced_script_identity(tmp_path):
+    """Two different base commits that happen to share an identical
+    manifest.yaml blob (and empty tracked_inputs) but differ in their
+    bootstrap script bytes must never collide on the reuse key — the
+    manifest blob alone does not capture what actually executes
+    (review finding #1)."""
+    repo_a = _write_repo(tmp_path, bootstrap="#!/bin/sh\necho A > out.txt\nexit 0\n")
+    repo_b = _write_repo(tmp_path, bootstrap="#!/bin/sh\necho B > out.txt\nexit 0\n")
+    base_a, base_b = _base_sha(repo_a), _base_sha(repo_b)
+    cfg = _cfg()
+
+    first = _materialize(repo_a, base_a, cfg)
+    assert first["state"] == "ready"
+    assert (repo_a / "out.txt").read_text().strip() == "A"
+
+    second = _materialize(repo_b, base_b, cfg)
+    assert second["state"] == "ready"
+    assert second["key"] != first["key"]
+    assert second["id"] != first["id"]
+    # A collision would have reused repo_a's ready row and skipped repo_b's
+    # own bootstrap entirely.
+    assert (repo_b / "out.txt").read_text().strip() == "B"
+
+
 def test_bootstrap_timeout_fails_with_persisted_log(tmp_path):
     repo = _write_repo(tmp_path, bootstrap="#!/bin/sh\necho starting\nsleep 30\nexit 0\n")
     base_sha = _base_sha(repo)
@@ -228,6 +267,40 @@ def test_bootstrap_timeout_fails_with_persisted_log(tmp_path):
     assert "starting" in Path(row["stdout_path"]).read_text()
     # Lease released, so a fresh slot is immediately available.
     assert store.acquire_resource_lease("materialization_slot", 1, key="probe") is not None
+
+
+def test_output_cap_is_enforced_even_when_child_exits_before_next_check(tmp_path):
+    """A fast child that blows the output cap and exits almost immediately
+    must still fail the session. The exit-time check must independently
+    verify against the cap rather than only checking it while the process
+    is still running — otherwise a burst-then-exit child slips through as
+    'ready' (review finding #5)."""
+    repo = _write_repo(tmp_path, bootstrap="#!/bin/sh\nyes A | head -c 2000000\nexit 0\n")
+    base_sha = _base_sha(repo)
+    cfg = _cfg(max_output_bytes=1000)
+    row = _materialize(repo, base_sha, cfg)
+    assert row["state"] == "failed"
+    assert "max_output_bytes" in row["last_error"]
+    assert row["output_cap_exceeded"] == 1
+
+
+def test_network_deny_strips_proxy_env_and_reports_advisory_not_enforced(monkeypatch, tmp_path):
+    """network: deny must mechanically strip proxy env vars from the child's
+    environment, and must never claim 'enforced' — only an env var plus
+    proxy stripping is applied, which a raw-socket script can bypass, so the
+    truthful level is 'advisory' (review finding #7)."""
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("https_proxy", "http://proxy.invalid:8080")
+    repo = _write_repo(tmp_path, bootstrap="#!/bin/sh\nenv\nexit 0\n")
+    base_sha = _base_sha(repo)
+    cfg = _cfg()
+    row = _materialize(repo, base_sha, cfg)
+    assert row["state"] == "ready"
+    assert row["network_enforcement_level"] == "advisory"
+    log_text = Path(row["stdout_path"]).read_text()
+    assert "HTTP_PROXY" not in log_text
+    assert "https_proxy" not in log_text
+    assert "SHIPFACTORY_NETWORK_POLICY=deny" in log_text
 
 
 def test_bootstrap_forked_orphan_is_reaped_via_process_group(tmp_path):
@@ -284,6 +357,75 @@ def test_daemon_dies_before_spawn_recorded_is_treated_as_crashed(tmp_path):
     row = store.env_session_row("orphan-row")
     assert row["state"] == "failed"
     assert store.acquire_resource_lease("materialization_slot", 1, key="probe") is not None
+
+
+def _wait_for_reap(pid: int, *, timeout: float = 3.0):
+    """Non-blocking WNOHANG poll so a pre-fix hang fails the test instead of
+    wedging the whole run."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return status
+        time.sleep(0.05)
+    pytest.fail(f"pid {pid} was never reaped — the orphaned child was never killed")
+
+
+def test_pid_persisted_before_token_is_still_killed_on_restore(tmp_path):
+    """A daemon crash between Popen returning and the start token being
+    durably recorded (up to two seconds) must not leak the real child: the
+    pid is already persisted the instant Popen returns, so a nonterminal row
+    with a pid but a null token still gets a verified-kill attempt on
+    restore, not silently skipped (review finding #2)."""
+    repo = _write_repo(tmp_path)
+    base_sha = _base_sha(repo)
+    child = subprocess.Popen(["sh", "-c", "sleep 30"], cwd=repo, start_new_session=True)
+    try:
+        store.insert_env_session(
+            "crash-window-row", key="k2", base_sha=base_sha, candidate_sha=None,
+            manifest_path=".shipfactory/runtime.yaml", manifest_blob_sha="deadbeef",
+            tracked_input_hash="none", workspace_path=str(repo), control_plane_risk=False,
+            control_plane_paths=[], lease_key="materialization_slot:crash-window",
+            stdout_path=None, stderr_path=None,
+        )
+        store.acquire_resource_lease(
+            "materialization_slot", 1, key="materialization_slot:crash-window",
+        )
+        # Simulate the crash landing after Popen persisted the pid but before
+        # the OS start token was captured and written.
+        store.mark_env_session_pid("crash-window-row", child.pid)
+        env.restore_materializations()
+        status = _wait_for_reap(child.pid)
+        assert os.WIFSIGNALED(status)
+        row = store.env_session_row("crash-window-row")
+        assert row["state"] == "failed"
+        assert store.acquire_resource_lease(
+            "materialization_slot", 1, key="probe-crash-window",
+        ) is not None
+    finally:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def test_app_pid_persisted_before_token_is_verified_killed_on_restore(tmp_path):
+    """Same crash-window scenario as above, for app sessions: the port lease
+    must never be released while a real orphaned child still holds the
+    port (review finding #2)."""
+    repo, cfg, env_row = _ready_env(tmp_path)
+    app = env.request_app_start(env_session_id=env_row["id"], request_key="crash-app", cfg=cfg)
+    record = env._APP_RUNNING.pop(app["id"])
+    real_pid = record["pid"]
+    # Simulate the crash landing before the start token made it to the
+    # database, leaving a durable pid with a null token.
+    store.mark_app_session_token(app["id"], None)
+    env.restore_app_sessions(cfg)
+    status = _wait_for_reap(real_pid)
+    assert os.WIFSIGNALED(status)
+    row = store.app_session_row(app["id"])
+    assert row["state"] == "crashed"
+    assert store.acquire_resource_lease("port", 1, key="probe-crash-app") is not None
 
 
 # --- Port leasing ------------------------------------------------------------
@@ -451,3 +593,81 @@ def test_stale_pid_is_never_blindly_killed(tmp_path):
     assert killed["value"] is False
     row = store.app_session_row(app["id"])
     assert row["state"] == "crashed"
+
+
+def test_request_stop_never_signals_a_stale_pid(tmp_path):
+    """Every kill site — not just daemon-restart adoption — must recheck the
+    stored start token immediately before signalling. This exercises
+    request_stop's kill specifically, which pre-fix called os.killpg
+    directly with no identity recheck at all (review finding #3)."""
+    repo, cfg, env_row = _ready_env(tmp_path)
+    app = env.request_app_start(env_session_id=env_row["id"], request_key="stopstale1", cfg=cfg)
+    _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
+    record = env._APP_RUNNING[app["id"]]
+    real_pid = record["pid"]
+
+    killed = {"value": False}
+    real_killpg = os.killpg
+
+    def spy(pid, sig):
+        if pid == real_pid:
+            killed["value"] = True
+        return real_killpg(pid, sig)
+
+    import shipfactory.spawn as spawn_module
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(spawn_module, "_process_start_token", lambda pid: "mismatched-token")
+        mp.setattr(os, "killpg", spy)
+        env.request_stop(app["id"], cfg)
+    assert killed["value"] is False
+
+
+def test_healthy_app_port_lease_is_renewed_and_never_silently_expires(tmp_path):
+    """A healthy app's port lease must be renewed on every successful poll,
+    not left to expire on its original startup+shutdown+300s acquisition
+    window while the app is still alive and answering (review finding #4)."""
+    repo, cfg, env_row = _ready_env(tmp_path)
+    app = env.request_app_start(env_session_id=env_row["id"], request_key="lease1", cfg=cfg)
+    healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
+    assert healthy["state"] == "healthy"
+    port_lease_key = healthy["port_lease_key"]
+
+    # Force the lease into the past, simulating a long-lived healthy session
+    # well beyond its original acquisition window.
+    assert store.renew_resource_lease(port_lease_key, lease_seconds=-5) is True
+
+    env.tick(cfg)  # a successful poll of a live/healthy session must renew it
+
+    assert store.reap_resource_leases() == 0  # nothing should have expired
+    # The port must still be unavailable to a competing acquisition.
+    assert store.acquire_port_lease(healthy["port"], healthy["port"], key="steal-attempt") is None
+
+
+def test_healthchecks_are_probed_concurrently_not_serially(tmp_path):
+    """Several apps starting at once must have their healthchecks probed
+    concurrently within one tick, not one blocking urlopen call at a time —
+    a serial probe blocks the whole daemon tick for N * timeout with N
+    starting sessions (review finding #6)."""
+    n = 4
+    repo = _write_repo(tmp_path, app_start=_HANGS_ON_HEALTHCHECK)
+    base_sha = _base_sha(repo)
+    port_min = next(_PORT_COUNTER)
+    cfg = _cfg(
+        port_min=port_min, port_max=port_min + n - 1,
+        startup_timeout_seconds=30, shutdown_timeout_seconds=1,
+        healthcheck_timeout_seconds=1,
+    )
+    row = _materialize(repo, base_sha, cfg)
+    assert row["state"] == "ready"
+    apps = [
+        env.request_app_start(env_session_id=row["id"], request_key=f"concurrent{i}", cfg=cfg)
+        for i in range(n)
+    ]
+    for app in apps:
+        assert app["id"] in env._APP_RUNNING
+
+    started = time.monotonic()
+    env.tick(cfg)
+    elapsed = time.monotonic() - started
+    # Concurrent: ~1 timeout regardless of N. Serial: ~N * timeout (~4s here).
+    assert elapsed < 1.0 + (n - 1) * 0.5
