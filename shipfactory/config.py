@@ -34,6 +34,8 @@ ENVIRONMENT_RUNTIME_DEFAULTS = {
     "shutdown_timeout_seconds": 15,
     "max_output_bytes": 10485760,
     "default_network": "deny",
+    "healthcheck_timeout_seconds": 2,
+    "healthcheck_probe_concurrency": 8,
 }
 
 
@@ -231,6 +233,7 @@ def validate(cfg) -> None:
     for field in (
         "port_min", "port_max", "max_sessions", "bootstrap_timeout_seconds",
         "startup_timeout_seconds", "shutdown_timeout_seconds", "max_output_bytes",
+        "healthcheck_timeout_seconds", "healthcheck_probe_concurrency",
     ):
         if field in runtime and (
             not isinstance(runtime[field], int)

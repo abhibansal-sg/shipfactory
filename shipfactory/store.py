@@ -242,6 +242,15 @@ _ENVIRONMENT_SESSION_MIGRATION_STATEMENTS = (
     "CREATE INDEX idx_app_sessions_state ON app_sessions(state)",
 )
 _ENVIRONMENT_SESSION_MIGRATION_TEXT = ";\n".join(_ENVIRONMENT_SESSION_MIGRATION_STATEMENTS) + ";\n"
+_ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS = (
+    "ALTER TABLE env_sessions ADD COLUMN network_enforcement_level TEXT",
+    "ALTER TABLE env_sessions ADD COLUMN output_cap_exceeded INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE app_sessions ADD COLUMN network_enforcement_level TEXT",
+    "ALTER TABLE app_sessions ADD COLUMN output_cap_exceeded INTEGER NOT NULL DEFAULT 0",
+)
+_ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT = (
+    ";\n".join(_ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -250,6 +259,7 @@ _MIGRATIONS = (
     (5, "sf5_instance_base_identity", _INSTANCE_BASE_MIGRATION_TEXT),
     (6, "sf6_named_token_pool_charges", _PLANNING_BUDGET_MIGRATION_TEXT),
     (7, "sf8_environment_sessions", _ENVIRONMENT_SESSION_MIGRATION_TEXT),
+    (8, "sf8_environment_enforcement_and_caps", _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -259,6 +269,7 @@ _MIGRATION_STATEMENTS = {
     5: _INSTANCE_BASE_MIGRATION_STATEMENTS,
     6: _PLANNING_BUDGET_MIGRATION_STATEMENTS,
     7: _ENVIRONMENT_SESSION_MIGRATION_STATEMENTS,
+    8: _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS,
 }
 
 
@@ -427,9 +438,20 @@ def init_db() -> None:
                         "token_pool" in charge_columns
                         or "idx_budget_charges_pool" in indexes
                     )
-                else:
+                elif version == 7:
                     migration_artifacts = bool(
                         {"env_sessions", "app_sessions"} & existing_tables
+                    )
+                else:
+                    env_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(env_sessions)"
+                    )}
+                    app_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(app_sessions)"
+                    )}
+                    migration_artifacts = bool(
+                        {"network_enforcement_level", "output_cap_exceeded"}
+                        & (env_columns | app_columns)
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -1013,15 +1035,40 @@ def latest_env_session_for_key(key: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def mark_env_session_spawned(id: str, pid: int, token: str | None) -> None:
+def mark_env_session_pid(id: str, pid: int) -> None:
+    """Persist the child pid the instant ``Popen`` returns.
+
+    Split from the start-token write (``mark_env_session_token``) so a
+    daemon crash during the up-to-two-second OS start-token observation
+    window still leaves the pid durable — recovery can then verify/kill the
+    real child instead of leaking an untracked orphan (review finding #2).
+    """
     with _connect() as conn:
         changed = conn.execute(
-            "UPDATE env_sessions SET pid=?,process_start_token=?,started_at=? "
-            "WHERE id=? AND state='materializing'",
-            (int(pid), token, _now(), id),
+            "UPDATE env_sessions SET pid=?,started_at=? WHERE id=? AND state='materializing'",
+            (int(pid), _now(), id),
         ).rowcount
         if changed != 1:
             raise ValueError(f"unknown or terminal env_session {id}")
+
+
+def mark_env_session_token(id: str, token: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE env_sessions SET process_start_token=? WHERE id=?", (token, id),
+        )
+
+
+def update_env_session_network_enforcement(id: str, level: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE env_sessions SET network_enforcement_level=? WHERE id=?", (level, id),
+        )
+
+
+def mark_env_session_output_capped(id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE env_sessions SET output_cap_exceeded=1 WHERE id=?", (id,))
 
 
 def update_env_session_state(id: str, state: str, *, last_error: str | None = None) -> None:
@@ -1080,15 +1127,35 @@ def mark_app_session_bound(id: str, *, port: int, port_lease_key: str, app_url: 
         )
 
 
-def mark_app_session_spawned(id: str, pid: int, token: str | None) -> None:
+def mark_app_session_pid(id: str, pid: int) -> None:
+    """Persist the child pid the instant ``Popen`` returns (see finding #2)."""
     with _connect() as conn:
         changed = conn.execute(
-            "UPDATE app_sessions SET pid=?,process_start_token=?,started_at=? "
+            "UPDATE app_sessions SET pid=?,started_at=? "
             "WHERE id=? AND state IN ('starting','stopping')",
-            (int(pid), token, _now(), id),
+            (int(pid), _now(), id),
         ).rowcount
         if changed != 1:
             raise ValueError(f"unknown or terminal app_session {id}")
+
+
+def mark_app_session_token(id: str, token: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET process_start_token=? WHERE id=?", (token, id),
+        )
+
+
+def update_app_session_network_enforcement(id: str, level: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE app_sessions SET network_enforcement_level=? WHERE id=?", (level, id),
+        )
+
+
+def mark_app_session_output_capped(id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE app_sessions SET output_cap_exceeded=1 WHERE id=?", (id,))
 
 
 def update_app_session_state(id: str, state: str, *, health_status: str | None = None,

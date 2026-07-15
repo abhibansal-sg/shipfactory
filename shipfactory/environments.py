@@ -15,9 +15,11 @@ import hashlib
 import os
 import signal
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from time import monotonic
@@ -231,8 +233,23 @@ def _atomic_write_once(path: Path, data: bytes, *, mode: int = 0o700) -> None:
     os.replace(temp, path)
 
 
+def control_blob_shas(repo_root: str | Path, manifest: RuntimeManifest) -> dict[str, str]:
+    """Return ``{repo-relative path: blob_sha}`` for every non-manifest script.
+
+    This is the actual content identity of what will execute: the manifest's
+    own blob SHA only covers the YAML file, not the bootstrap/app/seed
+    scripts it references by path (review finding #1).
+    """
+    repo_root = Path(repo_root)
+    return {
+        path: _ls_tree_blob(repo_root, manifest.base_sha, path)[1]
+        for path in sorted(manifest.control_paths - {manifest.manifest_path})
+    }
+
+
 def materialize_pinned_scripts(
     repo_root: str | Path, manifest: RuntimeManifest, dest_root: str | Path,
+    *, blob_shas: dict[str, str] | None = None,
 ) -> dict[str, Path]:
     """Copy every referenced script's pinned bytes into a Factory-owned root.
 
@@ -244,9 +261,10 @@ def materialize_pinned_scripts(
     """
     repo_root = Path(repo_root)
     dest_root = Path(dest_root) / manifest.blob_sha
+    resolved_shas = blob_shas if blob_shas is not None else control_blob_shas(repo_root, manifest)
     materialized: dict[str, Path] = {}
     for path in sorted(manifest.control_paths - {manifest.manifest_path}):
-        _mode, blob_sha = _ls_tree_blob(repo_root, manifest.base_sha, path)
+        blob_sha = resolved_shas[path]
         data = _blob_bytes(repo_root, blob_sha)
         dest = dest_root / blob_sha / path
         _atomic_write_once(dest, data, mode=0o700)
@@ -310,9 +328,23 @@ def compute_tracked_input_hash(
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
-def materialization_key(manifest_blob_sha: str, tracked_input_hash: str) -> str:
-    """Return the content-addressed cache key for one materialized environment."""
-    return hashlib.sha256(f"{manifest_blob_sha}:{tracked_input_hash}".encode()).hexdigest()
+def materialization_key(
+    *, base_sha: str, candidate_sha: str | None, manifest_blob_sha: str,
+    tracked_input_hash: str, control_blob_shas: dict[str, str],
+) -> str:
+    """Return the content-addressed cache key for one materialized environment.
+
+    Must fold in every byte that influences what actually executes. The
+    manifest blob SHA alone is not enough: two different base commits can
+    carry an identical ``runtime.yaml`` while their referenced bootstrap or
+    seed script differs, and a manifest blob hash cannot see that. Folding
+    in ``base_sha``, ``candidate_sha``, and each referenced script's blob SHA
+    closes that reuse hole (review finding #1) — an existing "ready" row is
+    only ever reused when every one of these matches exactly.
+    """
+    parts = [base_sha, candidate_sha or "", manifest_blob_sha, tracked_input_hash]
+    parts.extend(f"{path}={sha}" for path, sha in sorted(control_blob_shas.items()))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
 def candidate_control_plane_diff(
@@ -343,13 +375,19 @@ def _logs_root() -> Path:
     return _state_root() / "env-logs"
 
 
-def _kill_group(pid: int | None, sig: int = signal.SIGKILL) -> None:
+def _kill_group(pid: int | None, sig: int = signal.SIGKILL, *, token: str | None = None) -> None:
+    """Signal a process group after reconfirming its OS start identity.
+
+    Every call site passes the ``token`` captured at spawn (the A1
+    run-identity pattern already used for daemon-restart adoption) so a
+    PID/group reused by an unrelated process between an earlier poll and
+    this signal is never killed on a stale identity (review finding #3).
+    Delegates to :func:`shipfactory.spawn.verified_killpg`, the one shared
+    implementation of this check, rather than reinventing it here.
+    """
     if not pid:
         return
-    try:
-        os.killpg(int(pid), sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    _spawn.verified_killpg(int(pid), token, sig)
 
 
 def _log_tail(path: Path, limit: int = 4000) -> str:
@@ -359,17 +397,125 @@ def _log_tail(path: Path, limit: int = 4000) -> str:
         return ""
 
 
+# Proxy variables are the only mechanical lever available without a real OS
+# sandbox: stripping them blocks proxy-routed traffic but not raw sockets, so
+# ``network: deny`` is always reported as "advisory", never "enforced". A
+# genuine block (macOS: ``sandbox-exec`` with a loopback-allow / network-deny
+# profile) is a documented option, deliberately not wired up here — the
+# session must never claim a guarantee this code does not provide (finding #7).
+_PROXY_ENV_VARS = frozenset({
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
+})
+
+
+def _apply_network_policy(env: dict[str, str], policy: str) -> str:
+    """Mutate ``env`` for ``policy`` in place; return the truthful enforcement level.
+
+    ``SHIPFACTORY_NETWORK_POLICY`` alone is advisory — a trusted script (or a
+    dependency it shells out to) can simply ignore it. Returns
+    ``"not_applicable"`` for ``allow`` (nothing to constrain) or
+    ``"advisory"`` for ``deny`` (proxy env stripped, but raw sockets are
+    unconstrained) — never ``"enforced"``, since no real sandbox is applied.
+    """
+    env["SHIPFACTORY_NETWORK_POLICY"] = policy
+    if policy != "deny":
+        return "not_applicable"
+    for var in _PROXY_ENV_VARS:
+        env.pop(var, None)
+    return "advisory"
+
+
+class _OutputCapWatcher:
+    """A background poller tracking whether a child exceeded its output cap."""
+
+    def __init__(self) -> None:
+        self.exceeded = threading.Event()
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=0.5)
+
+
+def _watch_output_cap(
+    log_path: Path, max_bytes: int, on_exceeded, *, poll_interval: float = 0.1,
+) -> _OutputCapWatcher:
+    """Poll ``log_path``'s size on a tight interval and kill immediately on breach.
+
+    A full daemon tick can be seconds apart; checking the cap only once per
+    tick lets a fast child fill disk in the gap between ticks (review
+    finding #5). A dedicated poller closes that window down to
+    ``poll_interval`` instead. stdout is still wired directly to a real log
+    file rather than a pipe the daemon process holds open: a child's stdout
+    must survive a daemon crash/restart on its own, exactly like every other
+    spawn path in this module (an in-process pipe reader would starve the
+    child of a writable stdout the moment the daemon that adopted it died,
+    breaking orphan adoption across restarts).
+    """
+    watcher = _OutputCapWatcher()
+    max_bytes = max(0, int(max_bytes))
+
+    def _poll() -> None:
+        while not watcher._stop.is_set():
+            try:
+                size = log_path.stat().st_size
+            except OSError:
+                size = 0
+            if size > max_bytes:
+                watcher.exceeded.set()
+                on_exceeded()
+                return
+            watcher._stop.wait(poll_interval)
+
+    watcher.thread = threading.Thread(target=_poll, daemon=True)
+    watcher.thread.start()
+    return watcher
+
+
+def _stop_output_watch(record: dict[str, Any]) -> None:
+    watch = record.get("output_watch")
+    if watch is not None:
+        watch.stop()
+
+
+def _output_cap_exceeded(record: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Return whether ``record`` is over its output cap, right now.
+
+    The watcher thread's ``exceeded`` flag is a fast path (kills a
+    long-running child quickly), not the source of truth: a child that
+    writes a huge burst and exits before the watcher's next poll tick would
+    otherwise race past it undetected. A synchronous size check here is the
+    authoritative backstop, independent of watcher thread timing.
+    """
+    watch = record.get("output_watch")
+    if watch is not None and watch.exceeded.is_set():
+        return True
+    log_path = record.get("log_path")
+    if log_path is None:
+        return False
+    try:
+        return log_path.exists() and log_path.stat().st_size > int(cfg["max_output_bytes"])
+    except OSError:
+        return False
+
+
 # Materializations (bootstrap [+ seed]) currently owned by this daemon
 # process, keyed by env_session id. Never run synchronously inside a tick —
 # spawned once here, then polled to completion across subsequent ticks.
 _MATERIALIZING: dict[str, dict[str, Any]] = {}
 
 
-def _spawn_phase(id: str, record: dict[str, Any], *, phase: str, argv: list[str]) -> None:
+def _spawn_phase(
+    id: str, record: dict[str, Any], *, phase: str, argv: list[str], cfg: dict[str, Any],
+) -> None:
+    _stop_output_watch(record)  # a prior phase's watcher (e.g. bootstrap) must not race a new one
     resolved = [str(record["scripts"][argv[0]]), *argv[1:]]
     log_file = open(record["log_path"], "ab")
     env = dict(os.environ)
-    env["SHIPFACTORY_NETWORK_POLICY"] = record["network_policy"]
+    enforcement_level = _apply_network_policy(env, record["network_policy"])
     try:
         proc = subprocess.Popen(
             resolved, cwd=str(record["workspace"]), stdin=subprocess.DEVNULL,
@@ -378,9 +524,24 @@ def _spawn_phase(id: str, record: dict[str, Any], *, phase: str, argv: list[str]
     finally:
         log_file.close()
     pid = proc.pid
+    # Persist the pid the instant Popen returns — before the (up to two
+    # second) OS start-token observation below — so a daemon crash in that
+    # window still leaves a durable pid recovery can verify/kill, instead of
+    # leaking an untracked orphan (review finding #2).
+    store.mark_env_session_pid(id, pid)
+    store.update_env_session_network_enforcement(id, enforcement_level)
+    record["proc"], record["pid"], record["phase"], record["token"] = proc, pid, phase, None
+
+    def _on_output_cap_exceeded() -> None:
+        store.mark_env_session_output_capped(id)
+        _kill_group(pid, token=record.get("token"))
+
+    record["output_watch"] = _watch_output_cap(
+        record["log_path"], cfg["max_output_bytes"], _on_output_cap_exceeded,
+    )
     token = _spawn._capture_start_token(pid, proc)
-    store.mark_env_session_spawned(id, pid, token)
-    record["proc"], record["pid"], record["phase"] = proc, pid, phase
+    store.mark_env_session_token(id, token)
+    record["token"] = token
 
 
 def _finish_env_session(id: str, state: str, error: str | None, record: dict[str, Any]) -> None:
@@ -408,7 +569,11 @@ def request_materialization(
     tracked_hash = compute_tracked_input_hash(
         workspace, manifest.document["bootstrap"]["tracked_inputs"],
     )
-    key = materialization_key(manifest.blob_sha, tracked_hash)
+    blob_shas = control_blob_shas(repo_root, manifest)
+    key = materialization_key(
+        base_sha=base_sha, candidate_sha=candidate_sha, manifest_blob_sha=manifest.blob_sha,
+        tracked_input_hash=tracked_hash, control_blob_shas=blob_shas,
+    )
     existing = store.latest_env_session_for_key(key)
     if existing and existing["state"] in ("materializing", "ready"):
         return existing
@@ -436,7 +601,7 @@ def request_materialization(
         control_plane_paths=changed_control_paths, lease_key=lease_key,
         stdout_path=str(log_path), stderr_path=None,
     )
-    scripts = materialize_pinned_scripts(repo_root, manifest, _scripts_root())
+    scripts = materialize_pinned_scripts(repo_root, manifest, _scripts_root(), blob_shas=blob_shas)
     record: dict[str, Any] = {
         "log_path": log_path, "workspace": workspace, "scripts": scripts,
         "network_policy": manifest.document["bootstrap"]["network"],
@@ -445,7 +610,9 @@ def request_materialization(
         "deadline": monotonic() + int(cfg["bootstrap_timeout_seconds"]),
     }
     try:
-        _spawn_phase(id, record, phase="bootstrap", argv=manifest.document["bootstrap"]["argv"])
+        _spawn_phase(
+            id, record, phase="bootstrap", argv=manifest.document["bootstrap"]["argv"], cfg=cfg,
+        )
     except Exception as exc:
         _finish_env_session(id, "failed", f"bootstrap spawn failed: {exc}", record)
         return store.env_session_row(id)
@@ -457,11 +624,18 @@ def restore_materializations() -> None:
     """Fail-closed reconciliation of materializations from a prior daemon life.
 
     A daemon restart loses in-memory phase/manifest context, so an adopted
-    row is never optimistically resumed or marked ready — it is killed (only
-    when the OS start token still matches, never a blind PID kill) and
+    row is never optimistically resumed or marked ready — it is killed and
     failed, forcing a fresh rebuild on next demand. This is the same
     fail-closed posture as artifact sealing: safety over salvaging partial
     progress.
+
+    A pid is now persisted the instant ``Popen`` returns (review finding
+    #2), so any nonterminal row with a pid may have a real, still-running
+    child — even one whose start token never made it to the database before
+    the crash. We attempt a verified kill (falling back to a liveness probe
+    when no token is on record) whenever a pid is present, rather than only
+    when a token happens to match; a materialization row is never declared
+    failed while it might still be leaking a live orphan.
     """
     for row in store.nonterminal_env_sessions():
         id = row["id"]
@@ -469,8 +643,8 @@ def restore_materializations() -> None:
             continue
         pid = row.get("pid")
         token = row.get("process_start_token")
-        if pid and token and _spawn._process_start_token(int(pid)) == token:
-            _kill_group(int(pid))
+        if pid:
+            _spawn.verified_killpg(int(pid), token)
         _finish_env_session(
             id, "failed", "daemon restarted during materialization; rebuild required", row,
         )
@@ -481,7 +655,8 @@ def cancel_materialization(id: str, *, reason: str = "cancelled") -> bool:
     record = _MATERIALIZING.pop(id, None)
     if record is None:
         return False
-    _kill_group(record.get("pid"))
+    _kill_group(record.get("pid"), token=record.get("token"))
+    _stop_output_watch(record)
     _finish_env_session(id, "failed", reason, record)
     return True
 
@@ -492,13 +667,19 @@ def reap_materializations(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     for id, record in list(_MATERIALIZING.items()):
         proc = record["proc"]
         code = proc.poll()
-        log_path = record["log_path"]
-        size = log_path.stat().st_size if log_path.exists() else 0
-        over_output = size > int(cfg["max_output_bytes"])
+        # A dedicated watcher thread enforces the output cap on a tight poll
+        # interval, not just once per tick (review finding #5) — it already
+        # killed the child the instant it hit the cap. The exit-time check
+        # here is a synchronous authoritative backstop, independent of
+        # watcher-thread timing (a fast child can exit before the watcher's
+        # next scheduled poll).
+        over_output = _output_cap_exceeded(record, cfg)
+        if over_output:
+            store.mark_env_session_output_capped(id)
         if code is None:
             over_budget = monotonic() >= record["deadline"]
             if over_budget or over_output:
-                _kill_group(record.get("pid"))
+                _kill_group(record.get("pid"), token=record.get("token"))
                 reason = "bootstrap_timeout" if over_budget else "max_output_bytes exceeded"
                 _finish_env_session(id, "failed", reason, record)
                 finished.append({"id": id, "state": "failed", "reason": reason})
@@ -506,10 +687,17 @@ def reap_materializations(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         # Exited: kill any orphaned grandchildren left behind in the group
         # before evaluating the outcome (§2.1.7 "forks a child and exits").
-        _kill_group(record.get("pid"))
+        _kill_group(record.get("pid"), token=record.get("token"))
+        _stop_output_watch(record)
+        if over_output:
+            _finish_env_session(id, "failed", "max_output_bytes exceeded", record)
+            finished.append({"id": id, "state": "failed"})
+            del _MATERIALIZING[id]
+            continue
         if code != 0:
             _finish_env_session(
-                id, "failed", f"{record['phase']} exited {code}: {_log_tail(log_path)}", record,
+                id, "failed",
+                f"{record['phase']} exited {code}: {_log_tail(record['log_path'])}", record,
             )
             finished.append({"id": id, "state": "failed"})
             del _MATERIALIZING[id]
@@ -521,7 +709,7 @@ def reap_materializations(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 del _MATERIALIZING[id]
                 continue
             try:
-                _spawn_phase(id, record, phase="seed", argv=record["seed_argv"])
+                _spawn_phase(id, record, phase="seed", argv=record["seed_argv"], cfg=cfg)
             except Exception as exc:
                 _finish_env_session(id, "failed", f"seed spawn failed: {exc}", record)
                 finished.append({"id": id, "state": "failed"})
@@ -627,9 +815,12 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
         store.update_app_session_state(aid, "crashed", last_error=f"manifest unavailable: {exc}")
         return False
     port_lease_key = row.get("port_lease_key") or f"port:app:{aid}"
+    port_lease_seconds = (
+        int(cfg["startup_timeout_seconds"]) + int(cfg["shutdown_timeout_seconds"]) + 300
+    )
     port = store.acquire_port_lease(
         int(cfg["port_min"]), int(cfg["port_max"]), key=port_lease_key,
-        lease_seconds=int(cfg["startup_timeout_seconds"]) + int(cfg["shutdown_timeout_seconds"]) + 300,
+        lease_seconds=port_lease_seconds,
         metadata={"app_session_id": aid},
     )
     if port is None:
@@ -641,7 +832,7 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
     resolved = [str(scripts[app_config["start_argv"][0]]), *argv[1:]]
     env = dict(os.environ)
     env["PORT"] = str(port)
-    env["SHIPFACTORY_NETWORK_POLICY"] = manifest.document["bootstrap"]["network"]
+    enforcement_level = _apply_network_policy(env, manifest.document["bootstrap"]["network"])
     log_path = Path(row["stdout_path"])
     log_file = open(log_path, "wb")
     try:
@@ -659,26 +850,52 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
         return False
     log_file.close()
     pid = proc.pid
-    token = _spawn._capture_start_token(pid, proc)
-    store.mark_app_session_spawned(aid, pid, token)
-    _APP_RUNNING[aid] = {
-        "proc": proc, "pid": pid, "phase": "starting", "port": port,
-        "port_lease_key": port_lease_key, "log_path": log_path,
+    # Persist the pid the instant Popen returns, before the (up to two
+    # second) start-token observation below (review finding #2).
+    store.mark_app_session_pid(aid, pid)
+    store.update_app_session_network_enforcement(aid, enforcement_level)
+    record: dict[str, Any] = {
+        "proc": proc, "pid": pid, "token": None, "phase": "starting", "port": port,
+        "port_lease_key": port_lease_key, "port_lease_seconds": port_lease_seconds,
+        "log_path": log_path,
         "health_path": app_config["healthcheck"]["path"],
         "expected_status": app_config["healthcheck"]["expected_status"],
         "stop_signal": app_config["stop_signal"],
         "deadline": monotonic() + int(cfg["startup_timeout_seconds"]),
     }
+
+    def _on_output_cap_exceeded() -> None:
+        store.mark_app_session_output_capped(aid)
+        _kill_group(pid, token=record.get("token"))
+
+    record["output_watch"] = _watch_output_cap(
+        log_path, cfg["max_output_bytes"], _on_output_cap_exceeded,
+    )
+    token = _spawn._capture_start_token(pid, proc)
+    store.mark_app_session_token(aid, token)
+    record["token"] = token
+    _APP_RUNNING[aid] = record
     return True
 
 
-def _advance_one_app(aid: str, record: dict[str, Any], cfg: dict[str, Any]) -> list[dict[str, Any]]:
+def _advance_one_app(
+    aid: str, record: dict[str, Any], cfg: dict[str, Any], *, health_result: bool | None = None,
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     proc = record["proc"]
     code = proc.poll()
-    if code is not None:
-        _kill_group(record.get("pid"))
-        if record["phase"] == "stopping":
+    # See _output_cap_exceeded: the watcher thread is a fast path, this call
+    # is the authoritative synchronous backstop (finding #5).
+    over_output = _output_cap_exceeded(record, cfg)
+    if over_output:
+        store.mark_app_session_output_capped(aid)
+    if code is not None or over_output:
+        _kill_group(record.get("pid"), token=record.get("token"))
+        _stop_output_watch(record)
+        if over_output:
+            _finish_app_session(aid, "crashed", "max_output_bytes exceeded", record)
+            events.append({"id": aid, "event": "crashed"})
+        elif record["phase"] == "stopping":
             _finish_app_session(aid, "stopped", None, record)
             events.append({"id": aid, "event": "stopped"})
         else:
@@ -688,13 +905,24 @@ def _advance_one_app(aid: str, record: dict[str, Any], cfg: dict[str, Any]) -> l
             events.append({"id": aid, "event": "crashed"})
         del _APP_RUNNING[aid]
         return events
+    if record["phase"] in ("starting", "healthy") and record.get("port_lease_key"):
+        # The process is alive and (for "starting") the most recent probe —
+        # taken concurrently by tick(), never serially here (finding #6) — is
+        # in health_result. A live/healthy session's port lease must never be
+        # left to expire on a wall-clock timer while it keeps answering;
+        # renew it on every successful poll, and let expiry reap only a
+        # session whose liveness check actually failed (finding #4).
+        store.renew_resource_lease(
+            record["port_lease_key"], lease_seconds=record["port_lease_seconds"],
+        )
     if record["phase"] == "starting":
-        if _poll_health(record["port"], record["health_path"], record["expected_status"]):
+        if health_result:
             store.update_app_session_state(aid, "healthy", health_status="ok")
             record["phase"] = "healthy"
             events.append({"id": aid, "event": "healthy"})
         elif monotonic() >= record["deadline"]:
-            _kill_group(record.get("pid"))
+            _kill_group(record.get("pid"), token=record.get("token"))
+            _stop_output_watch(record)
             _finish_app_session(
                 aid, "crashed",
                 "healthcheck never became healthy before startup_timeout_seconds", record,
@@ -703,25 +931,56 @@ def _advance_one_app(aid: str, record: dict[str, Any], cfg: dict[str, Any]) -> l
             del _APP_RUNNING[aid]
         return events
     if record["phase"] == "stopping" and monotonic() >= record["deadline"] and not record.get("kill_sent"):
-        _kill_group(record.get("pid"), signal.SIGKILL)
+        _kill_group(record.get("pid"), signal.SIGKILL, token=record.get("token"))
         record["kill_sent"] = True
     return events
 
 
 def tick(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Advance every locally-owned or newly-adopted app session by one step."""
+    """Advance every locally-owned or newly-adopted app session by one step.
+
+    Every "starting" session's healthcheck is probed concurrently through a
+    bounded thread pool rather than one blocking ``urlopen`` call at a time
+    on this thread: with several apps starting together, a serial probe
+    blocks the whole daemon tick for up to ``healthcheck_timeout_seconds``
+    per session (review finding #6). The timeout itself is validated
+    operator config, not a hardcoded constant.
+    """
     restore_app_sessions(cfg)
     events: list[dict[str, Any]] = []
-    for row in store.nonterminal_app_sessions():
+    rows = store.nonterminal_app_sessions()
+    probe_timeout = float(cfg.get("healthcheck_timeout_seconds", 2))
+    probe_concurrency = max(1, int(cfg.get("healthcheck_probe_concurrency", 8)))
+    pending: dict[str, Any] = {}
+    pool = ThreadPoolExecutor(max_workers=probe_concurrency, thread_name_prefix="sf-probe")
+    try:
+        for row in rows:
+            aid = row["id"]
+            if row["state"] == "starting" and not row.get("pid") and aid not in _APP_RUNNING:
+                if _try_bind_and_spawn(aid, cfg):
+                    events.append({"id": aid, "event": "spawned"})
+                continue
+            record = _APP_RUNNING.get(aid)
+            if record is None or record["phase"] != "starting" or record["proc"].poll() is not None:
+                continue
+            pending[aid] = pool.submit(
+                _poll_health, record["port"], record["health_path"], record["expected_status"],
+                timeout=probe_timeout,
+            )
+        health_results: dict[str, bool] = {}
+        for aid, future in pending.items():
+            try:
+                health_results[aid] = bool(future.result(timeout=probe_timeout + 1.0))
+            except Exception:
+                health_results[aid] = False
+    finally:
+        pool.shutdown(wait=False)
+    for row in rows:
         aid = row["id"]
-        if row["state"] == "starting" and not row.get("pid") and aid not in _APP_RUNNING:
-            if _try_bind_and_spawn(aid, cfg):
-                events.append({"id": aid, "event": "spawned"})
-            continue
         record = _APP_RUNNING.get(aid)
         if record is None:
             continue
-        events.extend(_advance_one_app(aid, record, cfg))
+        events.extend(_advance_one_app(aid, record, cfg, health_result=health_results.get(aid)))
     return {"events": events}
 
 
@@ -744,10 +1003,7 @@ def request_stop(app_session_id: str, cfg: dict[str, Any]) -> bool:
         sig = getattr(signal, f"SIG{record['stop_signal']}")
     except AttributeError:
         sig = signal.SIGTERM
-    try:
-        os.killpg(record["pid"], sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    _kill_group(record.get("pid"), sig, token=record.get("token"))
     return True
 
 
@@ -756,8 +1012,15 @@ def restore_app_sessions(cfg: dict[str, Any]) -> None:
 
     A pid/start-token match is adopted with its healthcheck contract
     re-derived from the pinned manifest (never trusted from a stale DB
-    snapshot); a mismatch is a crashed session whose port lease is released
-    — a stale PID is never sent a signal on a guess (§2.1.7).
+    snapshot). A daemon crash can also land between ``Popen`` returning and
+    the OS start token being durably recorded (up to two seconds); the pid
+    is already persisted by then (review finding #2), but the token may
+    still be null. Rather than skip that pid (leaving a live orphan holding
+    its port forever) or trust it blindly, every row with a pid gets a
+    verified-kill attempt — token match, or a liveness probe when no token
+    is on record — before its port lease is released; a stale PID is never
+    signalled on a guess, but a live one is never left running untracked
+    either (§2.1.7, review finding #2/#3).
     """
     for row in store.nonterminal_app_sessions():
         aid = row["id"]
@@ -768,6 +1031,7 @@ def restore_app_sessions(cfg: dict[str, Any]) -> None:
         if not pid:
             continue
         if not (token and _spawn._process_start_token(int(pid)) == token):
+            _spawn.verified_killpg(int(pid), token)
             store.update_app_session_state(
                 aid, "crashed", last_error="pid reused or dead across daemon restart",
             )
@@ -794,15 +1058,28 @@ def restore_app_sessions(cfg: dict[str, Any]) -> None:
             if phase == "stopping" else
             _monotonic_deadline_from_iso(row.get("started_at"), int(cfg["startup_timeout_seconds"]))
         )
-        _APP_RUNNING[aid] = {
-            "proc": _spawn._AdoptedProcess(int(pid), token), "pid": int(pid), "phase": phase,
-            "port": row.get("port"), "port_lease_key": row.get("port_lease_key"),
-            "log_path": Path(row["stdout_path"]) if row.get("stdout_path") else None,
+        log_path = Path(row["stdout_path"]) if row.get("stdout_path") else None
+        record: dict[str, Any] = {
+            "proc": _spawn._AdoptedProcess(int(pid), token), "pid": int(pid), "token": token,
+            "phase": phase, "port": row.get("port"), "port_lease_key": row.get("port_lease_key"),
+            "port_lease_seconds": (
+                int(cfg["startup_timeout_seconds"]) + int(cfg["shutdown_timeout_seconds"]) + 300
+            ),
+            "log_path": log_path,
             "health_path": app_config["healthcheck"]["path"],
             "expected_status": app_config["healthcheck"]["expected_status"],
             "stop_signal": app_config["stop_signal"],
             "deadline": deadline, "kill_sent": False,
         }
+        if log_path is not None:
+            def _on_output_cap_exceeded(aid=aid, record=record) -> None:
+                store.mark_app_session_output_capped(aid)
+                _kill_group(record.get("pid"), token=record.get("token"))
+
+            record["output_watch"] = _watch_output_cap(
+                log_path, cfg["max_output_bytes"], _on_output_cap_exceeded,
+            )
+        _APP_RUNNING[aid] = record
 
 
 __all__ = [

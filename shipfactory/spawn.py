@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,33 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def verified_killpg(pid: int | None, token: str | None, sig: int = signal.SIGKILL) -> bool:
+    """Signal a process group only after reconfirming its OS start identity.
+
+    A PID (and its process group) can be reused by an unrelated process
+    between whenever it was last observed alive and the moment we act on
+    that observation — the same race ``_AdoptedProcess``/``restore_running``
+    guard against on daemon restart, just at a shorter timescale (one poll
+    to the next signal). This re-probes ``token`` immediately before the
+    ``killpg`` call so a stale identity is never signalled. When no token is
+    available (degraded environment with neither ``psutil`` nor ``ps``),
+    falls back to a liveness check rather than skipping the signal entirely.
+    """
+    if not pid:
+        return False
+    pid = int(pid)
+    if token is not None:
+        if _process_start_token(pid) != token:
+            return False
+    elif not _pid_alive(pid):
+        return False
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
 
 
 class _AdoptedProcess:
