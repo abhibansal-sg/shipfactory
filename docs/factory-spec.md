@@ -281,7 +281,11 @@ surface, no core patches, no npm anything.
 
 store.py MUST export (sqlite3, factory.db at get_hermes_home()/factory/factory.db):
   init_db() -> None                       # idempotent CREATE TABLE IF NOT EXISTS
-  record_run_start(task_id, seat, executor, model, pid) -> run_id:int
+  record_run_start(task_id, seat, executor, model, pid=None, *, board,
+                   workspace_path, log_path, prompt_path, provider,
+                   resolved_model, executor_version, process_start_token=None) -> run_id:int
+  record_run_spawned(run_id, pid, process_start_token) -> None
+  nonterminal_runs() -> list[dict]
   record_run_end(run_id, exit_code, tokens_in, tokens_out, duration_s, result) -> None
   get_policy(task_id) -> dict|None ; set_policy(task_id, policy: dict) -> None
   record_decision(task_id, stage_id, stage_type, seat, outcome, body) -> None
@@ -420,6 +424,9 @@ recipes:
   notify_target: telegram:home
   board_day_token_ceiling: 500000
   dispatcher_max_in_progress: 4
+  max_workers: 2
+  watchdog_subprocess_timeout_seconds: 120
+  watchdog_tick_timeout_seconds: 120
   execution_profiles:
     standard:
       max_runtime_seconds: 1800
@@ -427,7 +434,7 @@ recipes:
       token_allowance: 50000
 ```
 
-Every referenced execution profile and seat MUST exist at startup. Factory SHALL pass `dispatcher_max_in_progress` to `dispatch_once`. Recipe YAML SHALL NOT declare concurrency, executor, model, or arbitrary retry values. Seats own executor and model; execution profiles own runtime, retry, and admission bounds.
+Every referenced execution profile and seat MUST exist at startup. Factory SHALL pass `dispatcher_max_in_progress` to `dispatch_once`. `max_workers` is an operator-owned machine capacity (default 2); dispatch SHALL acquire a durable `worker_slot` lease and queue when capacity is exhausted. Recipe YAML SHALL NOT declare concurrency, executor, model, or arbitrary retry values. Seats own executor and model; execution profiles own runtime, retry, and admission bounds.
 
 #### 17.3 Recipe YAML schema
 

@@ -7,12 +7,15 @@ import importlib
 import json
 import subprocess
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 
 TERMINAL_STATUSES = {"done", "archived", "failed", "cancelled"}
 LIVE_RUN_STATUSES = {"queued", "running", "scheduled_retry", "in_progress"}
 RECOVERY_LADDER = ("wake_owner", "create_recovery_task", "escalate_to_board")
+_ACTIVE_COMMAND_TIMEOUT = 120.0
+_ACTIVE_TICK_DEADLINE: float | None = None
 
 
 def _module(name: str) -> Any:
@@ -210,10 +213,18 @@ def classify_subtree(input: dict[str, Any]) -> dict[str, Any]:
     return classify_task_watchdog_subtree(input)
 
 
-def _run_kanban(board: str, args: list[str], *, parse_json: bool = False) -> Any:
+def _run_kanban(board: str, args: list[str], *, parse_json: bool = False,
+                timeout: float | None = None) -> Any:
     """Run a kanban command through Hermes' CLI boundary."""
-
-    result = subprocess.run(["hermes", "kanban", "--board", board, *args], check=True, capture_output=True, text=True)
+    command = ["hermes", "kanban", "--board", board, *args]
+    bounded = float(timeout if timeout is not None else _ACTIVE_COMMAND_TIMEOUT)
+    if _ACTIVE_TICK_DEADLINE is not None:
+        bounded = min(bounded, max(0.0, _ACTIVE_TICK_DEADLINE - monotonic()))
+    if bounded <= 0:
+        raise subprocess.TimeoutExpired(command, 0)
+    result = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=bounded,
+    )
     if not parse_json:
         return None
     try:
@@ -307,7 +318,9 @@ def _route_recovery(row: dict[str, Any], board: str, now: str) -> dict[str, Any]
     return {"task_id": task_id, "action": action}
 
 
-def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None) -> list[dict[str, Any]]:
+def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None,
+         *, command_timeout_seconds: float | None = None,
+         tick_timeout_seconds: float | None = None) -> list[dict[str, Any]]:
     """Run due monitor recoveries once and return the actions taken.
 
     ``conn`` is accepted for daemon compatibility; Factory watchdog state is
@@ -316,6 +329,7 @@ def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None)
     supported as a compact form.
     """
 
+    global _ACTIVE_COMMAND_TIMEOUT, _ACTIVE_TICK_DEADLINE
     store = _module("shipfactory.store")
     if isinstance(conn, str) and board is not None and now_iso is None and "T" in board:
         now_iso, board, conn = board, conn, None
@@ -325,7 +339,51 @@ def tick(conn: Any = None, board: str | None = None, now_iso: str | None = None)
     rows = store.due_monitors(now)
     if board is None:
         board = getattr(_module("shipfactory.config").load_seats(), "company", "")
-    return [_route_recovery(row, board, now) for row in rows]
+    if command_timeout_seconds is None or tick_timeout_seconds is None:
+        try:
+            config = _module("shipfactory.config")
+            cfg = config.load_seats()
+            limits = config.recipe_runtime_config(getattr(cfg, "recipes", None))
+        except Exception:
+            limits = {
+                "watchdog_subprocess_timeout_seconds": 120,
+                "watchdog_tick_timeout_seconds": 120,
+            }
+        command_timeout_seconds = command_timeout_seconds or limits[
+            "watchdog_subprocess_timeout_seconds"
+        ]
+        tick_timeout_seconds = tick_timeout_seconds or limits[
+            "watchdog_tick_timeout_seconds"
+        ]
+    _ACTIVE_COMMAND_TIMEOUT = float(command_timeout_seconds)
+    _ACTIVE_TICK_DEADLINE = monotonic() + float(tick_timeout_seconds)
+    outcomes: list[dict[str, Any]] = []
+    try:
+        for row in rows:
+            if monotonic() >= _ACTIVE_TICK_DEADLINE:
+                break
+            task_id = str(row["task_id"])
+            try:
+                outcome = _route_recovery(row, board, now)
+            except subprocess.TimeoutExpired as exc:
+                error = f"kanban subprocess timed out after {exc.timeout}s"
+                if hasattr(store, "record_monitor_outcome"):
+                    store.record_monitor_outcome(task_id, "timed_out", error)
+                attempts = int(row.get("attempt_count", 0) or 0) + 1
+                close = attempts >= int(row.get("max_attempts", 1) or 1)
+                store.advance_monitor(task_id, now, close=close)
+                outcome = {"task_id": task_id, "action": "timed_out", "reason": error}
+            else:
+                if hasattr(store, "record_monitor_outcome"):
+                    store.record_monitor_outcome(
+                        task_id, str(outcome.get("action") or "checked"),
+                        str(outcome.get("reason")) if outcome.get("reason") else None,
+                    )
+            outcomes.append(outcome)
+    finally:
+        _ACTIVE_TICK_DEADLINE = None
+        _ACTIVE_COMMAND_TIMEOUT = 120.0
+    return outcomes
 
 
 def reconcile_watchdog(input: dict[str, Any], board: str | None = None) -> dict[str, Any]:

@@ -32,6 +32,7 @@ class CodexExecutor(Executor):
     def parse_usage(self, log_text: str) -> dict:
         """Parse Codex JSONL usage, then its human ``tokens used`` fallback."""
         tokens_in = tokens_out = 0
+        observed = False
         for line in log_text.splitlines():
             try:
                 event = json.loads(line)
@@ -40,13 +41,15 @@ class CodexExecutor(Executor):
             usage = event.get("usage") or event.get("total_usage") or {}
             if not isinstance(usage, dict):
                 continue
+            if any(key in usage for key in ("input_tokens", "input", "output_tokens", "output")):
+                observed = True
             tokens_in = max(tokens_in, int(usage.get("input_tokens", usage.get("input", 0)) or 0))
             tokens_out = max(tokens_out, int(usage.get("output_tokens", usage.get("output", 0)) or 0))
         if not tokens_in and not tokens_out:
             match = re.search(r"tokens\s+used\s*\n\s*([\d,]+)", log_text, re.I)
             if match:
                 return token_usage(0, int(match.group(1).replace(",", "")))
-        return token_usage(tokens_in, tokens_out)
+        return token_usage(tokens_in, tokens_out) if observed else token_usage()
 
     def identity_files(self, seat, workspace: str) -> None:
         """Place the profile's Codex-recognized ``AGENTS.md`` at workspace root."""

@@ -64,13 +64,13 @@ Fixed (#16-OPERATOR F1): prompt is written to a durable file
 test: test_huge_prompt_to_non_reading_child_does_not_wedge_dispatch.
 Bonus: the .prompt file is a durable audit artifact per run.
 
-Remaining operator findings deferred with owners (not silent):
-- F2 _RUNNING process-memory only — daemon restart orphans live harness
-  runs (tasks recover via kanban TTL, telemetry lost). Fix when factory
-  goes live: persist pid map in store, rescan on start.
-- F3 record_run_start after Popen — locked-store failure leaves an
-  untracked running harness. Mitigated by WAL+busy_timeout (V2 fix);
-  full fix rides F2's persistence change.
+Resolved in A1 (2026-07-15):
+- F2 process identity is durable in `runs`; restart reconciliation verifies
+  PID start tokens, re-adopts live workers, and crashes stale identities.
+- F3 the run row and worker-slot lease are durable before `Popen`; PID and
+  its OS start token are attached immediately after a successful spawn.
+
+Remaining operator note:
 - Model-capability note: the analysis half of this lane ran on luna-high;
   it produced a faithful call-site TABLE (26 rows, honest mechanics)
   but misjudged the one severity that mattered (F1 "accepted risk").

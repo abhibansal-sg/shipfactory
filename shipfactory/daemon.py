@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import inspect
 import json
 import os
 import logging
@@ -207,18 +208,36 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     result_recipes = None
     result_selector = None
     cfg = validate_recipe_mode(required=require_recipes)
+    max_workers = 2
     if cfg is not None:
+        try:
+            from shipfactory.config import recipe_runtime_config
+            runtime_cfg = recipe_runtime_config(cfg.recipes)
+        except ImportError:  # isolated compatibility stubs
+            runtime_cfg = {"max_workers": 2}
+        max_workers = int(runtime_cfg["max_workers"])
+        import shipfactory.spawn as spawn_module
+        restore = getattr(spawn_module, "restore_running", None)
+        if restore is not None:
+            restore(max_workers=max_workers)
         recipes_cfg = cfg.recipes or {}
         if recipes_cfg.get("enabled"):
             from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
             dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
             recipe_board = board or cfg.company
+            event_kwargs = {
+                "profiles": recipes_cfg["execution_profiles"],
+                "board": recipe_board,
+            }
+            try:
+                if "board_day_token_ceiling" in inspect.signature(apply_events).parameters:
+                    event_kwargs["board_day_token_ceiling"] = int(
+                        recipes_cfg.get("board_day_token_ceiling", 10**18)
+                    )
+            except (TypeError, ValueError):
+                pass
             result_recipes = {
-                "events": apply_events(
-                    conn,
-                    profiles=recipes_cfg["execution_profiles"],
-                    board=recipe_board,
-                ),
+                "events": apply_events(conn, **event_kwargs),
                 "outbox": deliver_outbox(conn, board=recipe_board),
                 "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
             }
@@ -233,6 +252,13 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     # and records a protocol violation — burning the failure fuse on workers
     # that completed perfectly. Reaping first finalizes their kanban state.
     reaped = reap_finished()
+    if cfg is not None and hasattr(conn, "execute"):
+        from shipfactory import store
+        available = store.available_resource_units("worker_slot", max_workers)
+        running = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='running'"
+        ).fetchone()[0])
+        dispatch_kwargs["max_spawn"] = running + available
     dispatched = dispatch_once(conn, spawn_fn=shipfactory_spawn, board=board, **dispatch_kwargs)
     reaped += reap_finished()
     _board_db_health_pass(conn, board)
