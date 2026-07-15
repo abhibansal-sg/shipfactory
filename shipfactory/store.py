@@ -131,11 +131,20 @@ _A1_MIGRATION_STATEMENTS = (
     "CREATE INDEX idx_resource_leases_active ON resource_leases(kind,state,lease_until)",
 )
 _A1_MIGRATION_TEXT = ";\n".join(_A1_MIGRATION_STATEMENTS) + ";\n"
+_A1_FENCING_MIGRATION_STATEMENTS = (
+    "ALTER TABLE runs ADD COLUMN task_attempt_id INTEGER",
+)
+_A1_FENCING_MIGRATION_TEXT = ";\n".join(_A1_FENCING_MIGRATION_STATEMENTS) + ";\n"
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
+    (3, "a1_worker_transition_attempt_fencing", _A1_FENCING_MIGRATION_TEXT),
 )
-_MIGRATION_STATEMENTS = {1: _A0_MIGRATION_STATEMENTS, 2: _A1_MIGRATION_STATEMENTS}
+_MIGRATION_STATEMENTS = {
+    1: _A0_MIGRATION_STATEMENTS,
+    2: _A1_MIGRATION_STATEMENTS,
+    3: _A1_FENCING_MIGRATION_STATEMENTS,
+}
 
 
 def _now() -> str:
@@ -256,7 +265,7 @@ def init_db() -> None:
                         or "lease_owner" in outbox_columns
                         or bool({"action_intents", "resource_leases"} & existing_tables)
                     )
-                else:
+                elif version == 2:
                     run_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(runs)"
                     )}
@@ -271,6 +280,11 @@ def init_db() -> None:
                         or {"state", "last_outcome"} & monitor_columns
                         or "idx_resource_leases_active" in indexes
                     )
+                else:
+                    run_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(runs)"
+                    )}
+                    migration_artifacts = "task_attempt_id" in run_columns
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:
@@ -288,25 +302,26 @@ def init_db() -> None:
 def record_run_start(task_id, seat, executor, model, pid=None, *, board=None,
                      workspace_path=None, log_path=None, prompt_path=None,
                      provider=None, resolved_model=None, executor_version=None,
-                     process_start_token=None) -> int:
+                     process_start_token=None, task_attempt_id=None) -> int:
     """Insert a running harness execution and return its run id."""
     init_db()
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO runs(task_id,seat,executor,model,pid,started_at,tokens_in,tokens_out,"
             "tokens_total,board,workspace_path,log_path,prompt_path,provider,resolved_model,"
-            "executor_version,process_start_token) "
-            "VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?)",
+            "executor_version,process_start_token,task_attempt_id) "
+            "VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?)",
             (task_id, seat, executor, model or "", pid, _now(), board,
              str(workspace_path) if workspace_path is not None else None,
              str(log_path) if log_path is not None else None,
              str(prompt_path) if prompt_path is not None else None,
-             provider, resolved_model, executor_version, process_start_token),
+             provider, resolved_model, executor_version, process_start_token,
+             int(task_attempt_id) if task_attempt_id is not None else None),
         )
         return int(cur.lastrowid)
 
 
-def record_run_spawned(run_id: int, pid: int, process_start_token: str) -> None:
+def record_run_spawned(run_id: int, pid: int, process_start_token: str | None) -> None:
     """Attach the OS identity only after a pre-spawn run row is durable."""
     with _connect() as conn:
         changed = conn.execute(

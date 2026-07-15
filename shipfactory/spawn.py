@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import re
 import shlex
@@ -18,6 +19,14 @@ _RESULT_RE = re.compile(r"^SHIPFACTORY_RESULT:\s*(done|blocked)\s+(.+?)\s*$", re
 _VERDICT_RE = re.compile(r"^SHIPFACTORY_VERDICT:\s*\{.*\}\s*$")
 _RUNNING: dict[int, dict[str, Any]] = {}
 _WORKER_LEASE_SECONDS = 300
+_START_TOKEN_OBSERVATION_SECONDS = 2.0
+
+
+logger = logging.getLogger(__name__)
+
+
+class WorkerCapacityExhausted(RuntimeError):
+    """Queue-only signal: no worker slot was available for this claim."""
 
 
 def _store_module() -> Any:
@@ -68,25 +77,45 @@ def _process_start_token(pid: int) -> str | None:
 
 
 def _capture_start_token(pid: int, proc: Any | None = None) -> str | None:
-    """Observe a just-spawned process across the short ps visibility race."""
-    for _ in range(5):
+    """Observe a new process for up to two seconds with bounded backoff."""
+    deadline = monotonic() + _START_TOKEN_OBSERVATION_SECONDS
+    delay = 0.02
+    while True:
         token = _process_start_token(pid)
         if token is not None:
             return token
         if proc is not None and proc.poll() is not None:
             return f"exited-before-identity:{pid}:{time_ns()}"
-        sleep(0.01)
-    return None
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return None
+        sleep(min(delay, remaining))
+        delay = min(delay * 2, 0.25)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness probe used only when an OS start token is absent."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 class _AdoptedProcess:
     """Minimal pollable handle for a worker whose original parent restarted."""
 
-    def __init__(self, pid: int, token: str):
+    def __init__(self, pid: int, token: str | None):
         self.pid = int(pid)
         self._token = token
 
     def poll(self) -> int | None:
+        if self._token is None:
+            return None if _pid_alive(self.pid) else 255
         return None if _process_start_token(self.pid) == self._token else 255
 
 
@@ -140,6 +169,8 @@ def _plan_worker_transition(record: dict[str, Any], result: str, summary: str) -
     plan_worker_transition(
         run_id=int(record["run_id"]), task_id=str(record["task_id"]),
         board=record.get("board"), result=result, summary=summary,
+        process_start_token=record.get("process_start_token"),
+        task_attempt_id=record.get("task_attempt_id"),
     )
 
 
@@ -226,6 +257,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         "provider": seat.executor,
         "resolved_model": seat.model or "",
         "executor_version": str(getattr(executor, "version", "1")),
+        "task_attempt_id": _value(task, "current_run_id"),
     }
     try:
         run_id = store.record_run_start(
@@ -241,8 +273,11 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
             metadata={"run_id": run_id, "task_id": task_id, "board": board},
         )
         if acquired is None:
-            store.record_run_end(run_id, -1, None, None, 0.0, "capacity_refused")
-            raise RuntimeError("worker_slot capacity exhausted")
+            try:
+                store.record_run_end(run_id, -1, None, None, 0.0, "capacity_refused")
+            except Exception:
+                logger.exception("Factory could not record capacity refusal for run %s", run_id)
+            raise WorkerCapacityExhausted("worker_slot capacity exhausted")
 
     proc: Any
     pid: int | None = None
@@ -250,8 +285,6 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         if seat.executor == "hermes":
             pid = int(kanban_db._default_spawn(task, workspace, board=board))
             token = _capture_start_token(pid)
-            if token is None:
-                token = f"exited-before-identity:{pid}:{time_ns()}"
             proc = _AdoptedProcess(pid, token)
         else:
             command = executor.build_cmd(seat, prompt, str(root))
@@ -282,35 +315,47 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
                 log_file.close()
             pid = int(proc.pid)
             token = _capture_start_token(pid, proc)
-            if token is None:
-                if hasattr(store, "record_run_spawned"):
-                    raise RuntimeError(f"spawned worker {pid} has no process identity")
-                else:
-                    token = f"unverified:{pid}:{time_ns()}"
+        if hasattr(store, "record_run_spawned"):
+            store.record_run_spawned(run_id, pid, token)
+        _RUNNING[pid] = {
+            "proc": proc, "run_id": run_id, "task_id": task_id,
+            "executor": seat.executor, "board": board, "log_path": log_path,
+            "prompt_path": prompt_path, "workspace_path": root,
+            "process_start_token": token,
+            "task_attempt_id": _value(task, "current_run_id"),
+            "lease_key": lease_key,
+            "started": monotonic(), "started_at": datetime.now(timezone.utc).isoformat(),
+            "adopted": seat.executor == "hermes",
+        }
     except Exception:
         if pid is not None:
             try:
                 os.killpg(pid, 15)
             except ProcessLookupError:
                 pass
-        if hasattr(store, "record_run_crashed"):
-            store.record_run_crashed(run_id, "spawn failed")
-        else:
-            store.record_run_end(run_id, -1, None, None, 0.0, "spawn_failed")
-        if hasattr(store, "release_resource_lease"):
-            store.release_resource_lease(lease_key)
+            except OSError:
+                terminate = getattr(locals().get("proc"), "terminate", None)
+                if terminate is not None:
+                    try:
+                        terminate()
+                    except Exception:
+                        logger.exception("Factory could not terminate failed spawn pid %s", pid)
+        try:
+            if hasattr(store, "record_run_crashed"):
+                store.record_run_crashed(run_id, "spawn failed")
+            else:
+                store.record_run_end(run_id, -1, None, None, 0.0, "spawn_failed")
+        except Exception:
+            logger.exception("Factory could not record failed spawn run %s", run_id)
+        finally:
+            if hasattr(store, "release_resource_lease"):
+                try:
+                    store.release_resource_lease(lease_key)
+                except Exception:
+                    logger.exception("Factory could not release failed spawn lease %s", lease_key)
+            if pid is not None:
+                _RUNNING.pop(pid, None)
         raise
-
-    if hasattr(store, "record_run_spawned"):
-        store.record_run_spawned(run_id, pid, token)
-    _RUNNING[pid] = {
-        "proc": proc, "run_id": run_id, "task_id": task_id,
-        "executor": seat.executor, "board": board, "log_path": log_path,
-        "prompt_path": prompt_path, "workspace_path": root,
-        "process_start_token": token, "lease_key": lease_key,
-        "started": monotonic(), "started_at": datetime.now(timezone.utc).isoformat(),
-        "adopted": seat.executor == "hermes",
-    }
     return pid
 
 
@@ -355,7 +400,9 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
                 store.renew_resource_lease(lease_key, lease_seconds=_WORKER_LEASE_SECONDS)
             restored.append(pid)
             continue
-        if pid > 0 and token and _process_start_token(pid) == token:
+        identity_matches = bool(token) and _process_start_token(pid) == token
+        pid_only_matches = token is None and pid > 0 and _pid_alive(pid)
+        if pid > 0 and (identity_matches or pid_only_matches):
             if hasattr(store, "acquire_resource_lease"):
                 store.acquire_resource_lease(
                     "worker_slot", lease_capacity, key=lease_key,
@@ -369,7 +416,9 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
                 "board": row.get("board"), "log_path": row.get("log_path"),
                 "prompt_path": row.get("prompt_path"),
                 "workspace_path": row.get("workspace_path"),
-                "process_start_token": token, "lease_key": lease_key,
+                "process_start_token": token,
+                "task_attempt_id": row.get("task_attempt_id"),
+                "lease_key": lease_key,
                 "started_at": row.get("started_at"), "adopted": True,
             }
             restored.append(pid)
@@ -381,6 +430,8 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
         record = {
             "run_id": run_id, "task_id": row["task_id"],
             "board": row.get("board"), "executor": row["executor"],
+            "process_start_token": token,
+            "task_attempt_id": row.get("task_attempt_id"),
         }
         _plan_worker_transition(record, "blocked", f"worker crashed: {reason}")
         boards.add(row.get("board"))
@@ -465,4 +516,6 @@ def reap_finished() -> list[dict]:
     return finished
 
 
-__all__ = ["shipfactory_spawn", "restore_running", "reap_finished"]
+__all__ = [
+    "WorkerCapacityExhausted", "shipfactory_spawn", "restore_running", "reap_finished",
+]

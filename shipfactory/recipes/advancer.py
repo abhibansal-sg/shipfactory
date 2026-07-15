@@ -121,7 +121,9 @@ def _plan_action(db: Any, *, logical_key: str, kind: str, payload: dict[str, Any
 
 
 def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
-                           result: str, summary: str) -> str:
+                           result: str, summary: str,
+                           process_start_token: str | None,
+                           task_attempt_id: int | None) -> str:
     """Journal one reaped worker's board transition as a recoverable effect."""
     store.init_db()
     logical_key = hashlib.sha256(
@@ -131,7 +133,11 @@ def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
         return _plan_action(
             db, logical_key=logical_key, kind="worker_task_transition",
             payload={"run_id": int(run_id), "task_id": task_id, "board": board,
-                     "result": result, "summary": summary},
+                     "result": result, "summary": summary,
+                     "process_start_token": process_start_token,
+                     "task_attempt_id": (
+                         int(task_attempt_id) if task_attempt_id is not None else None
+                     )},
         )
 
 def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any],
@@ -844,6 +850,22 @@ def _execute_action(conn: Any, row: dict[str, Any]) -> tuple[str, dict[str, Any]
     if kind == "worker_task_transition":
         task_id = payload["task_id"]
         desired = payload["result"]
+        factory_run = store.run_row(int(payload["run_id"]))
+        task_attempt_id = payload.get("task_attempt_id")
+        identity_mismatch = (
+            factory_run is None
+            or factory_run["task_id"] != task_id
+            or factory_run.get("board") != payload.get("board")
+            or factory_run.get("process_start_token") != payload.get("process_start_token")
+            or factory_run.get("task_attempt_id") != task_attempt_id
+            or task_attempt_id is None
+        )
+        if identity_mismatch:
+            return "abandoned", {
+                "task_id": task_id,
+                "probe": "run_identity_mismatch",
+                "run_id": payload.get("run_id"),
+            }, "worker transition run identity missing or mismatched"
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             return "terminal_failed", {"task_id": task_id}, "kanban task missing"
@@ -856,19 +878,29 @@ def _execute_action(conn: Any, row: dict[str, Any]) -> tuple[str, dict[str, Any]
             ):
                 return "succeeded", {"task_id": task_id, "probe": f"already_{status}"}, None
             return "abandoned", {"task_id": task_id, "probe": f"terminal_{status}"}, None
+        if task.current_run_id != int(task_attempt_id):
+            return "abandoned", {
+                "task_id": task_id,
+                "probe": "task_attempt_mismatch",
+                "expected_task_attempt_id": int(task_attempt_id),
+                "observed_task_attempt_id": task.current_run_id,
+            }, "worker transition belongs to a superseded task attempt"
         if desired == "done":
             try:
                 changed = kanban_db.complete_task(
                     conn, task_id, result=payload["summary"], summary=payload["summary"],
+                    expected_run_id=int(task_attempt_id),
                 )
             except TypeError:
                 changed = kanban_db.complete_task(
                     conn, task_id, summary=payload["summary"],
+                    expected_run_id=int(task_attempt_id),
                 )
             expected = "done"
         else:
             changed = kanban_db.block_task(
                 conn, task_id, reason=payload["summary"],
+                expected_run_id=int(task_attempt_id),
             )
             expected = "blocked"
         verified = kanban_db.get_task(conn, task_id)
