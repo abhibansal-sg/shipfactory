@@ -151,9 +151,7 @@ def _pause_after_effect(home: str, kanban_path: str, kinds, ready) -> None:
     )
     assert row is not None
     state, result, error = child_advancer._execute_action(conn, row)
-    with open("/tmp/dbg_pause_after_effect.log", "a") as f:
-        f.write(f"row={row!r}\nstate={state!r} result={result!r} error={error!r}\n")
-    assert state == "succeeded"
+    assert state == "succeeded", f"row={row!r} state={state!r} result={result!r} error={error!r}"
     ready.set()
     time.sleep(60)
 
