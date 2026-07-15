@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import uuid
@@ -79,6 +80,13 @@ def _string_list(document: dict[str, Any], schema: str, fields: Iterable[str]) -
             raise ArtifactValidationError(f"{schema} field {field} must be a string list")
 
 
+def _hash_string(value: Any, lengths: tuple[int, ...]) -> bool:
+    return (
+        isinstance(value, str) and len(value) in lengths
+        and bool(re.fullmatch(r"[0-9a-fA-F]+", value))
+    )
+
+
 def _validate_exploration(document: dict[str, Any]) -> None:
     schema = "shipfactory.exploration/v1"
     required = {
@@ -86,9 +94,13 @@ def _validate_exploration(document: dict[str, Any]) -> None:
         "direct_callers", "constraints", "untrusted_directives", "unknowns",
     }
     _require_keys(document, schema, required)
-    for field in ("intent_sha256", "base_sha", "repo_tree_sha"):
-        if not isinstance(document[field], str) or not document[field]:
-            raise ArtifactValidationError(f"{schema} field {field} must be a string")
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
+    if not _hash_string(document["intent_sha256"], (64,)):
+        raise ArtifactValidationError(f"{schema} field intent_sha256 must be a sha256")
+    for field in ("base_sha", "repo_tree_sha"):
+        if not _hash_string(document[field], (40, 64)):
+            raise ArtifactValidationError(f"{schema} field {field} must be a git hash")
     if not isinstance(document["references"], list):
         raise ArtifactValidationError(f"{schema} references must be a list")
     _string_list(document, schema, ("constraints", "untrusted_directives", "unknowns"))
@@ -105,11 +117,25 @@ def _validate_exploration(document: dict[str, Any]) -> None:
                 reference, f"{schema} reference {index}",
                 {"path", "git_blob_sha", "start_line", "end_line", "text_sha256"},
             )
+            if (not isinstance(reference["git_blob_sha"], str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", reference["git_blob_sha"])
+                    or not isinstance(reference["text_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", reference["text_sha256"])):
+                raise ArtifactValidationError(
+                    f"{schema} reference {index} has invalid hashes"
+                )
         if reference["status"] == "proposed":
             _require_keys(
                 reference, f"{schema} reference {index}",
                 {"path", "reason", "intended_parent_directory"},
             )
+        for field in ("path", "reason", "intended_parent_directory"):
+            if field in reference and (
+                not isinstance(reference[field], str) or not reference[field]
+            ):
+                raise ArtifactValidationError(
+                    f"{schema} reference {index} field {field} must be a nonempty string"
+                )
 
 
 def _validate_task_spec(document: dict[str, Any]) -> None:
@@ -120,23 +146,37 @@ def _validate_task_spec(document: dict[str, Any]) -> None:
         "rollback_notes", "assumptions", "clarifications",
     }
     _require_keys(document, schema, required)
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
     for field in ("intent_artifact_id", "problem", "rollback_notes"):
-        if not isinstance(document[field], str):
+        if not isinstance(document[field], str) or not document[field]:
             raise ArtifactValidationError(f"{schema} field {field} must be a string")
+    if not _hash_string(document["intent_artifact_id"], (64,)):
+        raise ArtifactValidationError(f"{schema} intent_artifact_id must be an artifact id")
     for field in (
         "non_goals", "target_files", "forbidden_paths", "risk_tags",
         "acceptance_cases", "assumptions", "clarifications",
     ):
         if not isinstance(document[field], list):
             raise ArtifactValidationError(f"{schema} field {field} must be a list")
+    _string_list(
+        document, schema,
+        (
+            "non_goals", "target_files", "forbidden_paths", "risk_tags",
+            "acceptance_cases", "assumptions", "clarifications",
+        ),
+    )
     if not isinstance(document["requirements"], list):
         raise ArtifactValidationError(f"{schema} requirements must be a list")
     ids: set[str] = set()
     for requirement in document["requirements"]:
         if (not isinstance(requirement, dict)
                 or set(requirement) != {"id", "behavior", "oracle", "risk"}
-                or not all(isinstance(requirement[key], str) for key in requirement)):
+                or not all(isinstance(requirement[key], str) and requirement[key]
+                           for key in requirement)):
             raise ArtifactValidationError(f"{schema} has invalid requirement")
+        if not re.fullmatch(r"REQ-[1-9][0-9]*", requirement["id"]):
+            raise ArtifactValidationError(f"{schema} has invalid requirement id")
         if requirement["id"] in ids:
             raise ArtifactValidationError(f"{schema} has duplicate requirement id")
         ids.add(requirement["id"])
@@ -149,7 +189,10 @@ def _validate_plan(document: dict[str, Any]) -> None:
         "shared_file_overlaps", "residual_risks",
     }
     _require_keys(document, schema, required)
-    if not isinstance(document["task_spec_sha256"], str) or not isinstance(document["base_sha"], str):
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
+    if (not _hash_string(document["task_spec_sha256"], (64,))
+            or not _hash_string(document["base_sha"], (40, 64))):
         raise ArtifactValidationError(f"{schema} revision fields must be strings")
     if not isinstance(document["nodes"], list):
         raise ArtifactValidationError(f"{schema} nodes must be a list")
@@ -161,7 +204,10 @@ def _validate_plan(document: dict[str, Any]) -> None:
     for node in document["nodes"]:
         if not isinstance(node, dict) or set(node) != node_keys:
             raise ArtifactValidationError(f"{schema} has invalid node shape")
-        if not isinstance(node["id"], str) or node["id"] in nodes:
+        if (not isinstance(node["id"], str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", node["id"])
+                or node["id"] in nodes
+                or not isinstance(node["title"], str) or not node["title"]
+                or not isinstance(node["kind"], str) or not node["kind"]):
             raise ArtifactValidationError(f"{schema} has invalid or duplicate node id")
         for field in ("needs", "requirements", "allowed_paths", "expected_outputs", "test_cases", "risk_tags"):
             if not isinstance(node[field], list) or not all(isinstance(x, str) for x in node[field]):
@@ -185,6 +231,15 @@ def _validate_plan(document: dict[str, Any]) -> None:
 
     for node_id in nodes:
         visit(node_id)
+    _string_list(
+        document, schema,
+        ("integration_order", "residual_risks"),
+    )
+    if (len(set(document["integration_order"])) != len(document["integration_order"])
+            or any(node_id not in nodes for node_id in document["integration_order"])):
+        raise ArtifactValidationError(f"{schema} integration_order has unknown nodes")
+    if not isinstance(document["shared_file_overlaps"], list):
+        raise ArtifactValidationError(f"{schema} shared_file_overlaps must be a list")
 
 
 _VALIDATORS = {
@@ -299,6 +354,75 @@ def _git(workspace: Path, *args: str) -> str:
         raise ArtifactValidationError(f"repository validation failed: {exc}") from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ArtifactSealError(f"repository validation unavailable: {exc}") from exc
+
+
+def _git_bytes(workspace: Path, *args: str) -> bytes:
+    try:
+        return subprocess.check_output(
+            ["git", *args], cwd=workspace, stderr=subprocess.PIPE, timeout=10,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ArtifactValidationError(f"repository validation failed: {exc}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(f"repository validation unavailable: {exc}") from exc
+
+
+def _repository_path(path: Any, *, label: str) -> str:
+    if not isinstance(path, str) or not path or "\\" in path:
+        raise ArtifactValidationError(f"{label} must be a repository-relative path")
+    parsed = PurePosixPath(path)
+    if (parsed.is_absolute() or not parsed.parts or ".." in parsed.parts
+            or parsed.parts[0] == ".git"):
+        raise ArtifactValidationError(f"{label} must be a repository-relative path")
+    return parsed.as_posix()
+
+
+def _validate_exploration_repository(document: dict[str, Any], workspace: Path) -> None:
+    """Bind every existing exploration citation to bytes at its declared base."""
+    base_sha = document["base_sha"]
+    expected_tree = _git(workspace, "rev-parse", f"{base_sha}^{{tree}}")
+    if document["repo_tree_sha"].lower() != expected_tree.lower():
+        raise ArtifactValidationError(
+            "shipfactory.exploration/v1 repo_tree_sha does not match base_sha"
+        )
+    for index, reference in enumerate(document["references"]):
+        status = reference["status"]
+        if status not in {"existing", "proposed", "generated"}:
+            continue
+        path = _repository_path(
+            reference.get("path"), label=f"exploration reference {index} path",
+        )
+        if status != "existing":
+            continue
+        try:
+            blob_sha = _git(workspace, "rev-parse", f"{base_sha}:{path}")
+            content = _git_bytes(workspace, "show", f"{base_sha}:{path}")
+        except ArtifactValidationError as exc:
+            raise ArtifactValidationError(
+                f"existing exploration path {path!r} is absent at base_sha"
+            ) from exc
+        if reference["git_blob_sha"].lower() != blob_sha.lower():
+            raise ArtifactValidationError(
+                f"exploration reference {index} git_blob_sha mismatch"
+            )
+        start = reference["start_line"]
+        end = reference["end_line"]
+        if (not isinstance(start, int) or isinstance(start, bool) or start < 1
+                or not isinstance(end, int) or isinstance(end, bool) or end < start):
+            raise ArtifactValidationError(
+                f"exploration reference {index} has invalid line range"
+            )
+        lines = content.splitlines(keepends=True)
+        if end > len(lines):
+            raise ArtifactValidationError(
+                f"exploration reference {index} line range exceeds blob"
+            )
+        cited = b"".join(lines[start - 1:end])
+        text_sha = hashlib.sha256(cited).hexdigest()
+        if reference["text_sha256"].lower() != text_sha:
+            raise ArtifactValidationError(
+                f"exploration reference {index} text_sha256 mismatch"
+            )
 
 
 def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:
@@ -447,6 +571,73 @@ def read_artifact(ident: str) -> dict[str, Any]:
     return _verified_row(row)
 
 
+def artifact_document(artifact: dict[str, Any] | str) -> dict[str, Any]:
+    """Return verified JSON for a sealed artifact row or identity."""
+    row = read_artifact(artifact) if isinstance(artifact, str) else _verified_row(artifact)
+    try:
+        document = json.loads(Path(row["sealed_path"]).read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactValidationError(f"sealed artifact document read failed: {exc}") from exc
+    assert isinstance(document, dict)
+    return document
+
+
+def _latest_sealed(db: Any, instance_id: str, kind: str) -> dict[str, Any] | None:
+    row = db.execute(
+        "SELECT * FROM artifacts WHERE instance_id=? AND kind=? AND state='sealed' "
+        "ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+        (instance_id, kind),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _validate_plan_context(document: dict[str, Any], instance_id: str) -> None:
+    """Validate plan coverage and revision binding against sealed inputs."""
+    with store._connect() as db:
+        task_spec = _latest_sealed(db, instance_id, "task-spec")
+        exploration = _latest_sealed(db, instance_id, "exploration")
+    if task_spec is None:
+        raise ArtifactValidationError("shipfactory.plan/v1 requires a sealed task-spec")
+    if document["task_spec_sha256"].lower() != str(task_spec["sha256"]).lower():
+        raise ArtifactValidationError("shipfactory.plan/v1 task_spec_sha256 mismatch")
+    bases = {str(task_spec["base_sha"]), document["base_sha"]}
+    if exploration is not None:
+        bases.add(str(exploration["base_sha"]))
+    if len(bases) != 1:
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 base_sha differs from exploration or task-spec"
+        )
+    spec = artifact_document(task_spec)
+    requirement_ids = {item["id"] for item in spec["requirements"]}
+    covered: set[str] = set()
+    for node in document["nodes"]:
+        node_requirements = set(node["requirements"])
+        unknown = node_requirements - requirement_ids
+        if unknown:
+            raise ArtifactValidationError(
+                f"shipfactory.plan/v1 node {node['id']} has unknown requirements"
+            )
+        covered.update(node_requirements)
+        for test_case in node["test_cases"]:
+            mapped = set(re.findall(r"REQ-[1-9][0-9]*", test_case))
+            if not mapped or not mapped <= node_requirements:
+                raise ArtifactValidationError(
+                    f"shipfactory.plan/v1 test case {test_case!r} is not mapped to a requirement"
+                )
+    if covered != requirement_ids:
+        raise ArtifactValidationError(
+            "shipfactory.plan/v1 does not cover every task-spec requirement"
+        )
+
+
+def task_spec_has_clarifications(artifact: dict[str, Any]) -> bool:
+    """Return whether a verified task-spec still contains unresolved questions."""
+    if artifact.get("kind") != "task-spec":
+        raise ArtifactValidationError("clarification check requires a task-spec artifact")
+    document = artifact_document(artifact)
+    return bool(document["clarifications"])
+
+
 def seal_artifact(
     *, instance_id: str, step_id: str, activation: int, run_id: int | None,
     output: dict[str, Any], workspace: str | Path, producer: str,
@@ -488,6 +679,10 @@ def seal_artifact(
             raise ArtifactValidationError("candidate is not valid JSON") from exc
         _validate_document(document, kind=kind, schema=schema)
         base_sha, head_sha, tree_sha = _repository_identity(worktree, document)
+        if kind == "exploration":
+            _validate_exploration_repository(document, worktree)
+        elif kind == "plan":
+            _validate_plan_context(document, instance_id)
         sealed_path = _storage_path(instance_id, step_id, activation, kind)
     except ArtifactSealError:
         # Operational failures keep the durable candidate row retryable.
@@ -674,7 +869,7 @@ def seal_declared_outputs_for_task(
 __all__ = [
     "ArtifactMissing", "ArtifactSealError", "ArtifactStale",
     "ArtifactValidationError", "DEFAULT_ARTIFACT_MAX_BYTES",
-    "artifact_id", "artifact_is_stale", "artifact_set_hash", "input_artifacts",
+    "artifact_document", "artifact_id", "artifact_is_stale", "artifact_set_hash", "input_artifacts",
     "output_artifacts", "read_artifact", "record_artifact_edge", "seal_artifact",
-    "seal_declared_outputs_for_task",
+    "seal_declared_outputs_for_task", "task_spec_has_clarifications",
 ]

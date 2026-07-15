@@ -1,0 +1,360 @@
+"""SF-6 serial planning, typed artifacts, and v2 budget regressions."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from shipfactory import store
+from shipfactory.artifacts import seal_artifact
+from shipfactory.recipes.advancer import reconcile
+from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.loader import load_library
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_PROFILES = {
+    "planning": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 30_000},
+    "review": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 25_000},
+    "build": {"max_runtime_seconds": 1800, "max_retries": 2, "token_allowance": 50_000},
+}
+PUBLISHED_SHA256 = {
+    1: "fff1275c003037ed84c35e97a38f8c07210b7143f871eb81dcc1b2c11455ab45",
+    2: "80743ca9c35d5455fc8c273a02cb7cdfc35c273a682ce4ed61a8327575f2152f",
+    3: "79f7812a5372d9e97781ccfb501198ed3cc3c13728d50c291f2e07f8d0fe6d45",
+    4: "4fc4ba60ae33754b8a7bc4180bf3fe33ca851a1c167c7105f7b9d0216dc4f68c",
+}
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+
+
+def _repo(tmp_path: Path) -> tuple[Path, str, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "README.md").write_text("planning fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Planning Test",
+        "GIT_AUTHOR_EMAIL": "planning@example.invalid",
+        "GIT_COMMITTER_NAME": "Planning Test",
+        "GIT_COMMITTER_EMAIL": "planning@example.invalid",
+    }
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, env=env, check=True)
+    return repo, _git(repo, "rev-parse", "HEAD"), _git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def _candidate(repo: Path, relative: str, document: dict) -> None:
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _exploration(base_sha: str, tree_sha: str, references: list[dict] | None = None) -> dict:
+    return {
+        "schema": "shipfactory.exploration/v1",
+        "intent_sha256": hashlib.sha256(b"request").hexdigest(),
+        "base_sha": base_sha,
+        "repo_tree_sha": tree_sha,
+        "references": references or [],
+        "direct_callers": [],
+        "constraints": [],
+        "untrusted_directives": [],
+        "unknowns": [],
+    }
+
+
+def _task_spec(exploration_id: str, *, clarifications: list[str] | None = None) -> dict:
+    return {
+        "schema": "shipfactory.task-spec/v1",
+        "intent_artifact_id": exploration_id,
+        "problem": "Make the requested behavior deterministic.",
+        "non_goals": [],
+        "requirements": [{
+            "id": "REQ-1", "behavior": "The behavior is deterministic.",
+            "oracle": "A regression test passes.", "risk": "control-plane",
+        }],
+        "target_files": ["README.md"],
+        "forbidden_paths": [],
+        "risk_tags": ["control-plane"],
+        "acceptance_cases": ["TEST-REQ-1-A"],
+        "rollback_notes": "Revert the change.",
+        "assumptions": [],
+        "clarifications": clarifications or [],
+    }
+
+
+def _plan(base_sha: str, task_spec_sha: str) -> dict:
+    return {
+        "schema": "shipfactory.plan/v1",
+        "task_spec_sha256": task_spec_sha,
+        "base_sha": base_sha,
+        "nodes": [{
+            "id": "build-readme", "title": "Build the change", "needs": [],
+            "kind": "logic", "requirements": ["REQ-1"],
+            "allowed_paths": ["README.md"], "expected_outputs": ["change-set"],
+            "test_cases": ["TEST-REQ-1-A"], "risk_tags": ["control-plane"],
+        }],
+        "integration_order": ["build-readme"],
+        "shared_file_overlaps": [],
+        "residual_risks": [],
+    }
+
+
+def _step(instance_id: str, step_id: str, activation: int | None = None) -> dict:
+    with store._connect() as db:
+        if activation is None:
+            row = db.execute(
+                "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+                "ORDER BY activation DESC LIMIT 1", (instance_id, step_id),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+                (instance_id, step_id, activation),
+            ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def _complete_review(conn, task_id: str, outcome: str, target: str | None = None) -> None:
+    from hermes_cli import kanban_db
+    verdict = {"outcome": outcome, "body": "APPROVE clean pass"}
+    if target:
+        verdict = {
+            "outcome": "request_changes", "target_step": target,
+            "body": "README.md:1 requires changes",
+        }
+    result = "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+    assert kanban_db.complete_task(conn, task_id, result=result, summary="reviewed")
+
+
+def _advance_to_spec_attack(
+    tmp_path: Path, conn, instance_id: str, *, clarifications: list[str] | None = None,
+) -> tuple[Path, str]:
+    from hermes_cli import kanban_db
+    recipe = load_library(ROOT / "recipes").get("dev-pipeline@5")
+    repo, base_sha, tree_sha = _repo(tmp_path)
+    instantiate(
+        conn, board="test", recipe=recipe, parameters={"request": "change README"},
+        instance_id=instance_id, base_sha=base_sha,
+    )
+    reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
+    explore = _step(instance_id, "explore")
+    exploration_doc = _exploration(base_sha, tree_sha)
+    _candidate(repo, ".shipfactory-output/exploration.json", exploration_doc)
+    exploration = seal_artifact(
+        instance_id=instance_id, step_id="explore", activation=1, run_id=1,
+        output=recipe.document["steps"][0]["outputs"][0], workspace=repo,
+        producer="run:1",
+    )
+    assert kanban_db.complete_task(conn, explore["kanban_task_id"], result="explored")
+    reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
+    spec = _step(instance_id, "spec-draft")
+    _candidate(
+        repo, ".shipfactory-output/spec.json",
+        _task_spec(exploration["id"], clarifications=clarifications),
+    )
+    seal_artifact(
+        instance_id=instance_id, step_id="spec-draft", activation=1, run_id=2,
+        output=recipe.document["steps"][1]["outputs"][0], workspace=repo,
+        producer="run:2",
+    )
+    assert kanban_db.complete_task(conn, spec["kanban_task_id"], result="specified")
+    reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
+    assert _step(instance_id, "spec-attack")["state"] == "running"
+    return repo, base_sha
+
+
+def test_dev_pipeline_5_loads_and_published_predecessors_are_byte_pinned():
+    for version, expected in PUBLISHED_SHA256.items():
+        assert hashlib.sha256(
+            (ROOT / "recipes" / f"dev-pipeline@{version}.yaml").read_bytes()
+        ).hexdigest() == expected
+    recipe = load_library(ROOT / "recipes", persist=False).get("dev-pipeline@5").document
+    assert recipe["schema"] == "shipfactory.recipe/v2"
+    assert [step["id"] for step in recipe["steps"]] == [
+        "explore", "spec-draft", "spec-attack", "plan-draft", "plan-attack", "build",
+    ]
+    assert recipe["steps"][0]["params"]["access_mode"] == "readonly"
+    assert recipe["steps"][0]["params"]["execution_profile"] == "planning"
+    assert recipe["budgets"]["token_pools"] == {
+        "planning": 120_000, "build": 130_000, "review": 50_000,
+    }
+
+
+def test_exploration_existing_path_must_exist_at_base_sha(tmp_path):
+    repo, base_sha, tree_sha = _repo(tmp_path)
+    reference = {
+        "id": "ref-1", "kind": "path", "status": "existing",
+        "path": "missing.py", "git_blob_sha": "a" * 40,
+        "start_line": 1, "end_line": 1, "text_sha256": "b" * 64,
+    }
+    _candidate(
+        repo, ".shipfactory-output/exploration.json",
+        _exploration(base_sha, tree_sha, [reference]),
+    )
+    with pytest.raises(ValueError, match="absent at base_sha"):
+        seal_artifact(
+            instance_id="missing-path", step_id="explore", activation=1, run_id=1,
+            output={
+                "kind": "exploration", "schema": "shipfactory.exploration/v1",
+                "path": ".shipfactory-output/exploration.json",
+            },
+            workspace=repo, producer="run:1",
+        )
+
+
+def test_spec_approval_is_blocked_while_clarifications_are_nonempty(tmp_path, kanban_conn):
+    _advance_to_spec_attack(
+        tmp_path, kanban_conn, "clarifications", clarifications=["Which API is authoritative?"],
+    )
+    gate = _step("clarifications", "spec-attack")
+    _complete_review(kanban_conn, gate["kanban_task_id"], "approve")
+    reconcile(kanban_conn, "clarifications", profiles=PIPELINE_PROFILES)
+    assert _step("clarifications", "spec-attack")["blocked_reason"] == "clarifications_nonempty"
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT status,blocked_reason FROM recipe_instances WHERE id='clarifications'"
+        ).fetchone()
+    assert tuple(instance) == ("blocked", "clarifications_nonempty")
+
+
+def test_spec_rejection_reactivates_only_the_spec_cone(tmp_path, kanban_conn):
+    _advance_to_spec_attack(tmp_path, kanban_conn, "spec-cone")
+    attack = _step("spec-cone", "spec-attack")
+    _complete_review(kanban_conn, attack["kanban_task_id"], "request_changes", "spec-draft")
+    reconcile(kanban_conn, "spec-cone", profiles=PIPELINE_PROFILES)
+    assert _step("spec-cone", "spec-draft", 2)["state"] == "running"
+    assert _step("spec-cone", "spec-attack", 2)["state"] == "pending"
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM recipe_steps WHERE instance_id='spec-cone' AND step_id='explore'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM recipe_steps WHERE instance_id='spec-cone' AND step_id='plan-draft'"
+        ).fetchone()[0] == 1
+
+
+def test_plan_rejection_reactivates_only_the_plan_cone(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+    repo, base_sha = _advance_to_spec_attack(tmp_path, kanban_conn, "plan-cone")
+    spec_attack = _step("plan-cone", "spec-attack")
+    _complete_review(kanban_conn, spec_attack["kanban_task_id"], "approve")
+    reconcile(kanban_conn, "plan-cone", profiles=PIPELINE_PROFILES)
+    plan_step = _step("plan-cone", "plan-draft")
+    with store._connect() as db:
+        task_spec = dict(db.execute(
+            "SELECT * FROM artifacts WHERE instance_id='plan-cone' AND kind='task-spec'"
+        ).fetchone())
+    _candidate(repo, ".shipfactory-output/plan.json", _plan(base_sha, task_spec["sha256"]))
+    recipe = load_library(ROOT / "recipes", persist=False).get("dev-pipeline@5")
+    seal_artifact(
+        instance_id="plan-cone", step_id="plan-draft", activation=1, run_id=3,
+        output=recipe.document["steps"][3]["outputs"][0], workspace=repo,
+        producer="run:3",
+    )
+    assert kanban_db.complete_task(kanban_conn, plan_step["kanban_task_id"], result="planned")
+    reconcile(kanban_conn, "plan-cone", profiles=PIPELINE_PROFILES)
+    attack = _step("plan-cone", "plan-attack")
+    _complete_review(kanban_conn, attack["kanban_task_id"], "request_changes", "plan-draft")
+    reconcile(kanban_conn, "plan-cone", profiles=PIPELINE_PROFILES)
+    assert _step("plan-cone", "plan-draft", 2)["state"] == "running"
+    assert _step("plan-cone", "plan-attack", 2)["state"] == "pending"
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM recipe_steps WHERE instance_id='plan-cone' AND step_id='explore'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM recipe_steps WHERE instance_id='plan-cone' AND step_id='spec-draft'"
+        ).fetchone()[0] == 1
+
+
+def _budget_recipe(tmp_path: Path, text: str, key: str):
+    library = tmp_path / key
+    library.mkdir()
+    (library / "recipe.yaml").write_text(text, encoding="utf-8")
+    return load_library(library).get(key)
+
+
+def test_named_pool_exhaustion_blocks_with_visible_reason(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+    recipe = _budget_recipe(tmp_path, """schema: shipfactory.recipe/v2
+id: pool-budget
+version: 1
+status: active
+description: pool budget
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets:
+  max_activations: 3
+  max_tokens: 300
+  step_activation_caps: {first: 1, second: 1}
+  token_pools: {planning: 100}
+steps:
+  - {id: first, primitive: agent_task, title: First, needs: [], optional: false, inputs: [], outputs: [], params: {seat: dev-backend, instructions: first, execution_profile: planning, workspace: worktree}}
+  - {id: second, primitive: agent_task, title: Second, needs: [first], optional: false, inputs: [], outputs: [], params: {seat: dev-backend, instructions: second, execution_profile: planning, workspace: worktree}}
+""", "pool-budget@1")
+    profiles = {"planning": {"max_runtime_seconds": 1, "max_retries": 1, "token_allowance": 60}}
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="pool")
+    reconcile(kanban_conn, "pool", profiles=profiles)
+    assert kanban_db.complete_task(kanban_conn, _step("pool", "first")["kanban_task_id"], result="done")
+    reconcile(kanban_conn, "pool", profiles=profiles)
+    assert _step("pool", "second")["blocked_reason"] == "budget_exhausted:token_pool:planning"
+    with store._connect() as db:
+        instance = db.execute("SELECT blocked_reason FROM recipe_instances WHERE id='pool'").fetchone()
+        charges = db.execute(
+            "SELECT token_pool,SUM(tokens) FROM budget_charges WHERE instance_id='pool' GROUP BY token_pool"
+        ).fetchone()
+    assert instance["blocked_reason"] == "budget_exhausted:token_pool:planning"
+    assert tuple(charges) == ("planning", 60)
+
+
+def test_step_activation_cap_exhaustion_blocks_instance(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+    recipe = _budget_recipe(tmp_path, """schema: shipfactory.recipe/v2
+id: step-budget
+version: 1
+status: active
+description: step budget
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets:
+  max_activations: 4
+  max_tokens: 400
+  step_activation_caps: {build: 1, attack: 2}
+  token_pools: {build: 200, review: 200}
+steps:
+  - {id: build, primitive: agent_task, title: Build, needs: [], optional: false, inputs: [], outputs: [], params: {seat: dev-backend, instructions: build, execution_profile: build, workspace: worktree}}
+  - {id: attack, primitive: review_gate, title: Attack, needs: [build], optional: false, inputs: [], outputs: [], params: {seat: verifier, instructions: attack, execution_profile: review, workspace: worktree}}
+""", "step-budget@1")
+    profiles = {
+        name: {"max_runtime_seconds": 1, "max_retries": 1, "token_allowance": 50}
+        for name in ("build", "review")
+    }
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="step-cap")
+    reconcile(kanban_conn, "step-cap", profiles=profiles)
+    assert kanban_db.complete_task(
+        kanban_conn, _step("step-cap", "build")["kanban_task_id"], result="built",
+    )
+    reconcile(kanban_conn, "step-cap", profiles=profiles)
+    attack = _step("step-cap", "attack")
+    _complete_review(kanban_conn, attack["kanban_task_id"], "request_changes", "build")
+    reconcile(kanban_conn, "step-cap", profiles=profiles)
+    reason = "budget_exhausted:step_activation_cap:build"
+    assert _step("step-cap", "build", 2)["blocked_reason"] == reason
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT status,blocked_reason FROM recipe_instances WHERE id='step-cap'"
+        ).fetchone()
+    assert tuple(instance) == ("blocked", reason)

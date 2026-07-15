@@ -185,12 +185,20 @@ SET base_sha=(
     )""",
 )
 _INSTANCE_BASE_MIGRATION_TEXT = ";\n".join(_INSTANCE_BASE_MIGRATION_STATEMENTS) + ";\n"
+_PLANNING_BUDGET_MIGRATION_STATEMENTS = (
+    "ALTER TABLE budget_charges ADD COLUMN token_pool TEXT",
+    "CREATE INDEX idx_budget_charges_pool ON budget_charges(instance_id,token_pool)",
+)
+_PLANNING_BUDGET_MIGRATION_TEXT = ";\n".join(
+    _PLANNING_BUDGET_MIGRATION_STATEMENTS
+) + ";\n"
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
     (3, "a1_worker_transition_attempt_fencing", _A1_FENCING_MIGRATION_TEXT),
     (4, "sf5_artifact_revision_identity", _ARTIFACT_MIGRATION_TEXT),
     (5, "sf5_instance_base_identity", _INSTANCE_BASE_MIGRATION_TEXT),
+    (6, "sf6_named_token_pool_charges", _PLANNING_BUDGET_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -198,6 +206,7 @@ _MIGRATION_STATEMENTS = {
     3: _A1_FENCING_MIGRATION_STATEMENTS,
     4: _ARTIFACT_MIGRATION_STATEMENTS,
     5: _INSTANCE_BASE_MIGRATION_STATEMENTS,
+    6: _PLANNING_BUDGET_MIGRATION_STATEMENTS,
 }
 
 
@@ -348,12 +357,23 @@ def init_db() -> None:
                         or {"input_artifact_set_hash", "output_artifact_set_hash"}
                         & step_columns
                     )
-                else:
+                elif version == 5:
                     instance_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(recipe_instances)"
                     )}
                     migration_artifacts = bool(
                         {"base_sha", "updated_base_at"} & instance_columns
+                    )
+                else:
+                    charge_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(budget_charges)"
+                    )}
+                    indexes = {row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )}
+                    migration_artifacts = bool(
+                        "token_pool" in charge_columns
+                        or "idx_budget_charges_pool" in indexes
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -840,7 +860,7 @@ def release_resource_lease(key: str) -> bool:
 
 def admit_budget_charge(db: sqlite3.Connection, *, key: str, board: str, utc_day: str, instance_id: str,
                         step_id: str, activation: int, tokens: int,
-                        ceiling: int) -> bool:
+                        ceiling: int, token_pool: str | None = None) -> bool:
     """Enforce the one configured board-day ceiling in the caller's transaction."""
     tokens, ceiling = int(tokens), int(ceiling)
     existing = db.execute(
@@ -855,9 +875,12 @@ def admit_budget_charge(db: sqlite3.Connection, *, key: str, board: str, utc_day
     if daily + tokens > ceiling:
         return False
     db.execute(
-        "INSERT INTO budget_charges(key,board,utc_day,instance_id,step_id,activation,tokens,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (key, board, utc_day, instance_id, step_id, int(activation), tokens, _now()),
+        "INSERT INTO budget_charges(key,board,utc_day,instance_id,step_id,activation,tokens,created_at,token_pool) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            key, board, utc_day, instance_id, step_id, int(activation), tokens,
+            _now(), token_pool,
+        ),
     )
     return True
 
