@@ -164,12 +164,20 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   honest `git_blob_sha` whenever its declared path resolves at `base_sha`;
   a path genuinely absent at `base_sha` (a not-yet-built output) still needs
   no corroboration (finding #33, SF-7 adversarial lane).
+- `access_mode: readonly` on a v2 recipe step (`explore`, `spec-attack`,
+  `plan-attack` in dev-pipeline@5) was validated for shape by the loader but
+  never enforced anywhere — every executor (codex, claude, hermes) ran with
+  full workspace-write regardless. Prompt wording is not a security
+  boundary; the OS is. `shipfactory_spawn` now chmods a readonly step's
+  workspace non-writable (dirs `0o550`, files `0o440`) before exec, leaving
+  only `.shipfactory-output/` writable so the step can still seal its
+  result or emit a verdict (finding #34, SF-7 adversarial lane).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#33 so far). When you fix one: commit message
+- Findings get numbers (#22–#34 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

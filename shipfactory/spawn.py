@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import re
@@ -242,6 +243,73 @@ def _drain_worker_transitions(boards: set[str | None] | None = None) -> None:
             conn.close()
 
 
+def _step_access_mode(task_id: str) -> str | None:
+    """Return the declared ``access_mode`` for *task_id*'s pinned recipe step.
+
+    ``access_mode`` is validated for shape by the v2 recipe loader but was
+    never consulted at spawn time — every executor ran ``workspace-write``
+    regardless of a step's declared ``readonly`` (finding #34). This is the
+    lookup the enforcement boundary needs; a task with no recipe step (a
+    bare kanban task) returns ``None`` and is unaffected.
+    """
+    store = _store_module()
+    if not hasattr(store, "_connect"):
+        return None
+    try:
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT s.step_id,i.recipe_id,i.recipe_version,v.normalized_yaml "
+                "FROM recipe_steps s JOIN recipe_instances i ON i.id=s.instance_id "
+                "JOIN recipe_versions v ON v.id=i.recipe_id AND v.version=i.recipe_version "
+                "WHERE s.kanban_task_id=?",
+                (str(task_id),),
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    try:
+        recipe = json.loads(row["normalized_yaml"])
+    except (TypeError, ValueError):
+        return None
+    definition = next(
+        (item for item in recipe.get("steps", []) if item.get("id") == row["step_id"]),
+        None,
+    )
+    if not isinstance(definition, dict):
+        return None
+    params = definition.get("params")
+    return params.get("access_mode") if isinstance(params, dict) else None
+
+
+def _enforce_readonly_workspace(root: Path) -> None:
+    """Deny filesystem writes outside the declared artifact output directory.
+
+    ``access_mode: readonly`` is only a real boundary if the OS backs it —
+    prompt wording alone is not a security boundary. The declared
+    ``.shipfactory-output/`` directory stays writable so a readonly step
+    (explore, spec-attack, plan-attack) can still seal its result or emit a
+    verdict; every other file and directory the executor can see is made
+    non-writable before it runs (finding #34).
+    """
+    output_dir = (root / ".shipfactory-output").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        current = Path(dirpath).resolve()
+        if current == output_dir:
+            dirnames[:] = []
+            continue
+        for filename in filenames:
+            try:
+                os.chmod(current / filename, 0o440)
+            except OSError:
+                pass
+        try:
+            os.chmod(current, 0o550)
+        except OSError:
+            pass
+
+
 def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     """Spawn the configured harness for a claimed kanban task, or skip unknown seats.
 
@@ -285,6 +353,8 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         finally:
             conn.close()
         executor.identity_files(seat, str(root))
+        if _step_access_mode(str(task_id)) == "readonly":
+            _enforce_readonly_workspace(root)
         prompt = _worker_prompt(context)
         prompt_path.write_text(prompt, encoding="utf-8")
 
