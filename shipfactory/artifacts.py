@@ -534,6 +534,26 @@ def _validate_exploration_repository(document: dict[str, Any], workspace: Path) 
         path = _repository_path(
             reference.get("path"), label=f"exploration reference {index} path",
         )
+        if status == "generated":
+            # "generated" must not be usable to relabel a real, already
+            # tracked file (e.g. quietly excusing a hand-authored test's
+            # removal) with no corroboration. If the path resolves at
+            # base_sha, its declared git_blob_sha must honestly match that
+            # blob; a path absent at base_sha is a legitimate not-yet-built
+            # output and needs no further check (finding #33).
+            try:
+                tracked_blob_sha = _git(workspace, "rev-parse", f"{base_sha}:{path}")
+            except ArtifactValidationError:
+                continue
+            declared_blob_sha = reference.get("git_blob_sha")
+            if (not isinstance(declared_blob_sha, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", declared_blob_sha)
+                    or declared_blob_sha.lower() != tracked_blob_sha.lower()):
+                raise ArtifactValidationError(
+                    f"exploration reference {index} classifies tracked path {path!r} "
+                    "as generated without a matching git_blob_sha"
+                )
+            continue
         if status != "existing":
             continue
         try:

@@ -157,12 +157,19 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   with its original (still-matching) start token. Tests simulating this
   must opportunistically `os.waitpid(-1, os.WNOHANG)` in their poll loop,
   or they'll see a supposedly-dead process reported as still alive.
+- An exploration reference's `generated` classification was unverified —
+  it could relabel any real, hand-authored tracked file (e.g. a test about
+  to be deleted) with zero corroboration, since only `existing`/`proposed`
+  statuses had required-field or hash checks. `generated` now requires an
+  honest `git_blob_sha` whenever its declared path resolves at `base_sha`;
+  a path genuinely absent at `base_sha` (a not-yet-built output) still needs
+  no corroboration (finding #33, SF-7 adversarial lane).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#31 so far). When you fix one: commit message
+- Findings get numbers (#22–#33 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
