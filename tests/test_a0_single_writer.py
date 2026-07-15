@@ -432,3 +432,36 @@ def test_second_daemon_process_exits_before_opening_its_board(tmp_path):
             first.wait(10)
         except subprocess.TimeoutExpired:
             first.kill(); first.wait(5)
+
+
+def test_run_action_intents_refuses_dirty_connection(kanban_conn):
+    """Finding: the effect-boundary commit must never flush a caller's
+    unrelated open write transaction — a dirty connection is refused."""
+    kanban_conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(RuntimeError, match="transaction-clean"):
+            advancer.run_action_intents(kanban_conn)
+    finally:
+        kanban_conn.rollback()
+
+
+def test_unreadable_recipe_config_fails_closed(monkeypatch):
+    """Finding: a load_seats() failure other than 'unconfigured' must fence
+    legacy policy (fail closed), not silently read as recipes-disabled."""
+    class BrokenConnection:
+        def __enter__(self):
+            raise sqlite3.OperationalError("factory unavailable")
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(store, "_connect", lambda: BrokenConnection())
+
+    def _unreadable():
+        raise PermissionError("seats.yaml unreadable")
+
+    monkeypatch.setattr("shipfactory.config.load_seats", _unreadable)
+    mutations = []
+    monkeypatch.setattr(policy, "_reopen", lambda *args: mutations.append(args))
+    with pytest.raises(RuntimeError, match="legacy policy is fenced"):
+        policy.on_complete("task", "test", "worker", "done")
+    assert mutations == []
