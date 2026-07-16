@@ -273,6 +273,12 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   `min_passed`, and zero failures/errors; fabricated wrappers, no-tests,
   all-deselected, and mixed pass/fail runs fail closed (finding #41,
   verification adversarial lane).
+- A pytest-shaped argv is not enough to trust its interpreter. A candidate could
+  commit `./python3` or a `./pytest` shebang chain, inherit the evidence path and
+  nonce, and forge the runner-owned JSON. Pytest launchers and their resolved
+  targets must both be executable, absolute, and outside the candidate
+  workspace; preserve an external virtualenv launcher path rather than resolving
+  away its `pyvenv.cfg` context (finding #43, verification rereview).
 - Normal, error, and timeout cleanup retain the leader as a waitable process
   until token-fenced group cleanup; there is no raw post-reap `killpg`. A
   process-tree tracker records PID/start-token/PGID identities and also stamps a
@@ -286,12 +292,23 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   resolved through the selected Playwright interpreter is exposed, so real
   browser execution works without restoring operator-home access (finding #42,
   verification adversarial lane).
+- Migration coverage cannot be inferred from the word `rollback` in a case id or
+  argv. The protected manifest must declare separate `migration_down` and
+  `migration_up` command behaviors, both requiring exit code zero, using the
+  same non-trivial migration tool, and each argv must structurally invoke its
+  declared direction. Candidate-only labels never satisfy the floor (finding
+  #44, verification rereview).
+- Review-input binding has both focused blocker tests and a public-path v2
+  `reconcile()` regression. The latter completes a real review task with an
+  approve verdict and proves an unbound task blocks the step and instance with
+  `review_inputs_not_bound`; testing only `_review_approval_blocker` would miss
+  a future call-site bypass (finding #45, verification rereview).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#42 so far). When you fix one: commit message
+- Findings get numbers (#22–#45 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

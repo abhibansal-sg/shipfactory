@@ -513,6 +513,43 @@ def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_c
     assert bundle["invalid_reason"] == "test_failed"
 
 
+def test_candidate_owned_relative_python_cannot_forge_pytest_evidence_via_run_action(tmp_path):
+    repo, base, _base_tree = _repo(tmp_path)
+    fake_python = repo / "python3"
+    fake_python.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib\n"
+        "pathlib.Path(os.environ['SHIPFACTORY_PYTEST_EVIDENCE_PATH']).write_text(\n"
+        "    json.dumps({'schema': 'shipfactory.pytest-evidence/v1', "
+        "'nonce': os.environ['SHIPFACTORY_PYTEST_EVIDENCE_NONCE'], "
+        "'exitstatus': 0, 'collected': 999, 'deselected': 0, "
+        "'passed': 999, 'failed': 0, 'errors': 0, 'skipped': 0})\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    import yaml
+    (repo / ".shipfactory" / "verification.yaml").write_text(
+        yaml.safe_dump(_manifest(
+            argv=["./python3", "-m", "pytest", "-q"],
+            oracle={"type": "pytest_summary", "min_passed": 1},
+        ), sort_keys=False),
+        encoding="utf-8",
+    )
+    head, tree = _commit(repo, "candidate-owned pytest interpreter")
+
+    result = _finish_action(_action_payload(
+        repo, base, head, tree, instance="relative-pytest-interpreter",
+    ))
+
+    assert result["status"] == "blocked"
+    with store._connect() as db:
+        reason = db.execute(
+            "SELECT invalid_reason FROM evidence_bundles WHERE id=?", (result["bundle_id"],),
+        ).fetchone()["invalid_reason"]
+    assert reason == "test_failed"
+
+
 def test_naive_output_contains_oracle_is_fooled_by_fabricated_text(tmp_path):
     """Documents why pytest_summary exists: a naive oracle is not fail-closed here."""
     document = _manifest(
@@ -795,6 +832,55 @@ def test_review_task_without_factory_opened_sealed_inputs_is_blocked(tmp_path, k
             recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker == "review_inputs_not_bound"
+
+
+def test_reconcile_blocks_v2_review_approval_without_factory_opened_inputs(
+    tmp_path, kanban_conn,
+):
+    from hermes_cli import kanban_db
+
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="rvw-reconcile", step_id="verify")
+    assert bundle["state"] == "done"
+    _definition, _defs, latest, _recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-reconcile",
+        bind_review_inputs=False,
+    )
+    review_task_id = latest["review"]["kanban_task_id"]
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
+            "VALUES('fake',1,'hash','published',?,?)",
+            (json.dumps(_recipe, sort_keys=True), store._now()),
+        )
+        db.execute(
+            "UPDATE recipe_steps SET state=CASE step_id "
+            "WHEN 'review' THEN 'running' ELSE 'done' END "
+            "WHERE instance_id='rvw-reconcile'"
+        )
+    result = "SHIPFACTORY_VERDICT: " + json.dumps({
+        "outcome": "approve", "body": "APPROVE clean pass",
+    }, separators=(",", ":"))
+    assert kanban_db.complete_task(kanban_conn, review_task_id, result=result)
+
+    reconciled = advancer.reconcile(kanban_conn, "rvw-reconcile")
+
+    assert reconciled["status"] == "blocked"
+    with store._connect() as db:
+        review = db.execute(
+            "SELECT state,blocked_reason FROM recipe_steps "
+            "WHERE instance_id='rvw-reconcile' AND step_id='review'",
+        ).fetchone()
+        instance = db.execute(
+            "SELECT status,blocked_reason FROM recipe_instances WHERE id='rvw-reconcile'",
+        ).fetchone()
+    assert dict(review) == {
+        "state": "blocked", "blocked_reason": "review_inputs_not_bound",
+    }
+    assert dict(instance) == {
+        "status": "blocked", "blocked_reason": "review_inputs_not_bound",
+    }
 
 
 def test_approval_uses_factory_opened_bundle_bytes_not_hash_testimony(tmp_path, kanban_conn):
@@ -1716,6 +1802,79 @@ def test_surface_floor_requires_executed_behavior_not_only_a_profile_label(
     )
     assert bundle["state"] == "failed"
     assert f"required surface behaviors are missing: {missing}" in bundle["invalid_reason"]
+
+
+def test_migration_surface_rejects_a_passing_command_with_only_a_rollback_label(tmp_path):
+    document = _manifest(
+        argv=["true"], case_id="rollback-noop",
+        oracle={"type": "exit_code", "equals": 0},
+    )
+    repo, base, _tree = _repo(tmp_path, document)
+    migration = repo / "db" / "migrations" / "001.sql"
+    migration.parent.mkdir(parents=True)
+    migration.write_text("ALTER TABLE example ADD COLUMN value TEXT;\n", encoding="utf-8")
+    head, tree = _commit(repo, "add migration")
+    protected = verify.load_verification_manifest(repo, base, verify_worktree_copy=False)
+
+    bundle = verify.run_verification(
+        instance_id="rollback-noop", step_id="verify", activation=1,
+        input_revision_hash="revision", base_sha=base, head_sha=head, tree_sha=tree,
+        workspace=repo, manifest=protected, profile=_profile(surface="migration"),
+        run_candidate_cases=False, protected_manifest=protected,
+        required_surface="migration",
+    )
+
+    assert bundle["state"] == "failed"
+    assert "required surface behaviors are missing: rollback" in bundle["invalid_reason"]
+
+
+def test_migration_surface_executes_protected_down_and_up_behavior_pair(tmp_path):
+    document = {
+        "schema": verify.VERIFICATION_SCHEMA,
+        "cases": [
+            {
+                "id": "migration-down", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_down",
+                "argv": [sys.executable, "migration_tool.py", "rollback"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+            {
+                "id": "migration-up", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_up",
+                "argv": [sys.executable, "migration_tool.py", "upgrade"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+        ],
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
+    }
+    repo, _initial, _tree = _repo(tmp_path, document)
+    migration_state = tmp_path / "migration-state"
+    (repo / "migration_tool.py").write_text(
+        "import pathlib, sys\n"
+        f"state = pathlib.Path({str(migration_state)!r})\n"
+        "if sys.argv[1] == 'rollback': state.write_text('down')\n"
+        "elif sys.argv[1] == 'upgrade':\n"
+        "    assert state.read_text() == 'down'\n"
+        "    state.write_text('up')\n",
+        encoding="utf-8",
+    )
+    base, _base_tree = _commit(repo, "trusted migration verification")
+    migration = repo / "db" / "migrations" / "001.sql"
+    migration.parent.mkdir(parents=True)
+    migration.write_text("ALTER TABLE example ADD COLUMN value TEXT;\n", encoding="utf-8")
+    head, tree = _commit(repo, "add migration")
+    protected = verify.load_verification_manifest(repo, base, verify_worktree_copy=False)
+
+    bundle = verify.run_verification(
+        instance_id="rollback-roundtrip", step_id="verify", activation=1,
+        input_revision_hash="revision", base_sha=base, head_sha=head, tree_sha=tree,
+        workspace=repo, manifest=protected, profile=_profile(surface="migration"),
+        run_candidate_cases=False, protected_manifest=protected,
+        required_surface="migration",
+    )
+
+    assert bundle["state"] == "done"
+    assert migration_state.read_text() == "up"
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import stat
@@ -36,10 +37,16 @@ DEFAULT_MANIFEST_PATH = ".shipfactory/verification.yaml"
 _TOP = {"schema", "cases", "capture"}
 _CAPTURE = {"video", "trace", "screenshots"}
 _COMMAND_CASE = {"id", "requirement_ids", "driver", "argv", "oracle"}
+_COMMAND_CASE_WITH_BEHAVIOR = _COMMAND_CASE | {"surface_behavior"}
 _PLAYWRIGHT_CASE = {"id", "requirement_ids", "driver", "script", "assertions"}
 _CASE_ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _HASH = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _BLOB_MODES = {"100644", "100755"}
+_MIGRATION_BEHAVIOR_TOKENS = {
+    "migration_down": {"down", "downgrade", "rollback", "revert"},
+    "migration_up": {"apply", "migrate", "up", "upgrade"},
+}
+_TRIVIAL_COMMANDS = {"echo", "false", "printf", "test", "true"}
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+"), r"\1[REDACTED]"),
     # Stops at quote/brace/bracket too, not just whitespace/,/; -- otherwise
@@ -161,6 +168,19 @@ def _validate_oracle(oracle: Any, label: str) -> None:
         raise VerificationManifestError(f"unknown oracle type {kind!r}")
 
 
+def _migration_tool_identity(argv: list[str]) -> tuple[str, ...]:
+    executable = PurePosixPath(argv[0]).name.casefold()
+    if executable in _TRIVIAL_COMMANDS:
+        raise VerificationManifestError("migration behavior cannot use a no-op command")
+    if executable.startswith("python"):
+        if len(argv) < 3 or argv[1] in {"-c", "-m"}:
+            raise VerificationManifestError(
+                "migration behavior must invoke a concrete migration tool"
+            )
+        return executable, argv[1]
+    return (executable,)
+
+
 def validate_verification_manifest(
     document: Any, *, required_requirement_ids: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -181,7 +201,12 @@ def validate_verification_manifest(
             raise VerificationManifestError(f"{label} must be a mapping")
         driver = case.get("driver")
         if driver == "command":
-            _exact(case, _COMMAND_CASE, label)
+            keys = set(case)
+            if keys != _COMMAND_CASE and keys != _COMMAND_CASE_WITH_BEHAVIOR:
+                raise VerificationManifestError(
+                    f"{label} keys must be exactly {sorted(_COMMAND_CASE)} or "
+                    f"{sorted(_COMMAND_CASE_WITH_BEHAVIOR)}"
+                )
             argv = case["argv"]
             if not isinstance(argv, list) or not argv or not all(
                 isinstance(item, str) and item for item in argv
@@ -198,6 +223,23 @@ def validate_verification_manifest(
                     ))):
                 raise VerificationManifestError(f"{label} shell interpolation is forbidden")
             _validate_oracle(case["oracle"], label)
+            behavior = case.get("surface_behavior")
+            if behavior is not None:
+                if behavior not in _MIGRATION_BEHAVIOR_TOKENS:
+                    raise VerificationManifestError(f"{label} surface behavior is invalid")
+                if case["oracle"] != {"type": "exit_code", "equals": 0}:
+                    raise VerificationManifestError(
+                        f"{label} migration behavior must require exit code zero"
+                    )
+                _migration_tool_identity(argv)
+                argument_tokens = {
+                    token for argument in argv[1:]
+                    for token in re.split(r"[^a-z0-9]+", argument.casefold()) if token
+                }
+                if not argument_tokens & _MIGRATION_BEHAVIOR_TOKENS[behavior]:
+                    raise VerificationManifestError(
+                        f"{label} argv does not execute declared {behavior} behavior"
+                    )
         elif driver == "playwright":
             _exact(case, _PLAYWRIGHT_CASE, label)
             _safe_relpath(case["script"], f"{label} script")
@@ -873,20 +915,55 @@ def _is_pytest_argv(argv: list[str]) -> bool:
     )
 
 
-def _isolated_pytest_argv(argv: list[str]) -> list[str]:
+def _trusted_interpreter_path(raw: str, workspace: Path) -> str:
+    """Resolve an executable without allowing candidate-owned interpreter bytes."""
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        if candidate.parent != Path("."):
+            raise VerificationError("pytest interpreter must not be workspace-relative")
+        found = shutil.which(raw)
+        if not found:
+            raise VerificationError("pytest interpreter is not available on trusted PATH")
+        candidate = Path(found)
+    try:
+        candidate_absolute = candidate.absolute()
+        resolved = candidate.resolve(strict=True)
+        workspace_resolved = workspace.resolve(strict=True)
+    except OSError as exc:
+        raise VerificationError("pytest interpreter identity is unreadable") from exc
+    if (candidate_absolute == workspace_resolved or workspace_resolved in candidate_absolute.parents
+            or resolved == workspace_resolved or workspace_resolved in resolved.parents
+            or not resolved.is_file() or not os.access(resolved, os.X_OK)):
+        raise VerificationError("pytest interpreter must be executable and outside workspace")
+    # Preserve an absolute virtualenv launcher path: resolving its symlink to
+    # the base interpreter discards pyvenv.cfg discovery and its site packages.
+    return str(candidate_absolute)
+
+
+def _isolated_pytest_argv(argv: list[str], workspace: Path) -> list[str]:
     """Replace a claimed pytest executable with the trusted isolated runner."""
     executable = PurePosixPath(argv[0]).name.casefold()
     if executable.startswith("python") and argv[1:3] == ["-m", "pytest"]:
-        interpreter, pytest_args = argv[0], argv[3:]
+        interpreter = _trusted_interpreter_path(argv[0], workspace)
+        pytest_args = argv[3:]
     else:
-        pytest_executable = shutil.which(argv[0]) or argv[0]
+        pytest_executable = _trusted_interpreter_path(argv[0], workspace)
         try:
             first = Path(pytest_executable).read_bytes().splitlines()[0].decode("utf-8")
         except (OSError, UnicodeDecodeError, IndexError) as exc:
             raise VerificationError("pytest interpreter identity is unreadable") from exc
         if not first.startswith("#!"):
             raise VerificationError("pytest executable has no trusted interpreter identity")
-        interpreter, pytest_args = first[2:].strip().split()[0], argv[1:]
+        shebang = shlex.split(first[2:].strip())
+        if not shebang:
+            raise VerificationError("pytest executable has no trusted interpreter identity")
+        if Path(shebang[0]).name == "env":
+            if len(shebang) != 2:
+                raise VerificationError("pytest env shebang is ambiguous")
+            interpreter = _trusted_interpreter_path(shebang[1], workspace)
+        else:
+            interpreter = _trusted_interpreter_path(shebang[0], workspace)
+        pytest_args = argv[1:]
     return [
         interpreter, "-I", str(Path(__file__).with_name("pytest_runner.py")), *pytest_args,
     ]
@@ -1003,7 +1080,7 @@ def _command_driver(
                 "started_at": started, "ended_at": now, "run_id": run_id,
             }
         try:
-            command_argv = _isolated_pytest_argv(case["argv"])
+            command_argv = _isolated_pytest_argv(case["argv"], workspace)
         except VerificationError as exc:
             now = store._now()
             store.record_run_end(
@@ -1608,10 +1685,21 @@ def run_verification(
             and any(assertion["type"] == "api-status" for assertion in case["assertions"])
             for case in cases_for_surface
         )
+        protected_cases = (
+            protected_manifest.document["cases"] if protected_manifest is not None else []
+        )
+        migration_down = [
+            case for case in protected_cases
+            if case.get("surface_behavior") == "migration_down"
+        ]
+        migration_up = [
+            case for case in protected_cases
+            if case.get("surface_behavior") == "migration_up"
+        ]
         has_rollback = any(
-            case["driver"] == "command"
-            and "rollback" in " ".join([case["id"], *case["requirement_ids"], *case["argv"]]).casefold()
-            for case in cases_for_surface
+            down["argv"] != up["argv"]
+            and _migration_tool_identity(down["argv"]) == _migration_tool_identity(up["argv"])
+            for down in migration_down for up in migration_up
         )
         has_protected = bool(
             protected_manifest is not None and protected_manifest.document.get("cases")
