@@ -403,12 +403,22 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   task is still `done` and reopening status afterward can return `ready` under
   the old worker, so both the update count and emitted ownership event are
   checked (finding #59, dev-pipeline@6 exact-gate stability pass).
+- Recipe immutability must survive loader namespace evolution without rewriting
+  published rows. Historical v1 rows use `factory.recipe/v1` and
+  `FACTORY_VERDICT`; compatibility may alias only those exact tokens in a
+  temporary copy, verify the row's own stored hash, revalidate both policies,
+  and require exact current semantic equality. "Standalone" excludes letters,
+  digits, and underscore on the token's left edge; hash-consistent but
+  non-document rows, non-list steps, and non-dict step entries raise a clean
+  `RecipeError`. The original normalized bytes and hash remain authoritative;
+  every other difference still fails immutable (finding #60,
+  dev-pipeline@6 live publication cutover).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#59 so far). When you fix one: commit message
+- Findings get numbers (#22–#60 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
