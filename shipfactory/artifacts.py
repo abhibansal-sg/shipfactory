@@ -84,6 +84,17 @@ def _string_list(document: dict[str, Any], schema: str, fields: Iterable[str]) -
             raise ArtifactValidationError(f"{schema} field {field} must be a string list")
 
 
+def _substantive_string_list(
+    document: dict[str, Any], schema: str, fields: Iterable[str],
+) -> None:
+    _string_list(document, schema, fields)
+    for field in fields:
+        if any(not item.strip() for item in document[field]):
+            raise ArtifactValidationError(
+                f"{schema} field {field} entries must contain non-whitespace text"
+            )
+
+
 def _hash_string(value: Any, lengths: tuple[int, ...]) -> bool:
     return (
         isinstance(value, str) and len(value) in lengths
@@ -339,10 +350,8 @@ def _validate_plan(document: dict[str, Any]) -> None:
 
     for node_id in nodes:
         visit(node_id)
-    _string_list(
-        document, schema,
-        ("integration_order", "residual_risks"),
-    )
+    _string_list(document, schema, ("integration_order",))
+    _substantive_string_list(document, schema, ("residual_risks",))
     if (len(set(document["integration_order"])) != len(document["integration_order"])
             or any(node_id not in nodes for node_id in document["integration_order"])):
         raise ArtifactValidationError(f"{schema} integration_order has unknown nodes")
@@ -433,7 +442,8 @@ def _validate_review_story(document: dict[str, Any]) -> None:
                 )
         for path in change["files"]:
             _repository_path(path, label=f"{schema} change {index} file")
-    _string_list(document, schema, ("generated_or_mechanical_files", "residual_risks"))
+    _string_list(document, schema, ("generated_or_mechanical_files",))
+    _substantive_string_list(document, schema, ("residual_risks",))
     for path in document["generated_or_mechanical_files"]:
         _repository_path(path, label=f"{schema} generated file")
     if not isinstance(document["not_changed"], list):
@@ -905,9 +915,14 @@ def _validate_review_story_context(
         or str(row["status"]).lower() in {"skipped", "warning", "warnings", "warn"}
         for row in case_rows
     ) or "warning" in str(bundle["invalid_reason"] or "").lower()
-    if verification_has_caveats and not document["residual_risks"]:
+    substantive_residual_risks = [
+        risk for risk in document.get("residual_risks", [])
+        if isinstance(risk, str) and risk.strip()
+    ]
+    if verification_has_caveats and not substantive_residual_risks:
         raise ArtifactValidationError(
-            f"{schema} residual_risks cannot be empty after retries/skips/warnings"
+            f"{schema} residual_risks must contain substantive text after "
+            "retries/skips/warnings"
         )
 
 

@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import base64
 import json
+import multiprocessing
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# Multiprocessing ``spawn`` re-imports this module. Pin the checkout root so a
+# checkout directory itself named ``shipfactory`` cannot shadow the package.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if sys.path[0] != _REPO_ROOT:
+    if _REPO_ROOT in sys.path:
+        sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
 
 from shipfactory import decisions, store, verification
 from shipfactory.recipes import advancer
@@ -70,6 +80,72 @@ def _new_activation(instance_id: str, revision: str = "f" * 64) -> None:
             "VALUES(?, 'approve',2,'approval_gate','waiting',?,?,?)",
             (instance_id, revision, now, now),
         )
+
+
+def _record_decision_racer(home: str, binding: dict, barrier, result_queue) -> None:
+    os.environ["HERMES_HOME"] = home
+    from shipfactory import decisions as child_decisions
+
+    barrier.wait(timeout=10)
+    row = child_decisions.record_decision(
+        instance_id=binding["instance_id"], step_id=binding["step_id"],
+        activation=binding["activation"], revision_hash=binding["revision_hash"],
+        evidence_bundle_hash=binding["evidence_bundle_hash"], nonce="record-race-nonce",
+        decision="approve", actor_kind="operator", actor_id="alice", channel="dashboard",
+    )
+    result_queue.put((row["id"], row["advance_event_key"], row["replayed"]))
+
+
+def _consume_phone_token_racer(home: str, token: str, barrier, result_queue) -> None:
+    os.environ["HERMES_HOME"] = home
+    from shipfactory import decisions as child_decisions
+
+    barrier.wait(timeout=10)
+    row = child_decisions.consume_phone_token(
+        token, actor_kind="operator", actor_id="alice", channel="telegram",
+    )
+    result_queue.put((row["id"], row["advance_event_key"], row["replayed"]))
+
+
+def _run_two_process_race(target, *args):
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(3)
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(target=target, args=(*args, barrier, result_queue))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    barrier.wait(timeout=10)
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    return [result_queue.get(timeout=5) for _ in processes]
+
+
+def _assert_single_applied_decision(instance_id: str, outcomes, kanban_conn) -> None:
+    assert len({item[0] for item in outcomes}) == 1
+    assert len({item[1] for item in outcomes}) == 1
+    assert sorted(item[2] for item in outcomes) == [False, True]
+
+    advancer.apply_events(kanban_conn, profiles=PROFILES, board="test")
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM gate_decisions WHERE instance_id=?", (instance_id,),
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM gate_decisions WHERE instance_id=? AND consumed_at IS NOT NULL",
+            (instance_id,),
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM advance_events WHERE instance_id=? AND source='gate_decision'",
+            (instance_id,),
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM action_intents WHERE instance_id=?",
+            (instance_id,),
+        ).fetchone()[0] == 1
 
 
 def _evidence(tmp_path: Path, instance_id: str, revision: str) -> dict:
@@ -155,6 +231,23 @@ def test_phone_nonce_replay_returns_recorded_decision_and_one_event(tmp_path, ka
         assert db.execute("SELECT COUNT(*) FROM advance_events WHERE source='gate_decision'").fetchone()[0] == 1
         actor = db.execute("SELECT actor_kind,actor_id,channel FROM gate_decisions").fetchone()
         assert tuple(actor) == ("operator", "alice", "telegram")
+
+
+def test_two_processes_record_same_gate_tuple_and_nonce_once(tmp_path, kanban_conn):
+    binding = _gate(tmp_path, kanban_conn, "record-race")
+    outcomes = _run_two_process_race(
+        _record_decision_racer, os.environ["HERMES_HOME"], binding,
+    )
+    _assert_single_applied_decision("record-race", outcomes, kanban_conn)
+
+
+def test_two_processes_consume_one_phone_nonce_once(tmp_path, kanban_conn):
+    binding = _gate(tmp_path, kanban_conn, "phone-race")
+    token = _token(binding, nonce="phone-race-nonce")
+    outcomes = _run_two_process_race(
+        _consume_phone_token_racer, os.environ["HERMES_HOME"], token,
+    )
+    _assert_single_applied_decision("phone-race", outcomes, kanban_conn)
 
 
 def test_bundle_replaced_after_notification_conflicts_before_click(tmp_path, kanban_conn):

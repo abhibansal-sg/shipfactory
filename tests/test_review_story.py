@@ -236,6 +236,21 @@ def test_retry_requires_nonempty_residual_risks(tmp_path):
     artifacts._validate_review_story_context(story, "retry-risk", repo)
 
 
+@pytest.mark.parametrize("placeholder", ["", "  "])
+@pytest.mark.parametrize("retry", [False, True], ids=["without-caveat", "with-caveat"])
+def test_residual_risks_reject_blank_entries(tmp_path, placeholder, retry):
+    instance_id = f"blank-risk-{retry}-{len(placeholder)}"
+    repo, story, _output = _story_fixture(
+        tmp_path, instance_id, {"app.py": "new\n"}, retry=retry,
+    )
+    story["residual_risks"] = [placeholder]
+    with pytest.raises(artifacts.ArtifactValidationError, match="residual_risks"):
+        if retry:
+            artifacts._validate_review_story_context(story, instance_id, repo)
+        else:
+            artifacts._validate_review_story(story)
+
+
 def test_story_hash_fields_are_authoritative(tmp_path):
     repo, story, _output = _story_fixture(tmp_path, "hashes", {"app.py": "new\n"})
     story["evidence_bundle_sha256"] = hashlib.sha256(b"decoy").hexdigest()
