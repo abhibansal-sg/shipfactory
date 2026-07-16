@@ -31,6 +31,19 @@ class WorkerCapacityExhausted(RuntimeError):
     """Queue-only signal: no worker slot was available for this claim."""
 
 
+class AccessModeResolutionError(RuntimeError):
+    """A recipe step's declared ``access_mode`` could not be trusted.
+
+    A step that IS declared ``readonly`` must never spawn unprotected just
+    because a lookup happened to fail — the ambiguity itself is the danger
+    (finding #1). Only a genuinely absent recipe step (a bare kanban task)
+    is a legitimate ``None``; a DB error, unparsable recipe JSON, or a
+    dangling step definition all raise here instead, and
+    :func:`shipfactory_spawn` lets that abort the spawn rather than
+    treating the unresolved step as if it were unrestricted.
+    """
+
+
 def _store_module() -> Any:
     return importlib.import_module("shipfactory.store")
 
@@ -251,6 +264,13 @@ def _step_access_mode(task_id: str) -> str | None:
     regardless of a step's declared ``readonly`` (finding #34). This is the
     lookup the enforcement boundary needs; a task with no recipe step (a
     bare kanban task) returns ``None`` and is unaffected.
+
+    Raises :class:`AccessModeResolutionError`, rather than returning
+    ``None``, for any failure that could be masking a real ``readonly``
+    declaration — a DB error, unparsable recipe JSON, a step definition
+    missing from the pinned recipe, or malformed ``params`` all abort the
+    caller's spawn instead of silently running unprotected (finding #1,
+    the fail-open gap the cross-lab review found).
     """
     store = _store_module()
     if not hasattr(store, "_connect"):
@@ -264,25 +284,57 @@ def _step_access_mode(task_id: str) -> str | None:
                 "WHERE s.kanban_task_id=?",
                 (str(task_id),),
             ).fetchone()
-    except Exception:
-        return None
+    except Exception as exc:
+        raise AccessModeResolutionError(
+            f"access_mode lookup failed for task {task_id}: {exc}"
+        ) from exc
     if row is None:
         return None
     try:
         recipe = json.loads(row["normalized_yaml"])
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise AccessModeResolutionError(
+            f"access_mode recipe parse failed for task {task_id}: {exc}"
+        ) from exc
     definition = next(
         (item for item in recipe.get("steps", []) if item.get("id") == row["step_id"]),
         None,
     )
     if not isinstance(definition, dict):
-        return None
+        raise AccessModeResolutionError(
+            f"access_mode step definition missing for task {task_id} "
+            f"step {row['step_id']!r}"
+        )
     params = definition.get("params")
+    if params is not None and not isinstance(params, dict):
+        raise AccessModeResolutionError(
+            f"access_mode params malformed for task {task_id} step {row['step_id']!r}"
+        )
     return params.get("access_mode") if isinstance(params, dict) else None
 
 
-def _enforce_readonly_workspace(root: Path) -> None:
+# ``access_mode: readonly`` enforcement is filesystem permission bits, not a
+# privilege or sandbox boundary: the worker runs under the SAME UID as this
+# call, and standard POSIX permission bits are the owning user's own
+# property to change. A worker that runs ``chmod u+w <file>`` before writing
+# restores its own write access exactly as freely as this function removed
+# it — that trivial bypass is real and is NOT closed by this mechanism
+# (finding #1). Closing it for real would require running the executor
+# under its own sandbox/privilege boundary (a different UID, a container, or
+# an OS sandbox like macOS Seatbelt / Linux Landlock) — genuinely enforced
+# per executor, which this engine does not set up here. So the truthful
+# level this function provides is ``"advisory"``, never ``"enforced"``: it
+# stops accidental or naive same-UID writes and any writer that genuinely
+# runs under a different UID, but not a same-UID adversary that specifically
+# re-``chmod``s before writing. This mirrors the SF-8 network-policy
+# labeling (`shipfactory/environments.py`'s `_apply_network_policy`, finding
+# #7) — callers must record the returned level rather than assuming
+# "enforced", and it must be applied identically for every executor
+# (codex, claude, hermes), not only the ones with their own build_cmd.
+_READONLY_ENFORCEMENT_LEVEL = "advisory"
+
+
+def _enforce_readonly_workspace(root: Path) -> str:
     """Deny filesystem writes outside the declared artifact output directory.
 
     ``access_mode: readonly`` is only a real boundary if the OS backs it —
@@ -290,7 +342,9 @@ def _enforce_readonly_workspace(root: Path) -> None:
     ``.shipfactory-output/`` directory stays writable so a readonly step
     (explore, spec-attack, plan-attack) can still seal its result or emit a
     verdict; every other file and directory the executor can see is made
-    non-writable before it runs (finding #34).
+    non-writable before it runs (finding #34). Returns the honest
+    enforcement level (see :data:`_READONLY_ENFORCEMENT_LEVEL`) so the
+    caller can record what was actually applied.
     """
     output_dir = (root / ".shipfactory-output").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +362,7 @@ def _enforce_readonly_workspace(root: Path) -> None:
             os.chmod(current, 0o550)
         except OSError:
             pass
+    return _READONLY_ENFORCEMENT_LEVEL
 
 
 def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
@@ -339,6 +394,17 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     log_path = logs / f"{task_id}-{stamp}.log"
     prompt_path = logs / f"{task_id}-{stamp}.prompt"
 
+    # Resolve and enforce access_mode BEFORE any executor-specific branch, so
+    # coverage never depends on which harness (codex, claude, hermes) claimed
+    # the task (finding #1 — the Hermes path used to bypass this entirely).
+    # _step_access_mode raises AccessModeResolutionError, which propagates
+    # out of this function, when the declaration is ambiguous — the spawn is
+    # blocked outright rather than proceeding unprotected.
+    access_mode = _step_access_mode(str(task_id))
+    enforcement_level = "not_applicable"
+    if access_mode == "readonly":
+        enforcement_level = _enforce_readonly_workspace(root)
+
     if seat.executor == "hermes":
         prompt = f"work kanban task {task_id}"
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -353,8 +419,6 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         finally:
             conn.close()
         executor.identity_files(seat, str(root))
-        if _step_access_mode(str(task_id)) == "readonly":
-            _enforce_readonly_workspace(root)
         prompt = _worker_prompt(context)
         prompt_path.write_text(prompt, encoding="utf-8")
 
@@ -367,6 +431,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         "resolved_model": seat.model or "",
         "executor_version": str(getattr(executor, "version", "1")),
         "task_attempt_id": _value(task, "current_run_id"),
+        "access_enforcement_level": enforcement_level,
     }
     try:
         run_id = store.record_run_start(
@@ -640,5 +705,6 @@ def reap_finished() -> list[dict]:
 
 
 __all__ = [
-    "WorkerCapacityExhausted", "shipfactory_spawn", "restore_running", "reap_finished",
+    "AccessModeResolutionError", "WorkerCapacityExhausted", "shipfactory_spawn",
+    "restore_running", "reap_finished",
 ]

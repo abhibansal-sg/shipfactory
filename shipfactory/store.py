@@ -251,6 +251,12 @@ _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS = (
 _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT = (
     ";\n".join(_ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS) + ";\n"
 )
+_RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS = (
+    "ALTER TABLE runs ADD COLUMN access_enforcement_level TEXT",
+)
+_RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT = (
+    ";\n".join(_RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -260,6 +266,7 @@ _MIGRATIONS = (
     (6, "sf6_named_token_pool_charges", _PLANNING_BUDGET_MIGRATION_TEXT),
     (7, "sf8_environment_sessions", _ENVIRONMENT_SESSION_MIGRATION_TEXT),
     (8, "sf8_environment_enforcement_and_caps", _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT),
+    (9, "sf7_run_access_enforcement_level", _RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -270,6 +277,7 @@ _MIGRATION_STATEMENTS = {
     6: _PLANNING_BUDGET_MIGRATION_STATEMENTS,
     7: _ENVIRONMENT_SESSION_MIGRATION_STATEMENTS,
     8: _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS,
+    9: _RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS,
 }
 
 
@@ -442,7 +450,7 @@ def init_db() -> None:
                     migration_artifacts = bool(
                         {"env_sessions", "app_sessions"} & existing_tables
                     )
-                else:
+                elif version == 8:
                     env_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(env_sessions)"
                     )}
@@ -453,6 +461,11 @@ def init_db() -> None:
                         {"network_enforcement_level", "output_cap_exceeded"}
                         & (env_columns | app_columns)
                     )
+                else:
+                    run_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(runs)"
+                    )}
+                    migration_artifacts = "access_enforcement_level" in run_columns
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:
@@ -470,21 +483,23 @@ def init_db() -> None:
 def record_run_start(task_id, seat, executor, model, pid=None, *, board=None,
                      workspace_path=None, log_path=None, prompt_path=None,
                      provider=None, resolved_model=None, executor_version=None,
-                     process_start_token=None, task_attempt_id=None) -> int:
+                     process_start_token=None, task_attempt_id=None,
+                     access_enforcement_level=None) -> int:
     """Insert a running harness execution and return its run id."""
     init_db()
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO runs(task_id,seat,executor,model,pid,started_at,tokens_in,tokens_out,"
             "tokens_total,board,workspace_path,log_path,prompt_path,provider,resolved_model,"
-            "executor_version,process_start_token,task_attempt_id) "
-            "VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?)",
+            "executor_version,process_start_token,task_attempt_id,access_enforcement_level) "
+            "VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?)",
             (task_id, seat, executor, model or "", pid, _now(), board,
              str(workspace_path) if workspace_path is not None else None,
              str(log_path) if log_path is not None else None,
              str(prompt_path) if prompt_path is not None else None,
              provider, resolved_model, executor_version, process_start_token,
-             int(task_attempt_id) if task_attempt_id is not None else None),
+             int(task_attempt_id) if task_attempt_id is not None else None,
+             access_enforcement_level),
         )
         return int(cur.lastrowid)
 

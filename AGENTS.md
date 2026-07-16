@@ -172,6 +172,19 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   workspace non-writable (dirs `0o550`, files `0o440`) before exec, leaving
   only `.shipfactory-output/` writable so the step can still seal its
   result or emit a verdict (finding #34, SF-7 adversarial lane).
+- Finding #34's first cut was itself fail-open and incomplete: a DB/JSON
+  error resolving `access_mode` silently returned "no enforcement needed"
+  instead of blocking the spawn, and the Hermes executor branch never
+  called the enforcement function at all. `_step_access_mode` now raises
+  `AccessModeResolutionError` on any ambiguous lookup — `shipfactory_spawn`
+  lets that abort the spawn rather than run unprotected — and the
+  enforcement call moved above the executor branch so codex/claude/hermes
+  are covered identically. The chmod mechanism itself is still same-UID
+  bypassable (`chmod u+w` before writing restores the worker's own access);
+  this is now recorded honestly as `access_enforcement_level="advisory"` on
+  the run row (never `"enforced"`) — the SF-8 truthful-labeling pattern
+  (see `_apply_network_policy`, finding #7) applied to the filesystem
+  boundary (finding #1, cross-lab review of the SF-7 adversarial lane).
 
 ## Conventions
 
