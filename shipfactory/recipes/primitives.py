@@ -43,10 +43,25 @@ def build_review_input_context(
     snapshot: dict[str, Any] = {
         "schema": "shipfactory.review-input/v1",
         "instance_id": instance["id"], "review_step_id": step_def["id"],
+        "input_artifact_set_hash": None,
         "artifacts": [], "evidence_bundles": [], "exact_diff": None,
     }
+    current_step = db.execute(
+        "SELECT input_artifact_set_hash FROM recipe_steps WHERE instance_id=? "
+        "AND step_id=? ORDER BY activation DESC LIMIT 1",
+        (instance["id"], step_def["id"]),
+    ).fetchone()
+    if current_step is not None:
+        snapshot["input_artifact_set_hash"] = current_step["input_artifact_set_hash"]
     artifacts_by_kind: dict[str, dict[str, Any]] = {}
-    for kind in ("task-spec", "plan"):
+    artifact_kinds = sorted({"task-spec", "plan"} | {
+        item["kind"] for node in [step_def["id"], *upstream]
+        for item in next(
+            definition for definition in recipe["steps"] if definition["id"] == node
+        ).get("inputs", [])
+        if item.get("kind") != "evidence-bundle" and item.get("from") in upstream
+    })
+    for kind in artifact_kinds:
         if not upstream:
             continue
         placeholders = ",".join("?" for _ in upstream)
@@ -170,7 +185,9 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
         return value
     key = task_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"])
     title, body = render(step_def["title"]), render(params.get("instructions", params.get("message", "")))
-    if primitive == "review_gate" and db is not None and recipe.get("schema") == "shipfactory.recipe/v2":
+    if (primitive in {"agent_task", "review_gate"} and db is not None
+            and recipe.get("schema") == "shipfactory.recipe/v2"
+            and step_def.get("inputs")):
         review_context, _digest = build_review_input_context(db, instance, recipe, step_def)
         body += review_context
     if primitive in {"agent_task", "review_gate"}:

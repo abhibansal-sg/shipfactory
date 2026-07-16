@@ -355,6 +355,13 @@ _VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS = (
 _VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT = (
     ";\n".join(_VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS) + ";\n"
 )
+_APP_SESSION_IDENTITY_MIGRATION_STATEMENTS = (
+    "ALTER TABLE app_sessions ADD COLUMN expected_instance_id TEXT",
+    "ALTER TABLE app_sessions ADD COLUMN expected_head_sha TEXT",
+)
+_APP_SESSION_IDENTITY_MIGRATION_TEXT = (
+    ";\n".join(_APP_SESSION_IDENTITY_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -369,6 +376,7 @@ _MIGRATIONS = (
     (11, "sf11_bound_gate_decisions", _GATE_DECISION_MIGRATION_TEXT),
     (12, "verification_adversarial_hardening", _VERIFICATION_HARDENING_MIGRATION_TEXT),
     (13, "verification_production_identity_binding", _VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT),
+    (14, "app_session_expected_candidate_identity", _APP_SESSION_IDENTITY_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -384,6 +392,7 @@ _MIGRATION_STATEMENTS = {
     11: _GATE_DECISION_MIGRATION_STATEMENTS,
     12: _VERIFICATION_HARDENING_MIGRATION_STATEMENTS,
     13: _VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS,
+    14: _APP_SESSION_IDENTITY_MIGRATION_STATEMENTS,
 }
 
 
@@ -584,7 +593,7 @@ def init_db() -> None:
                         "PRAGMA table_info(evidence_bundles)"
                     )}
                     migration_artifacts = "phase_b_eligible" in bundle_columns
-                else:
+                elif version == 13:
                     run_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(runs)"
                     )}
@@ -602,6 +611,13 @@ def init_db() -> None:
                         or "producer_run_id" in step_columns
                         or {"workspace_path", "environment_identity_json"} & bundle_columns
                         or "attempt" in item_columns
+                    )
+                else:
+                    app_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(app_sessions)"
+                    )}
+                    migration_artifacts = bool(
+                        {"expected_instance_id", "expected_head_sha"} & app_columns
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -1290,19 +1306,35 @@ def nonterminal_env_sessions() -> list[dict[str, Any]]:
 
 
 def insert_app_session(id: str, *, env_session_id: str, request_key: str, workspace_path: str,
-                       stdout_path: str | None, stderr_path: str | None) -> dict[str, Any]:
+                       expected_instance_id: str | None = None,
+                       expected_head_sha: str | None = None,
+                       stdout_path: str | None = None,
+                       stderr_path: str | None = None) -> dict[str, Any]:
     """Idempotently persist an app-session request keyed by ``request_key``."""
     init_db()
     with _connect() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO app_sessions(id,env_session_id,request_key,workspace_path,"
-            "state,stdout_path,stderr_path,created_at) VALUES(?,?,?,?,'starting',?,?,?)",
-            (id, env_session_id, request_key, workspace_path, stdout_path, stderr_path, _now()),
+            "expected_instance_id,expected_head_sha,state,stdout_path,stderr_path,created_at) "
+            "VALUES(?,?,?,?,?,?,'starting',?,?,?)",
+            (id, env_session_id, request_key, workspace_path, expected_instance_id,
+             expected_head_sha, stdout_path, stderr_path, _now()),
         )
         row = conn.execute(
             "SELECT * FROM app_sessions WHERE request_key=?", (request_key,),
         ).fetchone()
-    return dict(row)
+    result = dict(row)
+    requested = (str(env_session_id), str(Path(workspace_path).resolve()))
+    persisted = (str(result["env_session_id"]), str(Path(result["workspace_path"]).resolve()))
+    if persisted != requested or (
+        expected_instance_id is not None
+        and result.get("expected_instance_id") != expected_instance_id
+    ) or (
+        expected_head_sha is not None
+        and result.get("expected_head_sha") != expected_head_sha
+    ):
+        raise ValueError("app-session request key is already bound to another candidate identity")
+    return result
 
 
 def app_session_row(id: str) -> dict[str, Any] | None:

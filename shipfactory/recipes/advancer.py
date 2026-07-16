@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from shipfactory import store
-from .instantiate import recipe_for_instance, revision_vector
+from .instantiate import RecipePolicyError, recipe_for_instance, revision_vector
 from .instantiate import task_key
 from .primitives import activate, parse_verdict
 
@@ -19,6 +19,10 @@ TERMINAL = {"done", "skipped", "cancelled", "failed"}
 KANBAN_TERMINAL = {"done", "archived", "failed", "cancelled"}
 EVENT_TERMINAL = {"applied", "discarded", "failed"}
 ACTION_TERMINAL = {"succeeded", "terminal_failed", "abandoned"}
+_CLAIMABLE_ACTION_KINDS = {
+    "worker_task_transition", "approval_gate_completion", "triage_root_completion",
+    "notification_delivery", "verification_run",
+}
 _LEASE_SECONDS = 30
 
 _FINDING_COUNT = re.compile(r"(?im)^\s*(?:finding_count|findings)\s*[:=]\s*(\d+)\s*$")
@@ -55,6 +59,20 @@ def startup_guard(config: Any) -> None:
             raise RuntimeError("recipe engine refuses kanban.auto_decompose=true")
     except ImportError:
         pass
+    recipes = config.recipes or {}
+    # Some callers use the guard only to enforce the Hermes compatibility
+    # contract before a recipe library has been configured.  Validate the
+    # declared names as soon as a concrete library is present, but do not turn
+    # a deliberately partial configuration into an unrelated KeyError.
+    if not recipes.get("library_path"):
+        return
+    from shipfactory.recipes.loader import load_library
+    load_library(
+        recipes["library_path"], seats=set(config.seats),
+        profiles=set(recipes.get("execution_profiles", {})),
+        verification_profiles=set(recipes.get("verification_profiles", {})),
+        persist=False,
+    )
 
 def _latest(db: Any, instance_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in db.execute("SELECT s.* FROM recipe_steps s JOIN (SELECT step_id,MAX(activation) activation FROM recipe_steps WHERE instance_id=? GROUP BY step_id) l ON l.step_id=s.step_id AND l.activation=s.activation WHERE s.instance_id=?", (instance_id, instance_id)).fetchall()]
@@ -256,6 +274,104 @@ def _step_change_set_workspace(
     return workspace or fallback_workspace, owner_task_id or fallback_owner
 
 
+def _run_successful(run: Any) -> bool:
+    """Return whether a durable worker run completed successfully."""
+    return bool(
+        run["ended_at"]
+        and run["exit_code"] == 0
+        and str(run["result"] or "").casefold() == "done"
+    )
+
+
+def _run_provider_family(run: Any, role: str) -> tuple[str | None, str | None]:
+    """Resolve a run's persisted provider family, failing closed if unknown."""
+    value = run["provider"] if run["provider"] is not None else run["executor"]
+    family = str(value or "").strip().casefold()
+    if family not in {"codex", "claude", "hermes"}:
+        return None, f"review_{role}_provider_unknown:{value!r}"
+    return family, None
+
+
+def _activation_matches(value: Any, activation: int) -> bool:
+    try:
+        return value is not None and int(value) == int(activation)
+    except (TypeError, ValueError):
+        return False
+
+
+def _exact_producer_run(db: Any, *, instance_id: str, step_id: str,
+                        activation: int, role: str,
+                        expected_workspace: str | None = None,
+                        ) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve a step's durable producer run without trusting mutable config."""
+    step = db.execute(
+        "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+        (instance_id, step_id, int(activation)),
+    ).fetchone()
+    if step is None:
+        return None, f"review_{role}_run_missing:step"
+    if step["kanban_task_id"] is None:
+        return None, f"review_{role}_run_missing:task"
+    if step["producer_run_id"] is None:
+        return None, f"review_{role}_run_missing:producer_run_id"
+    try:
+        producer_run_id = int(step["producer_run_id"])
+    except (TypeError, ValueError):
+        return None, f"review_{role}_run_unknown:{step['producer_run_id']!r}"
+    run = db.execute(
+        "SELECT * FROM runs WHERE id=?", (producer_run_id,)
+    ).fetchone()
+    if run is None:
+        return None, f"review_{role}_run_unknown:{producer_run_id}"
+    if str(run["task_id"]) != str(step["kanban_task_id"]):
+        return None, f"review_{role}_run_wrong_task:{run['task_id']}"
+    if not _activation_matches(run["recipe_activation"], activation):
+        return None, f"review_{role}_run_stale_activation:{run['recipe_activation']}"
+    if expected_workspace is not None:
+        recorded_workspace = str(run["workspace_path"] or "")
+        if not recorded_workspace:
+            return None, f"review_{role}_workspace_missing"
+        if os.path.realpath(recorded_workspace) != os.path.realpath(str(expected_workspace)):
+            return None, f"review_{role}_run_workspace_mismatch:{recorded_workspace}"
+    if not _run_successful(run):
+        return None, f"review_{role}_run_non_successful:{run['result'] or run['exit_code']}"
+    return dict(run), None
+
+
+def _exact_reviewer_run(db: Any, *, instance_id: str, step_id: str,
+                        activation: int, task_id: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve the current review task's one successful durable worker run."""
+    if not task_id:
+        return None, "review_reviewer_run_missing:task"
+    rows = db.execute(
+        "SELECT * FROM runs WHERE task_id=? ORDER BY id", (str(task_id),)
+    ).fetchall()
+    malformed = []
+    for row in rows:
+        value = row["recipe_activation"]
+        if value is not None:
+            try:
+                int(value)
+            except (TypeError, ValueError):
+                malformed.append(value)
+    exact = [row for row in rows if _activation_matches(row["recipe_activation"], activation)]
+    if malformed and not exact:
+        return None, f"review_reviewer_run_unknown_activation:{malformed}"
+    if malformed and exact:
+        return None, f"review_reviewer_run_ambiguous:unknown_activation:{malformed}"
+    successful = [row for row in exact if _run_successful(row)]
+    if len(successful) > 1:
+        return None, "review_reviewer_run_ambiguous:multiple_successful_runs"
+    if successful:
+        return dict(successful[0]), None
+    if exact:
+        return None, "review_reviewer_run_non_successful"
+    if rows:
+        activations = sorted({row["recipe_activation"] for row in rows}, key=str)
+        return None, f"review_reviewer_run_stale_activation:{activations}"
+    return None, "review_reviewer_run_missing:exact_task_activation"
+
+
 def _review_approval_blocker(db: Any, instance_id: str,
                              definition: dict[str, Any], *,
                              verdict_body: str = "", recipe: dict[str, Any] | None = None,
@@ -310,7 +426,7 @@ def _review_approval_blocker(db: Any, instance_id: str,
                     "workspace_owner_task_id": bundle.get("workspace_owner_task_id"),
                     "workspace_owner_activation": bundle.get("workspace_owner_activation"),
                     "workspace_owner_run_id": bundle.get("workspace_owner_run_id"),
-                })
+                }, db=db)
                 assert_commit_binding(bundle["workspace_path"], bundle["head_sha"], bundle["tree_sha"])
         except CommitBindingError as exc:
             return f"candidate_mutated_after_verification:{exc}"
@@ -335,23 +451,45 @@ def _review_approval_blocker(db: Any, instance_id: str,
         task_body = str(task.body or "") if task is not None else ""
         if marker not in task_body or review_context not in task_body:
             return "review_inputs_not_bound"
-    # Reviewer/builder provider independence (finding #3): a differently
-    # named reviewer seat configured identically to the builder seat is not
-    # an independent review.
+    # Reviewer/builder provider independence (finding #57): the work that
+    # establishes independence is identified by its exact successful durable
+    # runs.  Mutable seat configuration is not evidence of which provider ran
+    # either task and must not launder collusion after spawn.
     change_set_producer_id = next((item["from"] for step_id in [definition["id"], *ancestors]
         for item in defs.get(step_id, {}).get("inputs", []) if item.get("kind") == "change-set"), None)
     if change_set_producer_id and defs.get(change_set_producer_id, {}).get("primitive") == "agent_task":
-        builder_seat = defs[change_set_producer_id]["params"].get("seat")
-        reviewer_seat = definition["params"].get("seat")
-        if builder_seat and reviewer_seat:
-            from shipfactory.config import load_seats, reviewer_shares_builder_provider
-            try:
-                cfg = load_seats()
-                shared = reviewer_shares_builder_provider(cfg, builder_seat, reviewer_seat)
-            except Exception as exc:
-                return f"reviewer_provider_unresolved:{exc}"
-            if shared:
-                return "reviewer_shares_builder_provider"
+        current_steps = {row["step_id"]: row for row in _latest(db, instance_id)}
+        builder_step = current_steps.get(change_set_producer_id)
+        review_step = current_steps.get(definition["id"])
+        if builder_step is None:
+            return "review_builder_run_missing:step"
+        if review_step is None:
+            return "review_reviewer_run_missing:step"
+        builder_run, reason = _exact_producer_run(
+            db, instance_id=instance_id, step_id=change_set_producer_id,
+            activation=int(builder_step["activation"]), role="builder",
+            expected_workspace=(
+                _step_change_set_workspace(conn, current_steps, definition)[0]
+                if conn is not None else None
+            ),
+        )
+        if reason:
+            return reason
+        reviewer_run, reason = _exact_reviewer_run(
+            db, instance_id=instance_id, step_id=definition["id"],
+            activation=int(review_step["activation"]),
+            task_id=review_step["kanban_task_id"],
+        )
+        if reason:
+            return reason
+        builder_family, reason = _run_provider_family(builder_run, "builder")
+        if reason:
+            return reason
+        reviewer_family, reason = _run_provider_family(reviewer_run, "reviewer")
+        if reason:
+            return reason
+        if builder_family == reviewer_family:
+            return "reviewer_shares_builder_provider"
     return None
 
 def _result_one_liner(value: str | None) -> str | None:
@@ -643,7 +781,11 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
     if target not in defs or defs[target]["primitive"] != "agent_task":
         raise ValueError("review change target must be an upstream agent_task")
     if recipe.get("schema") == "shipfactory.recipe/v2":
-        declared_targets = {
+        change_set_targets = {
+            item["from"] for item in defs[rejecting_step].get("inputs", [])
+            if item.get("kind") == "change-set"
+        }
+        declared_targets = change_set_targets or {
             item["from"] for item in defs[rejecting_step].get("inputs", [])
             if defs[item["from"]]["primitive"] == "agent_task"
         }
@@ -680,9 +822,25 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
             for child in children[node]: down(child)
     down(target)
     cone = {node for node in descendants if node == rejecting_step or rejecting_step in descendants and node in upstream(rejecting_step) | {rejecting_step}}
-    # The preceding expression intentionally retains target->review paths;
-    # include downstream review ancestors deterministically.
-    cone = {node for node in defs if target == node or target in upstream(node)} & {node for node in defs if node == rejecting_step or node in upstream(rejecting_step)}
+    # Planning attacks reopen only the producer-to-review path.  A production
+    # review bound to a change-set invalidates the entire candidate cone:
+    # verification, later review, story, approval, and notify must all receive
+    # fresh activations, so an already-issued decision token cannot name the
+    # new revision.
+    production_rework = any(
+        item.get("kind") == "change-set"
+        for item in defs[rejecting_step].get("inputs", [])
+    )
+    if production_rework:
+        cone = descendants
+    else:
+        # Retain target->review paths and include review ancestors
+        # deterministically without reopening unrelated downstream planning.
+        cone = (
+            {node for node in defs if target == node or target in upstream(node)}
+            & {node for node in defs
+               if node == rejecting_step or node in upstream(rejecting_step)}
+        )
     now = store._now()
     for node in sorted(cone):
         current = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], node)).fetchone()
@@ -740,7 +898,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
     with store._connect() as db:
         initial = _instance(db, instance_id)
         if not initial: raise ValueError("unknown recipe instance")
-        max_passes = max(4, 4 * len(recipe_for_instance(initial).document["steps"]))
+        max_passes = max(4, 4 * len(recipe_for_instance(initial, db=db).document["steps"]))
     # Reach a local fixpoint so one restart pass can observe a completion and
     # activate its dependent. Kanban mutations remain idempotent by task key.
     status = "running"
@@ -751,7 +909,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
             if not instance: raise ValueError("unknown recipe instance")
             if instance["status"] in {"cancelling", "cancelled"}:
                 return {"instance_id": instance_id, "status": instance["status"]}
-            recipe = recipe_for_instance(instance).document
+            recipe = recipe_for_instance(instance, db=db).document
             params = json.loads(instance["parameters_json"])
             defs = {x["id"]: x for x in recipe["steps"]}
 
@@ -1201,6 +1359,8 @@ def _claim_action(*, owner: str, board: str | None, kinds: set[str] | None,
             "ORDER BY a.created_at,a.key"
         ).fetchall()]
         for row in retryable:
+            if row["kind"] not in _CLAIMABLE_ACTION_KINDS:
+                continue
             if not _action_matches_board(db, row, board):
                 continue
             if kinds is not None and row["kind"] not in kinds:
@@ -1220,6 +1380,8 @@ def _claim_action(*, owner: str, board: str | None, kinds: set[str] | None,
         ).fetchall()]
         selected = None
         for row in candidates:
+            if row["kind"] not in _CLAIMABLE_ACTION_KINDS:
+                continue
             if kinds is not None and row["kind"] not in kinds:
                 continue
             if not _action_matches_board(db, row, board):
@@ -1738,6 +1900,8 @@ def _bound_gate_step(db: Any, instance_id: str, payload: dict[str, Any],
         decision["evidence_bundle_hash"] or None
     ):
         return None, "evidence bundle hash changed"
+    if binding.get("policy_hash") != decision["policy_hash"]:
+        return None, "policy hash changed"
     if payload.get("decision") != decision["decision"]:
         return None, "event decision differs from persisted decision"
     return step, None
@@ -1778,7 +1942,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
                     return
             if row["source"] == "external_event":
-                defs = {item["id"]: item for item in recipe_for_instance(instance).document["steps"]}
+                defs = {item["id"]: item for item in recipe_for_instance(instance, db=db).document["steps"]}
                 definition = defs.get(payload.get("step_id"))
                 if (step["state"] != "waiting" or not definition
                         or definition["primitive"] != "wait_for_event"
@@ -1826,7 +1990,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         or step["blocked_reason"] not in recoverable):
                     _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return
-                recipe = recipe_for_instance(instance).document
+                recipe = recipe_for_instance(instance, db=db).document
                 blocked_reason = step["blocked_reason"]
                 if blocked_reason == "review_stall":
                     from hermes_cli import kanban_db
@@ -1904,23 +2068,32 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
         kinds={"approval_gate_completion"},
     )
     for ident in ids:
-        reconcile(
-            conn, ident, profiles=profiles,
-            board_day_token_ceiling=board_day_token_ceiling,
-            verification_profiles=verification_profiles,
-            environment_config=environment_config,
-        )
-    ran_verification = run_action_intents(
-        conn, board=board, kinds={"verification_run"},
-    )
-    if ran_verification:
-        for ident in ids:
+        try:
             reconcile(
                 conn, ident, profiles=profiles,
                 board_day_token_ceiling=board_day_token_ceiling,
                 verification_profiles=verification_profiles,
                 environment_config=environment_config,
             )
+        except RecipePolicyError:
+            # A corrupted policy has already fenced any event that needed it.
+            # Do not let the post-event reconciliation pass mutate or advance
+            # the instance after the policy has become untrusted.
+            continue
+    ran_verification = run_action_intents(
+        conn, board=board, kinds={"verification_run"},
+    )
+    if ran_verification:
+        for ident in ids:
+            try:
+                reconcile(
+                    conn, ident, profiles=profiles,
+                    board_day_token_ceiling=board_day_token_ceiling,
+                    verification_profiles=verification_profiles,
+                    environment_config=environment_config,
+                )
+            except RecipePolicyError:
+                continue
     return count
 
 def cancel(conn: Any, instance_id: str, *, dry_run: bool = False) -> dict[str, Any]:

@@ -58,11 +58,15 @@ _APP_SERVER = """\
 #!/bin/sh
 PORT_VALUE="$2"
 exec python3 -c "
-import sys, http.server
+import os, json, http.server
 port = int('$PORT_VALUE')
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+        self.send_response(200); self.end_headers()
+        if self.path == '/.shipfactory/identity':
+            self.wfile.write(json.dumps({'instance_id': os.environ['SHIPFACTORY_INSTANCE_ID'], 'head_sha': os.environ['SHIPFACTORY_HEAD_SHA']}).encode())
+        else:
+            self.wfile.write(b'ok')
     def log_message(self, *a): pass
 http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()
 "
@@ -414,7 +418,7 @@ def test_app_pid_persisted_before_token_is_verified_killed_on_restore(tmp_path):
     must never be released while a real orphaned child still holds the
     port (review finding #2)."""
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="crash-app", cfg=cfg)
+    app = _request_app(env_row, "crash-app", cfg)
     record = env._APP_RUNNING.pop(app["id"])
     real_pid = record["pid"]
     # Simulate the crash landing before the start token made it to the
@@ -439,6 +443,14 @@ def test_two_sessions_race_for_the_same_port(tmp_path):
     assert store.release_resource_lease("a") is True
     third = store.acquire_port_lease(19000, 19000, key="b")
     assert third == 19000
+
+
+def test_app_identity_migration_is_durable_and_numbered():
+    store.init_db()
+    with store._connect() as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
+        columns = [row["name"] for row in db.execute("PRAGMA table_info(app_sessions)")]
+    assert columns[-2:] == ["expected_instance_id", "expected_head_sha"]
 
 
 # --- App sessions -------------------------------------------------------------
@@ -477,9 +489,19 @@ def _wait_for_app_state(app_id: str, cfg: dict, states: set[str], *, timeout: fl
     return row
 
 
+def _request_app(env_row: dict, request_key: str, cfg: dict, *,
+                 instance_id: str = "environment-test", head_sha: str | None = None) -> dict:
+    return env.request_app_start(
+        env_session_id=env_row["id"], request_key=request_key,
+        expected_instance_id=instance_id,
+        expected_head_sha=head_sha or env_row.get("candidate_sha") or env_row["base_sha"],
+        cfg=cfg,
+    )
+
+
 def test_app_healthcheck_and_stop_happy_path(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="r1", cfg=cfg)
+    app = _request_app(env_row, "r1", cfg)
     healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     assert healthy["state"] == "healthy"
     body = urllib.request.urlopen(healthy["app_url"], timeout=2).read()
@@ -491,13 +513,71 @@ def test_app_healthcheck_and_stop_happy_path(tmp_path):
     assert store.acquire_resource_lease("port", 1, key="probe-port") is not None
 
 
+def test_real_app_start_injects_and_probes_durable_instance_head_identity(tmp_path):
+    from shipfactory import verification
+
+    repo, cfg, env_row = _ready_env(tmp_path)
+    expected_head = env_row["base_sha"]
+    app = _request_app(
+        env_row, "identity-real-start", cfg,
+        instance_id="identity-instance", head_sha=expected_head,
+    )
+    healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
+    assert healthy["state"] == "healthy"
+    assert healthy["expected_instance_id"] == "identity-instance"
+    assert healthy["expected_head_sha"] == expected_head
+
+    live = verification._live_app_identity(
+        {
+            "instance_id": "identity-instance", "base_sha": env_row["base_sha"],
+            "head_sha": expected_head,
+        },
+        healthy, env_row, repo, 2,
+    )
+    assert live["instance_id"] == "identity-instance"
+    assert live["head_sha"] == expected_head
+    assert live["identity_url"].endswith("/.shipfactory/identity")
+
+
+def test_app_request_key_cannot_be_reused_for_another_identity(tmp_path):
+    repo, cfg, env_row = _ready_env(tmp_path)
+    first = _request_app(env_row, "identity-reuse", cfg, instance_id="first")
+    assert first["expected_instance_id"] == "first"
+    with pytest.raises(ValueError, match="another candidate identity"):
+        _request_app(env_row, "identity-reuse", cfg, instance_id="second")
+
+
+def test_live_probe_rejects_persisted_identity_drift_before_http_trust(tmp_path):
+    from shipfactory import verification
+
+    repo, cfg, env_row = _ready_env(tmp_path)
+    expected_head = env_row["base_sha"]
+    app = _request_app(env_row, "identity-drift", cfg, instance_id="right")
+    healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
+    assert healthy["state"] == "healthy"
+    with store._connect() as db:
+        db.execute(
+            "UPDATE app_sessions SET expected_head_sha=? WHERE id=?",
+            ("f" * 40, app["id"]),
+        )
+    drifted = store.app_session_row(app["id"])
+    with pytest.raises(verification.CommitBindingError, match="identity is stale"):
+        verification._live_app_identity(
+            {
+                "instance_id": "right", "base_sha": env_row["base_sha"],
+                "head_sha": expected_head,
+            },
+            drifted, env_row, repo, 2,
+        )
+
+
 def test_port_collision_second_session_queues_not_fails(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path)  # port range has exactly one slot
-    first = env.request_app_start(env_session_id=env_row["id"], request_key="p1", cfg=cfg)
+    first = _request_app(env_row, "p1", cfg)
     healthy = _wait_for_app_state(first["id"], cfg, {"healthy", "crashed"})
     assert healthy["state"] == "healthy"
 
-    second = env.request_app_start(env_session_id=env_row["id"], request_key="p2", cfg=cfg)
+    second = _request_app(env_row, "p2", cfg)
     env.tick(cfg)
     pending = store.app_session_row(second["id"])
     assert pending["state"] == "starting"
@@ -511,7 +591,7 @@ def test_port_collision_second_session_queues_not_fails(tmp_path):
 
 def test_healthcheck_never_healthy_fails_and_releases_port(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path, app_start=_NEVER_BINDS)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="nh1", cfg=cfg)
+    app = _request_app(env_row, "nh1", cfg)
     crashed = _wait_for_app_state(app["id"], cfg, {"crashed", "healthy"}, timeout=8)
     assert crashed["state"] == "crashed"
     assert "healthcheck" in crashed["last_error"]
@@ -520,7 +600,7 @@ def test_healthcheck_never_healthy_fails_and_releases_port(tmp_path):
 
 def test_stop_escalates_to_kill_after_shutdown_timeout(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path, app_start=_IGNORES_TERM)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="k1", cfg=cfg)
+    app = _request_app(env_row, "k1", cfg)
     started = _wait_for_app_state(app["id"], cfg, {"starting", "healthy", "crashed"}, timeout=3)
     assert app["id"] in env._APP_RUNNING
     assert env.request_stop(app["id"], cfg) is True
@@ -530,7 +610,7 @@ def test_stop_escalates_to_kill_after_shutdown_timeout(tmp_path):
 
 def test_daemon_restart_adopts_live_app_session(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="ad1", cfg=cfg)
+    app = _request_app(env_row, "ad1", cfg)
     healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     assert healthy["state"] == "healthy"
 
@@ -551,7 +631,7 @@ def test_daemon_restart_adopts_live_app_session(tmp_path):
 
 def test_daemon_restart_with_dead_session_crashes_and_releases_port(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="dead1", cfg=cfg)
+    app = _request_app(env_row, "dead1", cfg)
     healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     assert healthy["state"] == "healthy"
 
@@ -570,7 +650,7 @@ def test_daemon_restart_with_dead_session_crashes_and_releases_port(tmp_path):
 def test_stale_pid_is_never_blindly_killed(tmp_path):
     """A reused PID with a mismatched start token must not be signalled."""
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="stale1", cfg=cfg)
+    app = _request_app(env_row, "stale1", cfg)
     _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     record = env._APP_RUNNING.pop(app["id"])
     real_pid = record["pid"]
@@ -601,7 +681,7 @@ def test_request_stop_never_signals_a_stale_pid(tmp_path):
     request_stop's kill specifically, which pre-fix called os.killpg
     directly with no identity recheck at all (review finding #3)."""
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="stopstale1", cfg=cfg)
+    app = _request_app(env_row, "stopstale1", cfg)
     _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     record = env._APP_RUNNING[app["id"]]
     real_pid = record["pid"]
@@ -627,7 +707,7 @@ def test_healthy_app_port_lease_is_renewed_and_never_silently_expires(tmp_path):
     not left to expire on its original startup+shutdown+300s acquisition
     window while the app is still alive and answering (review finding #4)."""
     repo, cfg, env_row = _ready_env(tmp_path)
-    app = env.request_app_start(env_session_id=env_row["id"], request_key="lease1", cfg=cfg)
+    app = _request_app(env_row, "lease1", cfg)
     healthy = _wait_for_app_state(app["id"], cfg, {"healthy", "crashed"})
     assert healthy["state"] == "healthy"
     port_lease_key = healthy["port_lease_key"]
@@ -660,7 +740,7 @@ def test_healthchecks_are_probed_concurrently_not_serially(tmp_path):
     row = _materialize(repo, base_sha, cfg)
     assert row["state"] == "ready"
     apps = [
-        env.request_app_start(env_session_id=row["id"], request_key=f"concurrent{i}", cfg=cfg)
+        _request_app(row, f"concurrent{i}", cfg)
         for i in range(n)
     ]
     for app in apps:

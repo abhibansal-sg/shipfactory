@@ -19,6 +19,8 @@ def test_claude_command_and_stream_usage(tmp_path):
     cmd = executor.build_cmd(seat, "prompt", str(tmp_path))
     assert cmd[:5] == ["claude", "--print", "-", "--output-format", "stream-json"]
     assert "--effort" in cmd and "--add-dir" in cmd
+    assert "--strict-mcp-config" in cmd
+    assert not any("bypass" in item.lower() for item in cmd)
     usage = executor.parse_usage('{"type":"result","usage":{"input_tokens":10,"output_tokens":4}}')
     assert usage == {"tokens_in": 10, "tokens_out": 4, "tokens_total": 14}
 
@@ -71,9 +73,8 @@ def test_hermes_extract_text_passthrough():
     assert get_executor("hermes").extract_text("raw") == "raw"
 
 
-def test_codex_worktree_git_root_added_to_writable_roots(tmp_path):
-    """Finding #24: linked-worktree workspaces need the parent .git granted,
-    or codex's workspace-write sandbox denies index.lock and commits fail."""
+def test_codex_worker_is_not_granted_parent_git_write_access(tmp_path):
+    """Factory owns the canonical commit; the model gets no parent .git grant."""
     repo_git = tmp_path / "repo" / ".git" / "worktrees" / "t_x"
     repo_git.mkdir(parents=True)
     ws = tmp_path / "ws"
@@ -82,9 +83,8 @@ def test_codex_worktree_git_root_added_to_writable_roots(tmp_path):
     seat = SimpleNamespace(profile="dev", model="gpt-5", reasoning="")
     cmd = get_executor("codex").build_cmd(seat, "prompt", str(ws))
     joined = " ".join(cmd)
-    assert "sandbox_workspace_write.writable_roots" in joined
-    assert str(tmp_path / "repo" / ".git") in joined
-    # Regular checkout (.git is a directory): no extra grant.
+    assert "sandbox_workspace_write.writable_roots" not in joined
+    assert str(tmp_path / "repo" / ".git") not in joined
     plain = tmp_path / "plain"
     (plain / ".git").mkdir(parents=True)
     assert "writable_roots" not in " ".join(get_executor("codex").build_cmd(seat, "p", str(plain)))

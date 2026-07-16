@@ -306,12 +306,109 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   approve verdict and proves an unbound task blocks the step and instance with
   `review_inputs_not_bound`; testing only `_review_approval_blocker` would miss
   a future call-site bypass (finding #45, verification rereview).
+- Build workers do not own Git identity. Codex workspace-write and Claude
+  default permissions cannot reliably write a linked worktree's shared Git
+  metadata, and expanding model permissions would enlarge the trust boundary.
+  The reap/sealing path now validates exact dirty paths against the sealed plan
+  and task-spec exclusions, rejects symlinks/conflicts/preexisting model
+  commits, creates one hook-disabled commit with the canonical public author,
+  and writes the daemon-derived change-set. An exact existing Factory commit is
+  the only accepted retry state after a crash between commit and seal (finding
+  #46, dev-pipeline@6 integration review).
+- An app request's expected recipe instance and candidate head are durable
+  session identity, not data to infer from a request-key convention. Migration
+  14 stores both values; app startup overwrites the reserved
+  `SHIPFACTORY_INSTANCE_ID`/`SHIPFACTORY_HEAD_SHA` environment variables from
+  those trusted columns, and reuse plus the live root identity probe recheck the
+  persisted tuple before evidence can run (finding #47, dev-pipeline@6
+  integration review).
+- Claude's ambient global MCP registry is not a valid Factory tool boundary: a
+  malformed or oversized global tool definition can crash a review before it
+  starts. Every Claude executor command uses `--strict-mcp-config` while keeping
+  default permissions; bypass mode is never an availability fix (finding #48,
+  dev-pipeline@6 integration review).
+- Recording a gate decision's policy hash is insufficient unless queued event
+  consumption compares it with `current_binding()` again. Human-gate policy
+  identity remains the immutable recipe hash in this phase, and any recorded
+  mismatch is consumed as a stale decision while the approval gate remains
+  waiting (finding #49, dev-pipeline@6 integration review).
+- A review story binds the SHA-256 of its exact declared change-set alongside
+  spec, plan, and evidence. Production validation resolves the story step's
+  declared inputs and activation revision instead of selecting instance-wide
+  "latest" rows, then reopens the exact producer workspace. Canonical story
+  bytes remain unescaped when sealed—even paths containing HTML metacharacters;
+  escaping is an API/UI projection only (finding #50, dev-pipeline@6 integration
+  review).
+- Approval data is useful only when it reaches the operator surface. Waiting
+  gates and instance detail now carry the exact bound review-story projection,
+  and the dashboard renders its changes, paths, evidence, omissions, and
+  residual risks exclusively as React text children—never executable HTML
+  (finding #51, dev-pipeline@6 integration review).
+- A published recipe's live configuration contract includes deterministic
+  verification profiles as well as agent seats and token profiles. Loader and
+  startup validation now fail closed on an unknown verification profile; @6 is
+  covered against its exact seat/profile names, and both sequential production
+  reviewers must each be provider-family independent from the builder. Requiring
+  the two reviewers to use different provider families from one another would
+  reject the ratified verifier/architect configuration without strengthening
+  the builder-review trust boundary (finding #52, dev-pipeline@6 integration
+  review).
+- Real-browser adversarial controls need a runtime budget large enough to
+  reach their intended oracle under full-suite process load. A ten-second
+  generic unit-driver budget let Chromium cold-start latency turn deterministic
+  backend/reload failures into `test_timeout`; the real-browser control now
+  keeps its fail-closed assertion while using a bounded 30-second budget so it
+  proves `test_failed` for the named attack rather than host scheduling noise
+  (finding #53, dev-pipeline@6 cutover).
+- Asynchronous verification tests must measure the concurrency invariant, not
+  scheduler luck. The action-level poll budget now covers the sequential
+  protected-plus-candidate case set without changing either case's production
+  timeout, and the non-blocking regression proves that the fast action seals
+  while the deliberately slow runner process is still live instead of requiring
+  `Popen` bookkeeping to finish within one wall-clock second on a loaded host
+  (finding #54, dev-pipeline@6 cutover).
+- Public Git author and message metadata are descriptive, never proof that a
+  build commit belongs to Factory. Before moving `HEAD`, finalization now stages
+  only validated paths, writes the tree and deterministic public commit object
+  with hook-disabled plumbing, and durably records the exact commit/tree/base,
+  run, instance/step/activation, resolved workspace, message, and timestamps in
+  a non-claimable `action_intents` record. The finalizer alone performs the
+  compare-and-swap `update-ref`, then marks the journal row terminal; retries
+  accept only that persisted SHA and context, so forged public metadata and
+  cross-run/worktree reuse fail closed. The final canonical diff also rechecks
+  task-spec forbidden paths, including rename sources, on every retry
+  (finding #55, dev-pipeline@6 rework).
+- Persisted recipe policy bytes are not authoritative merely because their
+  stored hashes are unchanged. Every active instance load now canonicalizes
+  and hashes `normalized_yaml`, requiring equality with both
+  `recipe_versions.hash` and `recipe_instances.recipe_hash`; decision enqueue
+  and daemon application use that same transaction-bound loader and discard
+  queued decisions when policy bytes drift (finding #56).
+- Review provider independence must be derived from the exact successful
+  durable builder and reviewer runs, bound to their recipe activation and
+  kanban task, rather than mutable seat configuration. A post-spawn seat edit
+  cannot launder collusion or create a false provider identity; missing,
+  stale, non-successful, ambiguous, or unknown run identity blocks approval
+  (finding #57, dev-pipeline@6 review-run identity lane).
+- Dirty-tree and staged-tree path comparisons must use the same rename
+  representation. Pre-stage validation names both the source and destination;
+  staged `--name-only` must therefore use `--no-renames` before set comparison,
+  while the final canonical diff remains rename-aware and binds
+  `previous_path`. Otherwise legitimate approved renames fail before the
+  forbidden rename-source boundary can run (finding #58, dev-pipeline@6 final
+  review proof gap).
+- Legacy execution-policy reopen is one ownership transition: status, completed
+  timestamp, next-stage assignee, and reassignment failure-streak reset update
+  in the same kanban write transaction. Assigning through the CLI while the
+  task is still `done` and reopening status afterward can return `ready` under
+  the old worker, so both the update count and emitted ownership event are
+  checked (finding #59, dev-pipeline@6 exact-gate stability pass).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#45 so far). When you fix one: commit message
+- Findings get numbers (#22–#59 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

@@ -316,23 +316,19 @@ def _step_access_mode(task_id: str) -> str | None:
     try:
         with store._connect() as db:
             row = db.execute(
-                "SELECT s.step_id,i.recipe_id,i.recipe_version,v.normalized_yaml "
+                "SELECT s.step_id,i.recipe_id,i.recipe_version,i.recipe_hash "
                 "FROM recipe_steps s JOIN recipe_instances i ON i.id=s.instance_id "
                 "JOIN recipe_versions v ON v.id=i.recipe_id AND v.version=i.recipe_version "
                 "WHERE s.kanban_task_id=?",
                 (str(task_id),),
             ).fetchone()
+            if row is None:
+                return None
+            from shipfactory.recipes.instantiate import recipe_for_instance
+            recipe = recipe_for_instance(dict(row), db=db).document
     except Exception as exc:
         raise AccessModeResolutionError(
             f"access_mode lookup failed for task {task_id}: {exc}"
-        ) from exc
-    if row is None:
-        return None
-    try:
-        recipe = json.loads(row["normalized_yaml"])
-    except (TypeError, ValueError) as exc:
-        raise AccessModeResolutionError(
-            f"access_mode recipe parse failed for task {task_id}: {exc}"
         ) from exc
     definition = next(
         (item for item in recipe.get("steps", []) if item.get("id") == row["step_id"]),

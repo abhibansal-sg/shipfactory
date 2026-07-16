@@ -17,11 +17,12 @@ from shipfactory.recipes.selector import lease_source_task
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
-    "standard": {
+    name: {
         "max_runtime_seconds": 1800,
         "max_retries": 2,
         "token_allowance": 50_000,
     }
+    for name in ("standard", "planning", "build", "review")
 }
 
 
@@ -59,6 +60,7 @@ def stage_config(monkeypatch) -> FactoryConfig:
     seats = {
         name: Seat(name, profile=name, executor="codex", role=role)
         for name, role in (
+            ("explorer", "researcher"),
             ("dev-backend", "engineer"), ("verifier", "qa"),
             ("architect", "engineer"), ("operator", "general"),
         )
@@ -73,6 +75,7 @@ def stage_config(monkeypatch) -> FactoryConfig:
             "board_day_token_ceiling": 500_000,
             "dispatcher_max_in_progress": 4,
             "execution_profiles": PROFILES,
+            "verification_profiles": {"browser-standard": {}},
             "selector": {
                 "enabled": True,
                 "max_per_tick": 3,

@@ -2084,7 +2084,7 @@ def _spawn_runner(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "pending", "bundle_id": bundle_id, "reason": "verification running"}
 
 
-def _assert_workspace_owner(payload: dict[str, Any]) -> None:
+def _assert_workspace_owner(payload: dict[str, Any], *, db: Any | None = None) -> None:
     """Cross-check a claimed workspace against its recorded task owner.
 
     ``assert_commit_binding`` only proves that whatever directory is passed
@@ -2104,9 +2104,16 @@ def _assert_workspace_owner(payload: dict[str, Any]) -> None:
     owner_run_id = payload.get("workspace_owner_run_id")
     if not isinstance(owner_activation, int) or not isinstance(owner_run_id, int):
         raise CommitBindingError("exact workspace producer activation/run identity is missing")
-    recorded_run = store.exact_workspace_run(
-        str(owner_task_id), int(owner_run_id), int(owner_activation),
-    )
+    if db is None:
+        recorded_run = store.exact_workspace_run(
+            str(owner_task_id), int(owner_run_id), int(owner_activation),
+        )
+    else:
+        row = db.execute(
+            "SELECT * FROM runs WHERE id=? AND task_id=? AND recipe_activation=?",
+            (int(owner_run_id), str(owner_task_id), int(owner_activation)),
+        ).fetchone()
+        recorded_run = dict(row) if row is not None else None
     if recorded_run is None or not recorded_run.get("workspace_path"):
         raise CommitBindingError("exact workspace producer run is missing")
     recorded = recorded_run["workspace_path"]
@@ -2125,9 +2132,22 @@ def _live_app_identity(
 ) -> dict[str, Any]:
     """Bind a healthy app row to the exact environment and a live HTTP identity."""
     expected_workspace = workspace.resolve()
+    # A base-only materialization deliberately has no candidate SHA.  Its
+    # effective candidate is the base commit, but a non-base payload must
+    # still be rejected as stale rather than benefiting from that fallback.
+    env_candidate_sha = env_row.get("candidate_sha")
+    effective_candidate_sha = (
+        env_candidate_sha
+        if env_candidate_sha is not None
+        else env_row.get("base_sha")
+        if payload.get("head_sha") == env_row.get("base_sha")
+        else None
+    )
     fields_match = bool(
         env_row.get("base_sha") == payload["base_sha"]
-        and env_row.get("candidate_sha") == payload["head_sha"]
+        and effective_candidate_sha == payload["head_sha"]
+        and app.get("expected_instance_id") == payload["instance_id"]
+        and app.get("expected_head_sha") == payload["head_sha"]
         and Path(env_row.get("workspace_path") or "").resolve() == expected_workspace
         and Path(app.get("workspace_path") or "").resolve() == expected_workspace
         and app.get("env_session_id") == env_row.get("id")
@@ -2138,9 +2158,10 @@ def _live_app_identity(
     if (not app.get("pid") or not app.get("process_start_token")
             or spawn._process_start_token(int(app["pid"])) != app["process_start_token"]):
         raise CommitBindingError("app session process identity is not live")
-    identity_url = urllib.parse.urljoin(
-        str(app.get("app_url") or "").rstrip("/") + "/", ".shipfactory/identity",
-    )
+    app_url = urllib.parse.urlsplit(str(app.get("app_url") or ""))
+    identity_url = urllib.parse.urlunsplit((
+        app_url.scheme, app_url.netloc, "/.shipfactory/identity", "", "",
+    ))
     try:
         request = urllib.request.Request(
             identity_url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
@@ -2220,7 +2241,9 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
             if env_row["state"] != "ready":
                 return {"status": "pending", "reason": "environment materializing"}
             app = environments.request_app_start(
-                env_session_id=env_row["id"], request_key=app_key, cfg=cfg,
+                env_session_id=env_row["id"], request_key=app_key,
+                expected_instance_id=payload["instance_id"],
+                expected_head_sha=payload["head_sha"], cfg=cfg,
             )
         if app["state"] in {"crashed", "stopped"}:
             bundle = _preparation_failure_bundle(payload, primary, "environment_failed")

@@ -774,7 +774,10 @@ def _finish_app_session(aid: str, state: str, error: str | None, record: dict[st
         store.release_resource_lease(record["port_lease_key"])
 
 
-def request_app_start(*, env_session_id: str, request_key: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def request_app_start(
+    *, env_session_id: str, request_key: str, expected_instance_id: str,
+    expected_head_sha: str, cfg: dict[str, Any],
+) -> dict[str, Any]:
     """Idempotently request an app-up session on a materialized environment.
 
     A retry with the same ``request_key`` returns the existing row rather
@@ -782,6 +785,10 @@ def request_app_start(*, env_session_id: str, request_key: str, cfg: dict[str, A
     required to succeed here — an exhausted port range leaves the row
     queued (``state='starting'``, no pid) for the next ``tick`` to retry.
     """
+    if not isinstance(expected_instance_id, str) or not expected_instance_id:
+        raise EnvironmentError("app session requires an expected instance identity")
+    if not isinstance(expected_head_sha, str) or not expected_head_sha:
+        raise EnvironmentError("app session requires an expected candidate head identity")
     env_row = store.env_session_row(env_session_id)
     if env_row is None or env_row["state"] != "ready":
         raise EnvironmentError(f"env_session {env_session_id} is not ready")
@@ -790,7 +797,9 @@ def request_app_start(*, env_session_id: str, request_key: str, cfg: dict[str, A
     log_path.parent.mkdir(parents=True, exist_ok=True)
     row = store.insert_app_session(
         id, env_session_id=env_session_id, request_key=request_key,
-        workspace_path=env_row["workspace_path"], stdout_path=str(log_path), stderr_path=None,
+        workspace_path=env_row["workspace_path"],
+        expected_instance_id=expected_instance_id, expected_head_sha=expected_head_sha,
+        stdout_path=str(log_path), stderr_path=None,
     )
     if row["state"] == "starting" and not row.get("pid") and row["id"] not in _APP_RUNNING:
         _try_bind_and_spawn(row["id"], cfg)
@@ -802,6 +811,11 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
     """Attempt to lease a port and spawn the app child; ``False`` means queued."""
     row = store.app_session_row(aid)
     if row is None or row["state"] != "starting" or row.get("pid"):
+        return False
+    if not row.get("expected_instance_id") or not row.get("expected_head_sha"):
+        store.update_app_session_state(
+            aid, "crashed", last_error="app request has no durable candidate identity",
+        )
         return False
     env_row = store.env_session_row(row["env_session_id"])
     if env_row is None:
@@ -832,6 +846,11 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
     resolved = [str(scripts[app_config["start_argv"][0]]), *argv[1:]]
     env = dict(os.environ)
     env["PORT"] = str(port)
+    # These reserved values are durable request fields supplied only by the
+    # Factory parent. They are never inferred from the attacker-visible
+    # request key or inherited from ambient operator state.
+    env["SHIPFACTORY_INSTANCE_ID"] = str(row["expected_instance_id"])
+    env["SHIPFACTORY_HEAD_SHA"] = str(row["expected_head_sha"])
     enforcement_level = _apply_network_policy(env, manifest.document["bootstrap"]["network"])
     log_path = Path(row["stdout_path"])
     log_file = open(log_path, "wb")

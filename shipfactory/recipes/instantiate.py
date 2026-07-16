@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from shipfactory import store
-from .loader import Recipe, bind_parameters
+from .loader import Recipe, _canonical, bind_parameters
+
+
+class RecipePolicyError(RuntimeError):
+    """A persisted recipe policy cannot be trusted for its instance."""
 
 
 def task_key(instance_id: str, recipe_hash: str, step_id: str, activation: int) -> str:
@@ -115,12 +119,67 @@ def replace_unactivated(*, instance_id: str, recipe: Recipe, parameters: dict[st
     }
 
 
-def recipe_for_instance(instance: dict[str, Any]) -> Recipe:
-    row = None
-    with store._connect() as db:
-        row = db.execute("SELECT normalized_yaml,hash FROM recipe_versions WHERE id=? AND version=?", (instance["recipe_id"], instance["recipe_version"])).fetchone()
-    if row is None: raise RuntimeError("pinned recipe version missing")
-    return Recipe(json.loads(row["normalized_yaml"]), row["hash"])
+def recipe_for_instance(instance: dict[str, Any], db: Any | None = None) -> Recipe:
+    """Load and verify the immutable policy bound to an instance.
+
+    ``db`` lets callers validate against their current transaction snapshot;
+    callers outside a transaction get a short-lived read connection.
+    """
+    def load(connection: Any) -> Recipe:
+        row = connection.execute(
+            "SELECT normalized_yaml,hash FROM recipe_versions WHERE id=? AND version=?",
+            (instance["recipe_id"], instance["recipe_version"]),
+        ).fetchone()
+        if row is None:
+            raise RecipePolicyError("pinned recipe version missing")
+        normalized_yaml = row["normalized_yaml"]
+        try:
+            document = json.loads(normalized_yaml)
+        except Exception as exc:
+            raise RecipePolicyError(
+                f"pinned recipe policy bytes are malformed: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise RecipePolicyError("pinned recipe policy bytes are not a document")
+        canonical = _canonical(document).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()
+        version_hash = str(row["hash"] or "")
+        instance_hash = str(instance["recipe_hash"] or "")
+        if digest != version_hash:
+            raise RecipePolicyError(
+                "pinned recipe policy bytes hash mismatch: "
+                f"normalized_yaml sha256 {digest} != recipe_versions.hash {version_hash}"
+            )
+        if digest != instance_hash:
+            raise RecipePolicyError(
+                "pinned recipe policy bytes hash mismatch: "
+                f"normalized_yaml sha256 {digest} != recipe_instances.recipe_hash {instance_hash}"
+            )
+        if document.get("id") != instance["recipe_id"]:
+            raise RecipePolicyError(
+                "pinned recipe policy identity mismatch: "
+                f"document id {document.get('id')!r} != recipe_instances.recipe_id "
+                f"{instance['recipe_id']!r}"
+            )
+        try:
+            document_version = int(document.get("version"))
+            instance_version = int(instance["recipe_version"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RecipePolicyError(
+                "pinned recipe policy identity has an invalid version"
+            ) from exc
+        if document_version != instance_version:
+            raise RecipePolicyError(
+                "pinned recipe policy identity mismatch: "
+                f"document version {document_version} != recipe_instances.recipe_version "
+                f"{instance_version}"
+            )
+        return Recipe(document, digest)
+
+    if db is not None:
+        return load(db)
+    with store._connect() as connection:
+        return load(connection)
 
 
 def revision_vector(db: Any, instance_id: str, step: dict[str, Any], recipe: dict[str, Any]) -> str:
@@ -135,6 +194,54 @@ def revision_vector(db: Any, instance_id: str, step: dict[str, Any], recipe: dic
                 collect(parent)
 
     collect(step["step_id"])
+    if recipe.get("schema") == "shipfactory.recipe/v2":
+        # V2 gates bind authoritative bytes, not ordinal model-task revision
+        # counters.  Reopen every declared artifact/evidence input so a stale,
+        # replaced, or mismatched sealed object cannot retain the same gate
+        # revision.  Review activations are included because they carry no
+        # output artifact of their own but are still required approvals in the
+        # exact sequential chain.
+        from shipfactory.artifacts import input_artifacts
+
+        definition = definitions[step["step_id"]]
+        bound_inputs = input_artifacts(db, instance_id, definition)
+        artifact_values = sorted([
+            {
+                "id": str(item["id"]), "kind": str(item["kind"]),
+                "sha256": str(item["sha256"]), "base_sha": str(item["base_sha"]),
+                "head_sha": str(item.get("head_sha") or ""),
+                "tree_sha": str(item.get("repo_tree_sha") or ""),
+            }
+            for item in bound_inputs
+        ], key=lambda item: (item["kind"], item["id"]))
+        review_values = []
+        for review_id in sorted(
+            node for node in ancestors
+            if definitions[node]["primitive"] == "review_gate"
+        ):
+            row = db.execute(
+                "SELECT activation,state,kanban_task_id FROM recipe_steps "
+                "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
+                (instance_id, review_id),
+            ).fetchone()
+            if row is not None:
+                review_values.append({
+                    "step_id": review_id, "activation": int(row["activation"]),
+                    "state": str(row["state"]),
+                    "kanban_task_id": str(row["kanban_task_id"] or ""),
+                })
+        instance = db.execute(
+            "SELECT base_sha,recipe_hash FROM recipe_instances WHERE id=?",
+            (instance_id,),
+        ).fetchone()
+        payload = {
+            "schema": "shipfactory.revision-vector/v2",
+            "instance_id": instance_id, "step_id": step["step_id"],
+            "base_sha": str(instance["base_sha"] or "") if instance else "",
+            "artifacts": artifact_values, "reviews": review_values,
+        }
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode()).hexdigest()
     producers = sorted(
         step_id for step_id in ancestors
         if definitions[step_id]["primitive"] == "agent_task"

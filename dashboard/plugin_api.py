@@ -482,11 +482,28 @@ def get_instance(instance_id: str) -> dict[str, Any]:
             (instance_id,),
         ).fetchall()]
         story = None
-        story_row = db.execute(
-            "SELECT * FROM artifacts WHERE instance_id=? AND kind='review-story' "
-            "AND state='sealed' ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+        waiting_approval = db.execute(
+            "SELECT step_id FROM recipe_steps WHERE instance_id=? "
+            "AND primitive='approval_gate' AND state='waiting' "
+            "ORDER BY activation DESC LIMIT 1",
             (instance_id,),
         ).fetchone()
+        story_hash = None
+        if waiting_approval is not None:
+            try:
+                from shipfactory.decisions import current_binding
+                story_hash = current_binding(
+                    db, instance_id, waiting_approval["step_id"],
+                ).get("review_story_sha256")
+            except Exception:
+                # A stale or unverifiable approval binding must not fall back
+                # to an unrelated instance-wide "latest" story.
+                story_hash = None
+        story_row = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND kind='review-story' "
+            "AND state='sealed' AND sha256=?",
+            (instance_id, story_hash),
+        ).fetchone() if story_hash else None
         if story_row is not None:
             from shipfactory.artifacts import artifact_document, dashboard_safe_review_story
             story = dashboard_safe_review_story(artifact_document(dict(story_row)))
@@ -539,6 +556,21 @@ def waiting_gates() -> list[dict[str, Any]]:
             try:
                 from shipfactory.decisions import current_binding
                 gate.update(current_binding(db, instance_id, gate["step_id"]))
+                story_hash = gate.get("review_story_sha256")
+                gate["review_story"] = None
+                if story_hash:
+                    story_row = db.execute(
+                        "SELECT * FROM artifacts WHERE instance_id=? AND kind='review-story' "
+                        "AND state='sealed' AND sha256=?",
+                        (instance_id, story_hash),
+                    ).fetchone()
+                    if story_row is not None:
+                        from shipfactory.artifacts import (
+                            artifact_document, dashboard_safe_review_story,
+                        )
+                        gate["review_story"] = dashboard_safe_review_story(
+                            artifact_document(dict(story_row))
+                        )
             except Exception as exc:
                 gate["binding_error"] = str(exc)
         return gates
