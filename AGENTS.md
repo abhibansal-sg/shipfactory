@@ -204,6 +204,20 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   site, not merely name SOME real span; a `kind: symbol` reference's `id`
   must now appear, verbatim, as its own token in the cited text (finding
   #3, cross-lab review of the SF-7 adversarial lane).
+- Four SF-7 adversarial tests exercised their named attack only in name:
+  the backticked-command test never ran a worker (checking the rendered
+  task body alone proves nothing about what executes); the repository-
+  directive test typed the injection phrase into the test's own document
+  instead of a real committed file; the decoy-plan test wrote fake plan
+  JSON to a stray file the pipeline never reads instead of the actual
+  request/issue-body channel; the hidden-test-removal test asserted only
+  an exploration reference, never a plan. All four now construct the real
+  attack: a genuine spawned subprocess receiving the backticks only via
+  stdin, a real git-committed file cited with a normal hash-verified
+  reference, the decoy embedded in the `request` parameter that flows
+  into `${request}` substitution, and a real plan node targeting the
+  hidden file alongside the exploration deception (finding #4, cross-lab
+  review of the SF-7 adversarial lane).
 
 ## Conventions
 
