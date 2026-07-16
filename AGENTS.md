@@ -195,6 +195,15 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   pre-read `fstat` — a real, deterministic TOCTOU guard, not a hope that a
   racing writer never lands in the window (finding #2, cross-lab review of
   the SF-7 adversarial lane).
+- `_validate_exploration_repository` hash-verified an `existing` reference's
+  cited bytes but never checked a `kind: symbol` reference's claimed
+  identity against them — a byte-perfect hash of `login`'s real text could
+  be dishonestly labeled `revoke_all_sessions` (hallucinated) or `lοgin`
+  (Greek omicron homoglyph, byte-distinct from the real name) and would
+  seal. §2.2.5 requires a symbol claim to resolve to a definition or call
+  site, not merely name SOME real span; a `kind: symbol` reference's `id`
+  must now appear, verbatim, as its own token in the cited text (finding
+  #3, cross-lab review of the SF-7 adversarial lane).
 
 ## Conventions
 

@@ -612,6 +612,24 @@ def _validate_exploration_repository(document: dict[str, Any], workspace: Path) 
             raise ArtifactValidationError(
                 f"exploration reference {index} text_sha256 mismatch"
             )
+        if reference["kind"] == "symbol":
+            # A byte-perfect hash only proves the citation names SOME real
+            # span of text — it says nothing about which symbol that span
+            # actually defines or calls. Without this, a correct hash for
+            # `login` could be dishonestly labeled `revoke_all_sessions`
+            # (a hallucinated symbol) or `lοgin` (a Unicode homoglyph of the
+            # real name, byte-distinct from it) and would seal. §2.2.5
+            # requires a symbol claim to resolve to a definition or call
+            # site in what it cites; require the claimed name to appear,
+            # verbatim, as its own token in the cited text (finding #3).
+            claimed_symbol = reference["id"]
+            cited_text = cited.decode("utf-8", errors="replace")
+            if not re.search(r"\b" + re.escape(claimed_symbol) + r"\b", cited_text):
+                raise ArtifactValidationError(
+                    f"exploration reference {index} claims symbol {claimed_symbol!r} "
+                    "which does not resolve to a definition or call site in the "
+                    "cited text"
+                )
 
 
 def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:

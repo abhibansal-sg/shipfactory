@@ -120,10 +120,14 @@ def test_proposed_reference_to_nonexistent_path_is_legal(tmp_path):
 # 3. A hallucinated symbol is not backtick-quoted.
 # ---------------------------------------------------------------------------
 
-def test_hallucinated_symbol_citation_is_rejected_regardless_of_kind(tmp_path):
-    """A ``kind: symbol`` reference gets the same text-hash grounding as a
-    path reference — a fabricated symbol claim cannot bypass verification
-    by picking a different ``kind`` label."""
+def test_hallucinated_symbol_claim_with_a_correct_hash_is_rejected(tmp_path):
+    """The actual attack a fabricated text hash never exercises: cite
+    byte-perfect REAL text (the correct git_blob_sha and text_sha256 for
+    the real `login` function) while dishonestly claiming a completely
+    different, nonexistent symbol name. §2.2.5 requires a symbol claim to
+    resolve to a definition or call site in what it cites, not merely a
+    hash-verified span of SOME real bytes — a hash-only check would seal
+    this."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -134,13 +138,49 @@ def test_hallucinated_symbol_citation_is_rejected_regardless_of_kind(tmp_path):
     base_sha = _commit(repo, "auth module")
     tree_sha = _git(repo, "rev-parse", "HEAD^{tree}")
     blob_sha = _git(repo, "rev-parse", f"{base_sha}:auth.py")
+    real_text = b"def login(user):\n    return True\n"
     reference = {
-        "id": "ref-1", "kind": "symbol", "status": "existing",
+        # The claimed symbol name is hallucinated: "revoke_all_sessions"
+        # never appears anywhere in auth.py. Everything else about the
+        # citation is honest and byte-verified — real lines 1-2, real blob
+        # sha, real text hash of the actual `login` definition.
+        "id": "revoke_all_sessions", "kind": "symbol", "status": "existing",
         "path": "auth.py", "git_blob_sha": blob_sha,
-        # Real lines 1-2 are `login`; claim they define a hallucinated
-        # `revoke_all_sessions` symbol by citing a fabricated text hash.
         "start_line": 1, "end_line": 2,
-        "text_sha256": hashlib.sha256(b"def revoke_all_sessions(user):\n    ...\n").hexdigest(),
+        "text_sha256": hashlib.sha256(real_text).hexdigest(),
+    }
+    _candidate(
+        repo, ".shipfactory-output/exploration.json",
+        _exploration(base_sha, tree_sha, [reference]),
+    )
+    with pytest.raises(
+        ArtifactValidationError,
+        match="does not resolve to a definition or call site",
+    ):
+        seal_artifact(
+            instance_id="hallucinated-symbol", step_id="explore", activation=1, run_id=1,
+            output=_OUTPUT_EXPLORATION, workspace=repo, producer="run:1",
+        )
+
+
+def test_symbol_citation_with_a_wrong_hash_is_rejected_regardless_of_kind(tmp_path):
+    """A ``kind: symbol`` reference still gets the same text-hash grounding
+    as a ``kind: path`` reference — picking a different ``kind`` label does
+    not exempt a citation from hash verification."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "auth.py").write_text(
+        "def login(user):\n    return True\n", encoding="utf-8",
+    )
+    base_sha = _commit(repo, "auth module")
+    tree_sha = _git(repo, "rev-parse", "HEAD^{tree}")
+    blob_sha = _git(repo, "rev-parse", f"{base_sha}:auth.py")
+    reference = {
+        "id": "login", "kind": "symbol", "status": "existing",
+        "path": "auth.py", "git_blob_sha": blob_sha,
+        "start_line": 1, "end_line": 2,
+        "text_sha256": hashlib.sha256(b"totally fabricated text\n").hexdigest(),
     }
     _candidate(
         repo, ".shipfactory-output/exploration.json",
@@ -148,7 +188,7 @@ def test_hallucinated_symbol_citation_is_rejected_regardless_of_kind(tmp_path):
     )
     with pytest.raises(ArtifactValidationError, match="text_sha256 mismatch"):
         seal_artifact(
-            instance_id="hallucinated-symbol", step_id="explore", activation=1, run_id=1,
+            instance_id="symbol-wrong-hash", step_id="explore", activation=1, run_id=1,
             output=_OUTPUT_EXPLORATION, workspace=repo, producer="run:1",
         )
 
@@ -179,6 +219,45 @@ def test_unicode_homoglyph_path_does_not_resolve_to_the_real_file(tmp_path):
     with pytest.raises(ArtifactValidationError, match="absent at base_sha"):
         seal_artifact(
             instance_id="homoglyph", step_id="explore", activation=1, run_id=1,
+            output=_OUTPUT_EXPLORATION, workspace=repo, producer="run:1",
+        )
+
+
+def test_unicode_homoglyph_symbol_claim_is_rejected(tmp_path):
+    """The bullet's actual construction: a SYMBOL claim using a Unicode
+    homoglyph of the real name (Greek omicron for Latin 'o'), not a path
+    homoglyph. The citation is byte-perfect real text — correct blob sha,
+    correct text_sha256 for the real `login` function — but the claimed
+    symbol name is the lookalike, not the real identifier, so it must not
+    resolve as if it named the real symbol."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "auth.py").write_text(
+        "def login(user):\n    return True\n", encoding="utf-8",
+    )
+    base_sha = _commit(repo, "auth module")
+    tree_sha = _git(repo, "rev-parse", "HEAD^{tree}")
+    blob_sha = _git(repo, "rev-parse", f"{base_sha}:auth.py")
+    real_text = b"def login(user):\n    return True\n"
+    # Greek small letter omicron (U+03BF) replacing the Latin 'o' in "login".
+    homoglyph_symbol = "lοgin"
+    reference = {
+        "id": homoglyph_symbol, "kind": "symbol", "status": "existing",
+        "path": "auth.py", "git_blob_sha": blob_sha,
+        "start_line": 1, "end_line": 2,
+        "text_sha256": hashlib.sha256(real_text).hexdigest(),
+    }
+    _candidate(
+        repo, ".shipfactory-output/exploration.json",
+        _exploration(base_sha, tree_sha, [reference]),
+    )
+    with pytest.raises(
+        ArtifactValidationError,
+        match="does not resolve to a definition or call site",
+    ):
+        seal_artifact(
+            instance_id="homoglyph-symbol", step_id="explore", activation=1, run_id=1,
             output=_OUTPUT_EXPLORATION, workspace=repo, producer="run:1",
         )
 
