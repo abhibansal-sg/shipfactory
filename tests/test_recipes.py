@@ -327,6 +327,48 @@ def test_loader_rejects_legacy_schema_in_current_source(
         load_library(library_path)
 
 
+def _activate_output_task(kanban_conn, output):
+    from hermes_cli import kanban_db
+    from shipfactory.recipes.primitives import activate
+
+    instance = {"id": "output-contract", "recipe_hash": "a" * 64, "board": "test"}
+    definition = {
+        "id": "produce", "primitive": "agent_task", "title": "Produce",
+        "needs": [], "optional": False, "inputs": [], "outputs": [output],
+        "params": {
+            "seat": "builder", "instructions": "Produce the declared output.",
+            "execution_profile": "standard", "workspace": "worktree",
+            "access_mode": "workspace_write", "environment": "source",
+        },
+    }
+    task_id = activate(
+        kanban_conn, instance, {"schema": "shipfactory.recipe/v2"}, definition,
+        {"step_id": "produce", "activation": 1}, {}, [],
+    )
+    return kanban_db.get_task(kanban_conn, task_id)
+
+
+def test_worker_authored_v2_output_contract_names_exact_path_and_schema(kanban_conn):
+    task = _activate_output_task(kanban_conn, {
+        "kind": "exploration", "schema": "shipfactory.exploration/v1",
+        "path": ".shipfactory-output/exploration.json",
+    })
+    assert "Factory output contract" in task.body
+    assert ".shipfactory-output/exploration.json" in task.body
+    assert "shipfactory.exploration/v1" in task.body
+    assert "Write the artifact" in task.body
+
+
+def test_factory_generated_change_set_contract_says_worker_must_not_write(kanban_conn):
+    task = _activate_output_task(kanban_conn, {
+        "kind": "change-set", "schema": "shipfactory.change-set/v1",
+        "path": ".shipfactory-output/change-set.json",
+    })
+    assert "Factory generates this artifact after your successful exit" in task.body
+    assert "Do not write" in task.body
+    assert ".shipfactory-output/change-set.json" in task.body
+
+
 def test_restart_reconciliation_activates_review_once_after_swallowed_hook(tmp_path, kanban_conn):
     """§17.7: reconciliation reproduces the missing transition after restart."""
     from hermes_cli import kanban_db

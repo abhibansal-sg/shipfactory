@@ -413,12 +413,18 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   `RecipeError`. The original normalized bytes and hash remain authoritative;
   every other difference still fails immutable (finding #60,
   dev-pipeline@6 live publication cutover).
+- A v2 worker cannot produce a declared artifact if its task prompt omits the
+  exact output path and schema. Factory appends an explicit output contract to
+  every v2 agent/review task with outputs, states that chat prose is not an
+  artifact, and separately tells build workers that `change-set` is
+  Factory-generated and must not be written by the model (finding #61,
+  dev-pipeline@6 live shakedown).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#60 so far). When you fix one: commit message
+- Findings get numbers (#22–#61 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
