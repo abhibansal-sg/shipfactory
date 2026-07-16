@@ -279,7 +279,12 @@ def _recipe(args: argparse.Namespace) -> Any:
     if command == "event":
         return _emit({"key": advancer.event(args.instance, args.step, json.loads(args.payload))})
     if command in {"approve", "reject"}:
-        return _emit(_recipe_gate(None, args.instance, args.step, command, getattr(args, "reason", "")))
+        return _emit(_recipe_gate(
+            None, args.instance, args.step, command, getattr(args, "reason", ""),
+            activation=args.activation, revision_hash=args.revision_hash,
+            evidence_bundle_hash=args.evidence_bundle_hash, nonce=args.nonce,
+            actor_kind=args.actor_kind, actor_id=args.actor_id, channel=args.channel,
+        ))
     if command == "release":
         return _emit(_recipe_release(None, args.instance, args.step, args.reason))
     conn = kanban_db.connect(board=getattr(args, "board", None))
@@ -292,19 +297,32 @@ def _recipe(args: argparse.Namespace) -> Any:
         conn.close()
 
 
-def _recipe_gate(conn: Any, instance_id: str, step_id: str, decision: str, reason: str) -> dict[str, Any]:
+def _recipe_gate(
+    conn: Any, instance_id: str, step_id: str, decision: str, reason: str, *,
+    activation: int | None = None, revision_hash: str | None = None,
+    evidence_bundle_hash: str | None = None, nonce: str | None = None,
+    actor_kind: str = "operator", actor_id: str = "local-operator",
+    channel: str = "cli",
+) -> dict[str, Any]:
     from shipfactory import store
     from shipfactory.recipes import advancer
     with store._connect() as db:
         instance = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
         step = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance_id, step_id)).fetchone()
         if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting": raise ValueError("approval gate is not waiting")
-    key = advancer.gate_decision(instance_id, step_id, decision, reason)
+    key = advancer.gate_decision(
+        instance_id, step_id, decision, reason, activation=activation,
+        revision_hash=revision_hash, evidence_bundle_hash=evidence_bundle_hash,
+        nonce=nonce, actor_kind=actor_kind, actor_id=actor_id, channel=channel,
+    )
     with store._connect() as db:
         updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
+        recorded = db.execute(
+            "SELECT id FROM gate_decisions WHERE advance_event_key=?", (key,),
+        ).fetchone()
     return {
         "instance_id": instance_id,
-        "decision_id": key,
+        "decision_id": recorded["id"] if recorded else key,
         "key": key,
         "status": updated["status"] if updated else "unknown",
     }
@@ -394,7 +412,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     q = subs.add_parser("show"); q.add_argument("instance")
     subs.add_parser("waiting"); subs.add_parser("list")
     for name in ("approve", "reject"):
-        q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--board")
+        q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--activation", type=int, required=True); q.add_argument("--revision-hash", required=True); q.add_argument("--evidence-bundle-hash", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-kind", default="operator"); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli"); q.add_argument("--board")
     q = subs.add_parser("release"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", required=True); q.add_argument("--board")
     q = subs.add_parser("event"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("payload"); q.add_argument("--board")
     q = subs.add_parser("cancel"); q.add_argument("instance"); q.add_argument("--dry-run", action="store_true"); q.add_argument("--board")

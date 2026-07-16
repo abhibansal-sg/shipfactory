@@ -54,8 +54,8 @@ def _seed() -> None:
             ("4d3d10d6", "build", 1, "agent_task", "ready", now, now),
         )
         db.execute(
-            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,kanban_task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            ("4d3d10d6", "approve", 1, "approval_gate", "waiting", "gate-task", now, now),
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,kanban_task_id,input_revision_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("4d3d10d6", "approve", 1, "approval_gate", "waiting", "gate-task", "a" * 64, now, now),
         )
         db.execute(
             "INSERT INTO decisions(task_id,stage_id,stage_type,seat,outcome,body,at) VALUES(?,?,?,?,?,?,?)",
@@ -95,7 +95,14 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     assert client.get("/api/plugins/shipfactory/seats").json()[0]["name"] == "builder"
     assert client.get("/api/plugins/shipfactory/costs").json()[0]["tokens_total"] == 321
 
-    approved = client.post("/api/plugins/shipfactory/approve", json={"instance": "4d3d10d6", "step": "approve"})
+    tuple_fields = {
+        "activation": 1, "revision_hash": "a" * 64,
+        "evidence_bundle_hash": None, "nonce": "dashboard-nonce",
+        "actor_kind": "operator", "actor_id": "test-operator", "channel": "dashboard",
+    }
+    approved = client.post("/api/plugins/shipfactory/approve", json={
+        "instance": "4d3d10d6", "step": "approve", **tuple_fields,
+    })
     assert approved.status_code == 200 and approved.json()["key"]
     with store._connect() as db:
         event = db.execute("SELECT source,payload_json,state FROM advance_events").fetchone()
@@ -104,8 +111,8 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     assert tuple(event)[2] == "pending"
 
     # A ready build is not a human gate: both action endpoints fail cleanly.
-    assert client.post("/api/plugins/shipfactory/approve", json={"instance": "4d3d10d6", "step": "build"}).status_code == 400
-    assert client.post("/api/plugins/shipfactory/reject", json={"instance": "4d3d10d6", "step": "build", "reason": "no"}).status_code == 400
+    assert client.post("/api/plugins/shipfactory/approve", json={"instance": "4d3d10d6", "step": "build", **tuple_fields, "nonce": "build-a"}).status_code == 409
+    assert client.post("/api/plugins/shipfactory/reject", json={"instance": "4d3d10d6", "step": "build", "reason": "no", **tuple_fields, "nonce": "build-r"}).status_code == 409
 
 
 def test_seat_endpoints_create_update_and_reject_missing_profile(hermetic_hermes_home: Path):

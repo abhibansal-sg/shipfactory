@@ -1406,23 +1406,35 @@ def event(instance_id: str, step_id: str, payload: dict[str, Any]) -> str:
         expected_state=step["state"] if step else None,
     )
 
-def gate_decision(instance_id: str, step_id: str, decision: str, reason: str = "") -> str:
-    """Queue a human gate decision for the recipe engine's single writer."""
-    if decision not in {"approve", "reject"}:
-        raise ValueError("gate decision must be approve or reject")
-    with store._connect() as db:
-        step = db.execute(
-            "SELECT activation,state,primitive FROM recipe_steps WHERE instance_id=? AND step_id=? "
-            "ORDER BY activation DESC LIMIT 1", (instance_id, step_id),
-        ).fetchone()
-    if not step or step["primitive"] != "approval_gate" or step["state"] != "waiting":
-        raise ValueError("approval gate is not waiting")
-    return enqueue(
-        instance_id,
-        "gate_decision",
-        {"step_id": step_id, "decision": decision, "reason": reason},
-        expected_activation=int(step["activation"]), expected_state=step["state"],
+def gate_decision(
+    instance_id: str, step_id: str, decision: str, reason: str = "", *,
+    activation: int | None = None, revision_hash: str | None = None,
+    evidence_bundle_hash: str | None = None, nonce: str | None = None,
+    actor_kind: str = "operator", actor_id: str = "local-operator",
+    channel: str = "internal",
+) -> str:
+    """Persist and queue a human gate decision without applying it.
+
+    Dashboard, CLI, and phone callers supply the complete tuple.  The fallback
+    capture exists for trusted in-process compatibility callers; it still
+    records the resolved tuple in ``gate_decisions`` before enqueuing.
+    """
+    from shipfactory.decisions import current_binding, record_decision
+
+    if activation is None or revision_hash is None or nonce is None:
+        with store._connect() as db:
+            binding = current_binding(db, instance_id, step_id)
+        activation = binding["activation"]
+        revision_hash = binding["revision_hash"]
+        evidence_bundle_hash = binding["evidence_bundle_hash"]
+        nonce = nonce or uuid.uuid4().hex
+    row = record_decision(
+        instance_id=instance_id, step_id=step_id, activation=int(activation),
+        revision_hash=revision_hash, evidence_bundle_hash=evidence_bundle_hash,
+        nonce=nonce, decision=decision, actor_kind=actor_kind, actor_id=actor_id,
+        channel=channel, reason=reason,
     )
+    return str(row["advance_event_key"])
 
 def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
     """Queue an audited release for a recoverable blocked review gate.
@@ -1518,6 +1530,62 @@ def _matching_step(db: Any, instance_id: str, payload: dict[str, Any],
     return step
 
 
+def _consume_gate_decision(db: Any, decision_id: str, *, stale_reason: str | None = None) -> None:
+    """Mark the persisted statement consumed, retaining any stale explanation."""
+    if stale_reason:
+        row = db.execute(
+            "SELECT reason FROM gate_decisions WHERE id=?", (decision_id,),
+        ).fetchone()
+        prior = str(row["reason"] or "") if row else ""
+        reason = f"stale: {stale_reason}" + (f"; operator reason: {prior}" if prior else "")
+        db.execute(
+            "UPDATE gate_decisions SET consumed_at=?,reason=? WHERE id=? AND consumed_at IS NULL",
+            (store._now(), reason[:2000], decision_id),
+        )
+    else:
+        db.execute(
+            "UPDATE gate_decisions SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+            (store._now(), decision_id),
+        )
+
+
+def _bound_gate_step(db: Any, instance_id: str, payload: dict[str, Any],
+                     row: dict[str, Any]) -> tuple[Any | None, str | None]:
+    """Revalidate the durable decision against current activation/evidence."""
+    decision_id = payload.get("decision_id")
+    if not isinstance(decision_id, str):
+        return None, "persisted gate decision is missing"
+    decision = db.execute(
+        "SELECT * FROM gate_decisions WHERE id=? AND advance_event_key=?",
+        (decision_id, row["key"]),
+    ).fetchone()
+    if decision is None:
+        return None, "persisted gate decision is missing"
+    step = db.execute(
+        "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+        "ORDER BY activation DESC LIMIT 1",
+        (instance_id, decision["step_id"]),
+    ).fetchone()
+    if step is None or step["primitive"] != "approval_gate" or step["state"] != "waiting":
+        return None, "approval gate is no longer waiting"
+    if int(step["activation"]) != int(decision["activation"]):
+        return None, "activation changed"
+    if step["input_revision_hash"] != decision["revision_hash"]:
+        return None, "revision hash changed"
+    try:
+        from shipfactory.decisions import current_binding
+        binding = current_binding(db, instance_id, decision["step_id"])
+    except Exception as exc:
+        return None, f"current binding cannot be verified: {exc}"
+    if (binding.get("evidence_bundle_hash") or None) != (
+        decision["evidence_bundle_hash"] or None
+    ):
+        return None, "evidence bundle hash changed"
+    if payload.get("decision") != decision["decision"]:
+        return None, "event decision differs from persisted decision"
+    return step, None
+
+
 def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
     """Consume one leased event, producing intents but no external commands."""
     try:
@@ -1539,10 +1607,19 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
             if instance["status"] in {"cancelling", "cancelled"}:
                 _finish_event(db, row, "discarded", f"instance_{instance['status']}")
                 return
-            step = _matching_step(db, instance["id"], payload, row)
-            if step is None:
-                _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
-                return
+            if row["source"] == "gate_decision":
+                step, stale_reason = _bound_gate_step(db, instance["id"], payload, row)
+                if stale_reason is not None:
+                    decision_id = payload.get("decision_id")
+                    if isinstance(decision_id, str):
+                        _consume_gate_decision(db, decision_id, stale_reason=stale_reason)
+                    _finish_event(db, row, "discarded", f"stale_gate_decision:{stale_reason}")
+                    return
+            else:
+                step = _matching_step(db, instance["id"], payload, row)
+                if step is None:
+                    _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
+                    return
             if row["source"] == "external_event":
                 defs = {item["id"]: item for item in recipe_for_instance(instance).document["steps"]}
                 definition = defs.get(payload.get("step_id"))
@@ -1559,9 +1636,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _consume_resume_note(conn, step["kanban_task_id"])
                 return
             if row["source"] == "gate_decision":
-                if step["primitive"] != "approval_gate" or step["state"] != "waiting":
-                    _finish_event(db, row, "discarded", "approval_gate_not_waiting")
-                    return
+                decision_id = str(payload["decision_id"])
                 if payload.get("decision") == "approve":
                     logical_key = hashlib.sha256(
                         f"{row['key']}|approval_gate_completion".encode()
@@ -1573,6 +1648,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         instance_id=instance["id"], step_id=step["step_id"],
                         activation=int(step["activation"]),
                     )
+                    _consume_gate_decision(db, decision_id)
                     _finish_event(db, row, "applied", f"action_intent:{action_key}")
                     return
                 if payload.get("decision") == "reject":
@@ -1582,6 +1658,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         "UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?",
                         (reason, store._now(), instance["id"]),
                     )
+                    _consume_gate_decision(db, decision_id)
                     _finish_event(db, row, "applied", "gate_rejected")
                     return
                 _finish_event(db, row, "discarded", "unknown_gate_decision")

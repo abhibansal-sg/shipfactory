@@ -60,6 +60,31 @@ def _shipfactory_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "shipfactory"
 
 
+def _worker_environment(root: Path, *, board: str | None, task_id: str) -> dict[str, str]:
+    """Construct a worker environment that cannot disclose Factory key paths.
+
+    The real Hermes home is replaced with an empty workspace-local worker home,
+    and any ambient variable that looks like signing-key material is removed.
+    Key bytes are never placed in process arguments, prompts, or environment.
+    """
+    # Readonly recipe workspaces leave this Factory output subtree writable.
+    worker_home = root / ".shipfactory-output" / ".worker-home"
+    worker_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    excluded_fragments = ("SIGNING_KEY", "HMAC_KEY", "DECISION_KEY")
+    env = {
+        key: value for key, value in os.environ.items()
+        if key != "HERMES_HOME" and not any(fragment in key.upper() for fragment in excluded_fragments)
+    }
+    env.update({
+        "HERMES_HOME": str(worker_home),
+        "HERMES_KANBAN_TASK": str(task_id),
+        "HERMES_KANBAN_WORKSPACE": str(root),
+        "HERMES_KANBAN_BOARD": str(board or ""),
+        "TERMINAL_CWD": str(root),
+    })
+    return env
+
+
 def _worker_prompt(context: str) -> str:
     """Attach the Factory terminal-result protocol to worker context."""
     return (
@@ -469,13 +494,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
                 command = shlex.split(override)
                 if not command:
                     raise ValueError(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()} is empty")
-            env = dict(os.environ)
-            env.update({
-                "HERMES_KANBAN_TASK": str(task_id),
-                "HERMES_KANBAN_WORKSPACE": str(root),
-                "HERMES_KANBAN_BOARD": str(board or ""),
-                "TERMINAL_CWD": str(root),
-            })
+            env = _worker_environment(root, board=board, task_id=str(task_id))
             log_file = log_path.open("wb")
             prompt_file = prompt_path.open("rb")
             try:
