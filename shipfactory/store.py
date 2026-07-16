@@ -257,6 +257,60 @@ _RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS = (
 _RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT = (
     ";\n".join(_RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS) + ";\n"
 )
+_VERIFICATION_MIGRATION_STATEMENTS = (
+    """CREATE TABLE evidence_bundles (
+    id                    TEXT PRIMARY KEY,
+    instance_id           TEXT NOT NULL,
+    step_id               TEXT NOT NULL,
+    activation            INTEGER NOT NULL,
+    input_revision_hash   TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    head_sha              TEXT NOT NULL,
+    tree_sha              TEXT NOT NULL,
+    environment_session_id TEXT,
+    manifest_relpath      TEXT NOT NULL,
+    manifest_blob_sha     TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    bundle_sha256         TEXT,
+    redaction_state       TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    sealed_at             TEXT,
+    invalid_reason        TEXT,
+    UNIQUE(instance_id, step_id, activation)
+)""",
+    """CREATE TABLE evidence_items (
+    id               TEXT PRIMARY KEY,
+    bundle_id        TEXT NOT NULL,
+    case_id          TEXT,
+    kind             TEXT NOT NULL,
+    path             TEXT NOT NULL,
+    sha256           TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    mime_type        TEXT,
+    producer         TEXT NOT NULL,
+    command_json     TEXT,
+    cwd_relpath      TEXT,
+    env_digest       TEXT,
+    exit_code        INTEGER,
+    started_at       TEXT,
+    ended_at         TEXT,
+    metadata_json    TEXT NOT NULL
+)""",
+    """CREATE TABLE verification_cases (
+    bundle_id                TEXT NOT NULL,
+    case_id                  TEXT NOT NULL,
+    attempt                  INTEGER NOT NULL,
+    requirement_ids_json     TEXT NOT NULL,
+    oracle_type              TEXT NOT NULL,
+    oracle_json              TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    evidence_item_ids_json   TEXT NOT NULL,
+    started_at               TEXT NOT NULL,
+    ended_at                 TEXT,
+    PRIMARY KEY(bundle_id, case_id, attempt)
+)""",
+)
+_VERIFICATION_MIGRATION_TEXT = ";\n".join(_VERIFICATION_MIGRATION_STATEMENTS) + ";\n"
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -267,6 +321,7 @@ _MIGRATIONS = (
     (7, "sf8_environment_sessions", _ENVIRONMENT_SESSION_MIGRATION_TEXT),
     (8, "sf8_environment_enforcement_and_caps", _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT),
     (9, "sf7_run_access_enforcement_level", _RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT),
+    (10, "sf9_verification_evidence", _VERIFICATION_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -278,6 +333,7 @@ _MIGRATION_STATEMENTS = {
     7: _ENVIRONMENT_SESSION_MIGRATION_STATEMENTS,
     8: _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS,
     9: _RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS,
+    10: _VERIFICATION_MIGRATION_STATEMENTS,
 }
 
 
@@ -461,11 +517,16 @@ def init_db() -> None:
                         {"network_enforcement_level", "output_cap_exceeded"}
                         & (env_columns | app_columns)
                     )
-                else:
+                elif version == 9:
                     run_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(runs)"
                     )}
                     migration_artifacts = "access_enforcement_level" in run_columns
+                else:
+                    migration_artifacts = bool(
+                        {"evidence_bundles", "evidence_items", "verification_cases"}
+                        & existing_tables
+                    )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:
@@ -520,8 +581,19 @@ def nonterminal_runs() -> list[dict[str, Any]]:
     init_db()
     with _connect() as conn:
         return _rows(conn.execute(
-            "SELECT * FROM runs WHERE ended_at IS NULL AND task_id<>? ORDER BY id",
+            "SELECT * FROM runs WHERE ended_at IS NULL AND task_id<>? "
+            "AND executor NOT IN ('verification','verification-runner') ORDER BY id",
             (DAEMON_RUN_TASK_ID,),
+        ))
+
+
+def nonterminal_verification_runs() -> list[dict[str, Any]]:
+    """Return verification children requiring restart-time identity fencing."""
+    init_db()
+    with _connect() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM runs WHERE ended_at IS NULL "
+            "AND executor IN ('verification','verification-runner') ORDER BY id"
         ))
 
 
@@ -1244,4 +1316,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "run_row", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]

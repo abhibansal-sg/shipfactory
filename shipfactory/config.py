@@ -37,6 +37,12 @@ ENVIRONMENT_RUNTIME_DEFAULTS = {
     "healthcheck_timeout_seconds": 2,
     "healthcheck_probe_concurrency": 8,
 }
+VERIFICATION_PROFILE_FIELDS = frozenset({
+    "max_runtime_seconds", "infrastructure_retries", "max_evidence_bytes",
+    "max_log_bytes", "capture_video", "capture_trace", "capture_har",
+    "browser_slots",
+})
+VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env"})
 
 
 class FactoryConfigError(ValueError):
@@ -201,6 +207,43 @@ def validate(cfg) -> None:
         for name, profile in profiles.items():
             if not isinstance(profile, dict) or set(profile) != {"max_runtime_seconds", "max_retries", "token_allowance"} or any(not isinstance(profile[x], int) or profile[x] < 1 for x in profile):
                 raise FactoryConfigError(f"invalid execution profile {name!r}")
+        verification_profiles = recipes.get("verification_profiles", {})
+        if not isinstance(verification_profiles, dict):
+            raise FactoryConfigError("recipes.verification_profiles must be a mapping")
+        for name, profile in verification_profiles.items():
+            if not isinstance(name, str) or not name or not isinstance(profile, dict):
+                raise FactoryConfigError(f"invalid verification profile {name!r}")
+            if (not VERIFICATION_PROFILE_FIELDS.issubset(profile)
+                    or set(profile) - VERIFICATION_PROFILE_FIELDS
+                    - VERIFICATION_PROFILE_OPTIONAL_FIELDS):
+                raise FactoryConfigError(f"invalid verification profile {name!r}")
+            for field in (
+                "max_runtime_seconds", "max_evidence_bytes", "max_log_bytes",
+                "browser_slots",
+            ):
+                if (not isinstance(profile[field], int) or isinstance(profile[field], bool)
+                        or profile[field] < 1):
+                    raise FactoryConfigError(f"invalid verification profile {name!r}")
+            if (not isinstance(profile["infrastructure_retries"], int)
+                    or isinstance(profile["infrastructure_retries"], bool)
+                    or profile["infrastructure_retries"] not in (0, 1)):
+                raise FactoryConfigError(
+                    f"verification profile {name!r} infrastructure_retries must be 0 or 1"
+                )
+            if any(not isinstance(profile[field], bool) for field in (
+                "capture_video", "capture_trace", "capture_har",
+            )):
+                raise FactoryConfigError(f"invalid verification profile {name!r}")
+            declared_env = profile.get("env", {})
+            if (not isinstance(declared_env, dict)
+                    or not all(isinstance(key, str) and key and "=" not in key
+                               and "\x00" not in key and key != "HOME"
+                               and not key.startswith("SHIPFACTORY_")
+                               and isinstance(value, str) and "\x00" not in value
+                               for key, value in declared_env.items())):
+                raise FactoryConfigError(
+                    f"verification profile {name!r} env must map names to strings"
+                )
         selector = recipes.get("selector", {}) or {}
         if not isinstance(selector, dict) or set(selector) - set(SELECTOR_DEFAULTS):
             raise FactoryConfigError("recipes.selector has unknown keys")
@@ -265,6 +308,11 @@ def selector_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
     return {**SELECTOR_DEFAULTS, **configured}
 
 
+def verification_profiles_config(recipes: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Return operator-validated deterministic verification profiles."""
+    return dict(((recipes or {}).get("verification_profiles", {}) or {}))
+
+
 def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, int]:
     """Return validated operator-owned daemon limits with stable defaults."""
     configured = recipes or {}
@@ -278,5 +326,5 @@ __all__ = [
     "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS",
     "ENVIRONMENT_RUNTIME_DEFAULTS", "Seat",
     "load_seats", "recipe_runtime_config", "environment_runtime_config",
-    "selector_config", "validate",
+    "selector_config", "verification_profiles_config", "validate",
 ]
