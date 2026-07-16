@@ -295,11 +295,12 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
 - Migration coverage cannot be inferred from the word `rollback` in a case id or
   argv. The protected manifest must declare separate `migration_down` and
   `migration_up` command behaviors, both requiring exit code zero, using the
-  same non-trivial migration tool, and each direction must be the tool's primary
-  subcommand (`argv[1]`, or `argv[2]` for `python <script>`). Scanning every
-  argument still admits inert labels such as `--reason=rollback-please` and is
-  not a behavioral boundary. Candidate-only declarations never satisfy the
-  floor (finding #44, verification rereview).
+  same non-trivial migration tool, and each direction must be a bare positional
+  primary subcommand (`argv[1]`, or `argv[2]` for an exactly named Python
+  executable running `<script>`). Option flags such as `--rollback`, scanning
+  every argument for `--reason=rollback-please`, and broad `python*` executable
+  matching are not behavioral boundaries. Candidate-only declarations never
+  satisfy the floor (finding #44, verification rereview).
 - Review-input binding has both focused blocker tests and a public-path v2
   `reconcile()` regression. The latter completes a real review task with an
   approve verdict and proves an unbound task blocks the step and instance with

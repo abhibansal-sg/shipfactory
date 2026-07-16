@@ -1854,6 +1854,58 @@ def test_migration_behavior_rejects_direction_word_only_inside_an_inert_flag():
         verify.validate_verification_manifest(document)
 
 
+def test_migration_behavior_rejects_option_flag_as_primary_subcommand():
+    document = {
+        "schema": verify.VERIFICATION_SCHEMA,
+        "cases": [
+            {
+                "id": "migration-down", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_down",
+                "argv": ["do_stuff.sh", "--rollback"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+            {
+                "id": "migration-up", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_up",
+                "argv": ["do_stuff.sh", "--upgrade"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+        ],
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
+    }
+
+    with pytest.raises(
+        verify.VerificationManifestError, match="bare primary migration subcommand",
+    ):
+        verify.validate_verification_manifest(document)
+
+
+def test_python_prefix_tool_is_not_misclassified_as_a_python_interpreter():
+    document = {
+        "schema": verify.VERIFICATION_SCHEMA,
+        "cases": [
+            {
+                "id": "migration-down", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_down",
+                "argv": ["pythonic-migrate", "decoy", "rollback"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+            {
+                "id": "migration-up", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_up",
+                "argv": ["pythonic-migrate", "decoy", "upgrade"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+        ],
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
+    }
+
+    with pytest.raises(
+        verify.VerificationManifestError, match="primary migration subcommand",
+    ):
+        verify.validate_verification_manifest(document)
+
+
 def test_migration_surface_executes_protected_down_and_up_behavior_pair(tmp_path):
     document = {
         "schema": verify.VERIFICATION_SCHEMA,

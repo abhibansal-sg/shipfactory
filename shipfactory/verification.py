@@ -41,6 +41,7 @@ _COMMAND_CASE_WITH_BEHAVIOR = _COMMAND_CASE | {"surface_behavior"}
 _PLAYWRIGHT_CASE = {"id", "requirement_ids", "driver", "script", "assertions"}
 _CASE_ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _HASH = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_PYTHON_EXECUTABLE = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 _BLOB_MODES = {"100644", "100755"}
 _MIGRATION_BEHAVIOR_TOKENS = {
     "migration_down": {"down", "downgrade", "rollback", "revert"},
@@ -172,7 +173,7 @@ def _migration_tool_identity(argv: list[str]) -> tuple[str, ...]:
     executable = PurePosixPath(argv[0]).name.casefold()
     if executable in _TRIVIAL_COMMANDS:
         raise VerificationManifestError("migration behavior cannot use a no-op command")
-    if executable.startswith("python"):
+    if _PYTHON_EXECUTABLE.fullmatch(executable):
         if len(argv) < 3 or argv[1] in {"-c", "-m"}:
             raise VerificationManifestError(
                 "migration behavior must invoke a concrete migration tool"
@@ -183,12 +184,17 @@ def _migration_tool_identity(argv: list[str]) -> tuple[str, ...]:
 
 def _migration_primary_subcommand(argv: list[str]) -> str:
     executable = PurePosixPath(argv[0]).name.casefold()
-    index = 2 if executable.startswith("python") else 1
+    index = 2 if _PYTHON_EXECUTABLE.fullmatch(executable) else 1
     if len(argv) <= index:
         raise VerificationManifestError(
             "migration behavior requires a primary migration subcommand"
         )
-    return argv[index].casefold().lstrip("-")
+    subcommand = argv[index]
+    if subcommand.startswith("-"):
+        raise VerificationManifestError(
+            "migration behavior requires a bare primary migration subcommand"
+        )
+    return subcommand.casefold()
 
 
 def validate_verification_manifest(
