@@ -32,6 +32,32 @@ router = APIRouter()
 class GateDecision(BaseModel):
     instance: str = Field(min_length=1)
     step: str = Field(min_length=1)
+    activation: int = Field(ge=1)
+    revision_hash: str = Field(min_length=1)
+    evidence_bundle_hash: str | None
+    nonce: str = Field(min_length=1)
+    actor_kind: str = Field(min_length=1)
+    actor_id: str = Field(min_length=1)
+    channel: str = Field(min_length=1)
+    reason: str = ""
+
+
+class PhoneTokenRequest(BaseModel):
+    instance: str = Field(min_length=1)
+    step: str = Field(min_length=1)
+    activation: int = Field(ge=1)
+    revision_hash: str = Field(min_length=1)
+    evidence_bundle_hash: str | None
+    decision: str = Field(pattern="^(approve|reject)$")
+    nonce: str | None = None
+    ttl_seconds: int = Field(default=600, ge=1, le=600)
+
+
+class PhoneTokenDecision(BaseModel):
+    token: str = Field(min_length=1)
+    actor_kind: str = Field(min_length=1)
+    actor_id: str = Field(min_length=1)
+    channel: str = Field(default="telegram", min_length=1)
     reason: str = ""
 
 
@@ -451,11 +477,26 @@ def get_instance(instance_id: str) -> dict[str, Any]:
         if task_ids:
             placeholders = ",".join("?" for _ in task_ids)
             decisions = [dict(item) for item in db.execute(f"SELECT * FROM decisions WHERE task_id IN ({placeholders}) ORDER BY at DESC,id DESC", task_ids).fetchall()]
+        bound_decisions = [dict(item) for item in db.execute(
+            "SELECT * FROM gate_decisions WHERE instance_id=? ORDER BY created_at DESC,id DESC",
+            (instance_id,),
+        ).fetchall()]
+        story = None
+        story_row = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND kind='review-story' "
+            "AND state='sealed' ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+            (instance_id,),
+        ).fetchone()
+        if story_row is not None:
+            from shipfactory.artifacts import artifact_document, dashboard_safe_review_story
+            story = dashboard_safe_review_story(artifact_document(dict(story_row)))
         instance.update({
             "steps": steps,
             "activations": dict(activations),
             "blocked_reasons": [{"step": step["step_id"], "activation": step["activation"], "reason": step["blocked_reason"]} for step in steps if step["blocked_reason"]],
             "decisions": decisions,
+            "gate_decisions": bound_decisions,
+            "review_story": story,
         })
         return instance
 
@@ -495,6 +536,11 @@ def waiting_gates() -> list[dict[str, Any]]:
                 totals[instance_id] = len(ordered_ids)
             gate["step_position"] = positions[instance_id].get(gate["step_id"])
             gate["step_total"] = totals[instance_id]
+            try:
+                from shipfactory.decisions import current_binding
+                gate.update(current_binding(db, instance_id, gate["step_id"]))
+            except Exception as exc:
+                gate["binding_error"] = str(exc)
         return gates
 
 
@@ -574,11 +620,76 @@ def costs(
 
 @router.post("/approve")
 def approve(decision: GateDecision) -> dict[str, str]:
-    _gate_or_400(decision.instance, decision.step)
-    return {"key": advancer.gate_decision(decision.instance, decision.step, "approve")}
+    from shipfactory.decisions import DecisionConflict, record_decision
+    try:
+        row = record_decision(
+            instance_id=decision.instance, step_id=decision.step,
+            activation=decision.activation, revision_hash=decision.revision_hash,
+            evidence_bundle_hash=decision.evidence_bundle_hash, nonce=decision.nonce,
+            decision="approve", actor_kind=decision.actor_kind,
+            actor_id=decision.actor_id, channel=decision.channel,
+            reason=decision.reason,
+        )
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"key": str(row["advance_event_key"]), "decision_id": str(row["id"])}
 
 
 @router.post("/reject")
 def reject(decision: GateDecision) -> dict[str, str]:
-    _gate_or_400(decision.instance, decision.step)
-    return {"key": advancer.gate_decision(decision.instance, decision.step, "reject", decision.reason)}
+    from shipfactory.decisions import DecisionConflict, record_decision
+    try:
+        row = record_decision(
+            instance_id=decision.instance, step_id=decision.step,
+            activation=decision.activation, revision_hash=decision.revision_hash,
+            evidence_bundle_hash=decision.evidence_bundle_hash, nonce=decision.nonce,
+            decision="reject", actor_kind=decision.actor_kind,
+            actor_id=decision.actor_id, channel=decision.channel,
+            reason=decision.reason,
+        )
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"key": str(row["advance_event_key"]), "decision_id": str(row["id"])}
+
+
+@router.post("/phone-token")
+def phone_token(request: PhoneTokenRequest) -> dict[str, str]:
+    """Create an expiring action token; this does not record a decision."""
+    from shipfactory.decisions import DecisionConflict, issue_phone_token
+    try:
+        token = issue_phone_token(
+            instance_id=request.instance, step_id=request.step,
+            activation=request.activation, revision_hash=request.revision_hash,
+            evidence_bundle_hash=request.evidence_bundle_hash,
+            decision=request.decision, nonce=request.nonce,
+            ttl_seconds=request.ttl_seconds,
+        )
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"token": token}
+
+
+@router.post("/phone-decision")
+def phone_decision(request: PhoneTokenDecision) -> dict[str, Any]:
+    from shipfactory.decisions import (
+        DecisionConflict, DecisionTokenError, consume_phone_token,
+    )
+    try:
+        row = consume_phone_token(
+            request.token, actor_kind=request.actor_kind, actor_id=request.actor_id,
+            channel=request.channel, reason=request.reason,
+        )
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DecisionTokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "key": row["advance_event_key"], "decision_id": row["id"],
+        "replayed": bool(row.get("replayed")),
+    }

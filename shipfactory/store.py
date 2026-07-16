@@ -311,6 +311,30 @@ _VERIFICATION_MIGRATION_STATEMENTS = (
 )""",
 )
 _VERIFICATION_MIGRATION_TEXT = ";\n".join(_VERIFICATION_MIGRATION_STATEMENTS) + ";\n"
+_GATE_DECISION_MIGRATION_STATEMENTS = (
+    """CREATE TABLE gate_decisions (
+    id                   TEXT PRIMARY KEY,
+    instance_id          TEXT NOT NULL,
+    step_id              TEXT NOT NULL,
+    activation           INTEGER NOT NULL,
+    revision_hash        TEXT NOT NULL,
+    evidence_bundle_id   TEXT,
+    evidence_bundle_hash TEXT,
+    actor_kind           TEXT NOT NULL,
+    actor_id             TEXT NOT NULL,
+    channel              TEXT NOT NULL,
+    decision             TEXT NOT NULL,
+    reason               TEXT,
+    nonce_hash           TEXT,
+    policy_hash          TEXT,
+    created_at           TEXT NOT NULL,
+    consumed_at          TEXT,
+    advance_event_key    TEXT UNIQUE
+)""",
+)
+_GATE_DECISION_MIGRATION_TEXT = (
+    ";\n".join(_GATE_DECISION_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -322,6 +346,7 @@ _MIGRATIONS = (
     (8, "sf8_environment_enforcement_and_caps", _ENVIRONMENT_ENFORCEMENT_MIGRATION_TEXT),
     (9, "sf7_run_access_enforcement_level", _RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT),
     (10, "sf9_verification_evidence", _VERIFICATION_MIGRATION_TEXT),
+    (11, "sf11_bound_gate_decisions", _GATE_DECISION_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -334,6 +359,7 @@ _MIGRATION_STATEMENTS = {
     8: _ENVIRONMENT_ENFORCEMENT_MIGRATION_STATEMENTS,
     9: _RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS,
     10: _VERIFICATION_MIGRATION_STATEMENTS,
+    11: _GATE_DECISION_MIGRATION_STATEMENTS,
 }
 
 
@@ -522,11 +548,13 @@ def init_db() -> None:
                         "PRAGMA table_info(runs)"
                     )}
                     migration_artifacts = "access_enforcement_level" in run_columns
-                else:
+                elif version == 10:
                     migration_artifacts = bool(
                         {"evidence_bundles", "evidence_items", "verification_cases"}
                         & existing_tables
                     )
+                else:
+                    migration_artifacts = "gate_decisions" in existing_tables
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:

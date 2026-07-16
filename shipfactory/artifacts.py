@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import html
 import json
 import os
 import re
@@ -384,10 +385,85 @@ def _validate_plan(document: dict[str, Any]) -> None:
             )
 
 
+def _validate_review_story(document: dict[str, Any]) -> None:
+    schema = "shipfactory.review-story/v1"
+    required = {
+        "schema", "instance_id", "revision_hash", "task_spec_sha256",
+        "plan_sha256", "evidence_bundle_sha256", "headline", "changes",
+        "generated_or_mechanical_files", "not_changed", "residual_risks",
+    }
+    _require_keys(document, schema, required)
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
+    for field in (
+        "instance_id", "revision_hash", "task_spec_sha256", "plan_sha256",
+        "evidence_bundle_sha256", "headline",
+    ):
+        if not isinstance(document[field], str) or not document[field]:
+            raise ArtifactValidationError(f"{schema} field {field} must be a nonempty string")
+    for field in (
+        "revision_hash", "task_spec_sha256", "plan_sha256", "evidence_bundle_sha256",
+    ):
+        if not _hash_string(document[field], (64,)):
+            raise ArtifactValidationError(f"{schema} field {field} must be a sha256")
+    if not isinstance(document["changes"], list) or not document["changes"]:
+        raise ArtifactValidationError(f"{schema} changes must be a nonempty list")
+    change_keys = {
+        "importance", "requirement_ids", "files", "why", "risk", "evidence_case_ids",
+    }
+    for index, change in enumerate(document["changes"]):
+        if not isinstance(change, dict) or set(change) != change_keys:
+            raise ArtifactValidationError(f"{schema} change {index} has invalid shape")
+        if (not isinstance(change["importance"], int)
+                or isinstance(change["importance"], bool)
+                or change["importance"] < 1):
+            raise ArtifactValidationError(f"{schema} change {index} importance is invalid")
+        for field in ("requirement_ids", "files", "evidence_case_ids"):
+            if (not isinstance(change[field], list)
+                    or not all(isinstance(item, str) and item for item in change[field])):
+                raise ArtifactValidationError(
+                    f"{schema} change {index} field {field} must be a nonempty string list"
+                )
+        if not change["files"]:
+            raise ArtifactValidationError(f"{schema} change {index} must name a file")
+        for field in ("why", "risk"):
+            if not isinstance(change[field], str) or not change[field]:
+                raise ArtifactValidationError(
+                    f"{schema} change {index} field {field} must be nonempty"
+                )
+        for path in change["files"]:
+            _repository_path(path, label=f"{schema} change {index} file")
+    _string_list(document, schema, ("generated_or_mechanical_files", "residual_risks"))
+    for path in document["generated_or_mechanical_files"]:
+        _repository_path(path, label=f"{schema} generated file")
+    if not isinstance(document["not_changed"], list):
+        raise ArtifactValidationError(f"{schema} not_changed must be a list")
+    for index, item in enumerate(document["not_changed"]):
+        if not isinstance(item, dict):
+            raise ArtifactValidationError(
+                f"{schema} not_changed {index} must be an explicit not-implemented entry"
+            )
+        ids = item.get("requirement_ids")
+        if ids is None and isinstance(item.get("requirement_id"), str):
+            ids = [item["requirement_id"]]
+        reason = item.get("reason") or item.get("why")
+        disposition = item.get("disposition") or item.get("status")
+        explicit = item.get("not_implemented") is True or disposition in {
+            "not_implemented", "not-implemented",
+        }
+        if (not isinstance(ids, list) or not ids
+                or not all(isinstance(value, str) and value for value in ids)
+                or not isinstance(reason, str) or not reason or not explicit):
+            raise ArtifactValidationError(
+                f"{schema} not_changed {index} is not an explicit not-implemented entry"
+            )
+
+
 _VALIDATORS = {
     ("exploration", 1): _validate_exploration,
     ("task-spec", 1): _validate_task_spec,
     ("plan", 1): _validate_plan,
+    ("review-story", 1): _validate_review_story,
 }
 
 
@@ -630,6 +706,224 @@ def _validate_exploration_repository(document: dict[str, Any], workspace: Path) 
                     "which does not resolve to a definition or call site in the "
                     "cited text"
                 )
+
+
+def _changed_paths(workspace: Path, base_sha: str, head_sha: str) -> dict[str, str]:
+    """Return the complete NUL-safe changed-path map for a committed revision."""
+    raw = _git_bytes(
+        workspace, "diff", "--name-status", "-z", "--find-renames",
+        base_sha, head_sha,
+    )
+    parts = raw.split(b"\0")
+    if parts and not parts[-1]:
+        parts.pop()
+    changed: dict[str, str] = {}
+    index = 0
+    while index < len(parts):
+        status = parts[index].decode("ascii", errors="strict")
+        index += 1
+        count = 2 if status.startswith(("R", "C")) else 1
+        if index + count > len(parts):
+            raise ArtifactValidationError("review-story diff status output is truncated")
+        names = [parts[index + offset].decode("utf-8", errors="surrogateescape")
+                 for offset in range(count)]
+        index += count
+        for name_index, name in enumerate(names):
+            path = _repository_path(name, label="review-story changed path")
+            effective = "D" if status.startswith("R") and name_index == 0 else status[0]
+            if path in changed:
+                raise ArtifactValidationError(
+                    f"review-story diff contains duplicate path {path!r}"
+                )
+            changed[path] = effective
+    return changed
+
+
+def _generated_forbidden(path: str, status: str) -> bool:
+    lowered = path.lower()
+    name = PurePosixPath(lowered).name
+    lockfiles = {
+        "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+        "bun.lock", "bun.lockb", "poetry.lock", "pipfile.lock", "uv.lock",
+        "cargo.lock", "gemfile.lock", "composer.lock", "go.sum",
+    }
+    workflow = lowered == ".github/workflows" or lowered.startswith(".github/workflows/")
+    return status == "D" or workflow or name in lockfiles or name.endswith(".lock")
+
+
+def _configuration_path(path: str) -> bool:
+    lowered = path.lower()
+    name = PurePosixPath(lowered).name
+    return (
+        lowered.startswith((".github/", ".shipfactory/"))
+        or name.startswith(".")
+        or name in {"dockerfile", "makefile", "justfile", "procfile"}
+        or PurePosixPath(lowered).suffix in {
+            ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".lock",
+        }
+    )
+
+
+def _not_changed_requirement_ids(items: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for item in items:
+        if isinstance(item.get("requirement_ids"), list):
+            ids.update(item["requirement_ids"])
+        elif isinstance(item.get("requirement_id"), str):
+            ids.add(item["requirement_id"])
+    return ids
+
+
+def _validate_review_story_context(
+    document: dict[str, Any], instance_id: str, workspace: Path,
+) -> None:
+    """Bind narrative claims to the complete diff, spec, plan, and evidence."""
+    schema = "shipfactory.review-story/v1"
+    if document["instance_id"] != instance_id:
+        raise ArtifactValidationError(f"{schema} instance_id does not match producer instance")
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT base_sha FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone()
+        if instance is None or not instance["base_sha"]:
+            raise ArtifactValidationError(f"{schema} instance has no trusted base")
+        spec_row = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND kind='task-spec' "
+            "AND state='sealed' AND sha256=? ORDER BY activation DESC LIMIT 1",
+            (instance_id, document["task_spec_sha256"]),
+        ).fetchone()
+        plan_row = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND kind='plan' "
+            "AND state='sealed' AND sha256=? ORDER BY activation DESC LIMIT 1",
+            (instance_id, document["plan_sha256"]),
+        ).fetchone()
+        bundle = db.execute(
+            "SELECT * FROM evidence_bundles WHERE instance_id=? AND state='done' "
+            "AND bundle_sha256=? ORDER BY activation DESC LIMIT 1",
+            (instance_id, document["evidence_bundle_sha256"]),
+        ).fetchone()
+        if spec_row is None:
+            raise ArtifactValidationError(f"{schema} task_spec_sha256 is not a sealed input")
+        if plan_row is None:
+            raise ArtifactValidationError(f"{schema} plan_sha256 is not a sealed input")
+        if bundle is None:
+            raise ArtifactValidationError(
+                f"{schema} evidence_bundle_sha256 is not a current sealed bundle"
+            )
+        from shipfactory.verification import verify_evidence_bundle
+        verified_bundle = verify_evidence_bundle(bundle["id"], db=db)
+        case_rows = db.execute(
+            "SELECT case_id,attempt,status FROM verification_cases WHERE bundle_id=?",
+            (bundle["id"],),
+        ).fetchall()
+        waiting = db.execute(
+            "SELECT input_revision_hash FROM recipe_steps WHERE instance_id=? "
+            "AND primitive='approval_gate' AND state='waiting' "
+            "ORDER BY activation DESC LIMIT 1",
+            (instance_id,),
+        ).fetchone()
+    if verified_bundle["bundle_sha256"] != document["evidence_bundle_sha256"]:
+        raise ArtifactValidationError(f"{schema} evidence bundle hash changed")
+    if waiting and waiting["input_revision_hash"] != document["revision_hash"]:
+        raise ArtifactValidationError(f"{schema} revision_hash is not the waiting gate revision")
+
+    spec = artifact_document(dict(spec_row))
+    plan = artifact_document(dict(plan_row))
+    if plan.get("task_spec_sha256") != document["task_spec_sha256"]:
+        raise ArtifactValidationError(f"{schema} plan is not bound to its task spec")
+    requirements = {item["id"] for item in spec["requirements"]}
+    covered: set[str] = set()
+    narrated_paths: list[str] = []
+    known_cases = {str(row["case_id"]) for row in case_rows}
+    for index, change in enumerate(document["changes"]):
+        change_requirements = set(change["requirement_ids"])
+        unknown = change_requirements - requirements
+        if unknown:
+            raise ArtifactValidationError(
+                f"{schema} change {index} names unknown requirements: {sorted(unknown)}"
+            )
+        covered.update(change_requirements)
+        narrated_paths.extend(change["files"])
+        evidence_ids = set(change["evidence_case_ids"])
+        missing_cases = evidence_ids - known_cases
+        if missing_cases:
+            raise ArtifactValidationError(
+                f"{schema} change {index} cites absent evidence cases: {sorted(missing_cases)}"
+            )
+        # Every change carries a risk assertion; require evidence for all of
+        # them so euphemistic wording cannot bypass the safety-claim check.
+        if not evidence_ids:
+            raise ArtifactValidationError(
+                f"{schema} safety claim in change {index} has no evidence case"
+            )
+    explicit_not_implemented = _not_changed_requirement_ids(document["not_changed"])
+    unknown_not_changed = explicit_not_implemented - requirements
+    if unknown_not_changed:
+        raise ArtifactValidationError(
+            f"{schema} not_changed names unknown requirements: {sorted(unknown_not_changed)}"
+        )
+    if covered | explicit_not_implemented != requirements:
+        missing = sorted(requirements - covered - explicit_not_implemented)
+        raise ArtifactValidationError(
+            f"{schema} does not cover every requirement: {missing}"
+        )
+
+    head_sha = str(bundle["head_sha"])
+    changed = _changed_paths(workspace, str(instance["base_sha"]), head_sha)
+    generated = list(document["generated_or_mechanical_files"])
+    all_declared = narrated_paths + generated
+    duplicates = sorted({path for path in all_declared if all_declared.count(path) != 1})
+    if duplicates:
+        raise ArtifactValidationError(
+            f"{schema} changed paths must appear exactly once: {duplicates}"
+        )
+    declared = set(all_declared)
+    if declared != set(changed):
+        missing = sorted(set(changed) - declared)
+        extra = sorted(declared - set(changed))
+        raise ArtifactValidationError(
+            f"{schema} changed-path completeness mismatch; missing={missing}, extra={extra}"
+        )
+    for path in generated:
+        if _generated_forbidden(path, changed[path]):
+            raise ArtifactValidationError(
+                f"{schema} path {path!r} cannot be classified as generated/mechanical"
+            )
+        if _configuration_path(path):
+            raise ArtifactValidationError(
+                f"{schema} configuration path {path!r} must be called out as a change"
+            )
+    narrated = set(narrated_paths)
+    for path, status in changed.items():
+        if (status == "D" or _configuration_path(path)) and path not in narrated:
+            raise ArtifactValidationError(
+                f"{schema} deletion/configuration path {path!r} must be called out"
+            )
+
+    verification_has_caveats = any(
+        int(row["attempt"]) > 1
+        or str(row["status"]).lower() in {"skipped", "warning", "warnings", "warn"}
+        for row in case_rows
+    ) or "warning" in str(bundle["invalid_reason"] or "").lower()
+    if verification_has_caveats and not document["residual_risks"]:
+        raise ArtifactValidationError(
+            f"{schema} residual_risks cannot be empty after retries/skips/warnings"
+        )
+
+
+def dashboard_safe_review_story(document: dict[str, Any]) -> dict[str, Any]:
+    """Escape all narrative strings before returning a story to dashboard HTML."""
+    def escape(value: Any) -> Any:
+        if isinstance(value, str):
+            # Canonicalize through unescape so sealing and subsequent dashboard
+            # projection are idempotent rather than double-escaping.
+            return html.escape(html.unescape(value), quote=True)
+        if isinstance(value, list):
+            return [escape(item) for item in value]
+        if isinstance(value, dict):
+            return {key: escape(item) for key, item in value.items()}
+        return value
+    return escape(document)
 
 
 def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:
@@ -1002,6 +1296,19 @@ def seal_artifact(
             _validate_exploration_repository(document, worktree)
         elif kind == "plan":
             _validate_plan_context(document, instance_id, worktree)
+        elif kind == "review-story":
+            _validate_review_story_context(document, instance_id, worktree)
+            # Issue/request text is untrusted narrative. Store its safe
+            # projection, not executable HTML, while leaving diff/spec/evidence
+            # as the authoritative source records.
+            document = dashboard_safe_review_story(document)
+            data = json.dumps(
+                document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+            if len(data) > int(max_bytes):
+                raise ArtifactValidationError(
+                    f"escaped review-story size exceeds configured ceiling {int(max_bytes)}"
+                )
         sealed_path = _storage_path(instance_id, step_id, activation, kind)
     except ArtifactSealError:
         # Operational failures keep the durable candidate row retryable.

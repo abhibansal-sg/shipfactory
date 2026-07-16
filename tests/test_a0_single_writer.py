@@ -298,7 +298,11 @@ def test_stale_gate_activation_is_discarded_and_cannot_complete_new_gate(tmp_pat
         event_row = db.execute(
             "SELECT state,outcome FROM advance_events WHERE key=?", (key,)
         ).fetchone()
-        assert tuple(event_row) == ("discarded", "stale_or_nonmatching_activation")
+        assert tuple(event_row) == ("discarded", "stale_gate_decision:activation changed")
+        decision = db.execute(
+            "SELECT consumed_at,reason FROM gate_decisions WHERE advance_event_key=?", (key,)
+        ).fetchone()
+        assert decision["consumed_at"] and decision["reason"].startswith("stale: activation changed")
         assert db.execute("SELECT COUNT(*) FROM action_intents").fetchone()[0] == 0
 
 

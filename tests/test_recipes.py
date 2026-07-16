@@ -401,7 +401,7 @@ steps:
 
     result = _recipe_gate(kanban_conn, "human", "approve", "approve", "")
     assert result["status"] == "waiting_gate"
-    assert result["decision_id"] == result["key"]
+    assert result["decision_id"] != result["key"]
     assert kanban_db.get_task(kanban_conn, gate["kanban_task_id"]).status == "blocked"
     apply_events(kanban_conn, profiles=PROFILES)
     assert _instance("human")["status"] == "done"
