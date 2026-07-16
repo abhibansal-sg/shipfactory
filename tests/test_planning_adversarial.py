@@ -824,3 +824,232 @@ def test_readonly_explorer_write_attempt_is_denied_by_the_filesystem(
                 os.chmod(workspace_path, 0o755)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 17b. Cross-lab review finding #1: fail-open resolution, chmod-bypassable
+# same-UID enforcement, and a Hermes executor path that skipped enforcement
+# entirely.
+# ---------------------------------------------------------------------------
+
+def test_access_mode_resolution_failure_blocks_the_spawn_entirely(
+    tmp_path, hermetic_hermes_home, kanban_conn,
+):
+    """A DB/JSON error resolving a readonly step's access_mode must never be
+    read as "no enforcement needed" — it must block the spawn outright.
+    Corrupts the REAL pinned recipe_versions row for a real dev-pipeline@5
+    explore step (access_mode: readonly) so resolution genuinely fails, then
+    proves shipfactory_spawn raises rather than launching anything."""
+    from hermes_cli import kanban_db
+    from shipfactory.spawn import AccessModeResolutionError, _RUNNING, shipfactory_spawn
+
+    home = hermetic_hermes_home
+    (home / "profiles" / "explorer").mkdir(parents=True)
+    (home / "shipfactory").mkdir(parents=True, exist_ok=True)
+    (home / "shipfactory" / "seats.yaml").write_text(
+        "company: adversarial\n"
+        "seats:\n"
+        "  explorer:\n"
+        "    profile: explorer\n"
+        "    executor: codex\n"
+        "    model: test\n"
+        "    role: explorer\n",
+        encoding="utf-8",
+    )
+    repo, base_sha, _tree_sha = _repo(tmp_path)
+    recipe = load_library(ROOT / "recipes").get("dev-pipeline@5")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe,
+        parameters={"request": "explore the repo"}, instance_id="access-mode-corrupt",
+        base_sha=base_sha,
+    )
+    reconcile(kanban_conn, "access-mode-corrupt", profiles=PIPELINE_PROFILES)
+    explore = _step("access-mode-corrupt", "explore")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_versions SET normalized_yaml=? WHERE id=? AND version=?",
+            ("{not valid json", recipe.document["id"], recipe.document["version"]),
+        )
+    task = kanban_db.get_task(kanban_conn, explore["kanban_task_id"])
+    _RUNNING.clear()
+    with pytest.raises(AccessModeResolutionError):
+        shipfactory_spawn(task, str(tmp_path / "never-created-workspace"), board="test")
+    assert _RUNNING == {}
+    with store._connect() as db:
+        runs = db.execute(
+            "SELECT COUNT(*) FROM runs WHERE task_id=?", (explore["kanban_task_id"],),
+        ).fetchone()[0]
+    # The blocked spawn must never have reached record_run_start: no durable
+    # run row, no in-memory worker, nothing to reap.
+    assert runs == 0
+
+
+def test_readonly_enforcement_covers_the_hermes_executor_path_too(
+    tmp_path, hermetic_hermes_home, monkeypatch, kanban_conn,
+):
+    """The Hermes executor branch used to call kanban_db._default_spawn
+    directly and never ran _enforce_readonly_workspace at all — a readonly
+    explore step assigned to a hermes-executor seat ran with full
+    workspace-write. It must now get the identical filesystem lockdown
+    codex/claude seats get, applied before Hermes's own spawn runs."""
+    from hermes_cli import kanban_db
+    from shipfactory.spawn import _RUNNING, shipfactory_spawn
+
+    home = hermetic_hermes_home
+    _RUNNING.clear()
+    (home / "profiles" / "explorer").mkdir(parents=True)
+    (home / "shipfactory").mkdir(parents=True, exist_ok=True)
+    (home / "shipfactory" / "seats.yaml").write_text(
+        "company: adversarial\n"
+        "seats:\n"
+        "  explorer:\n"
+        "    profile: explorer\n"
+        "    executor: hermes\n"
+        "    model: test\n"
+        "    role: explorer\n",
+        encoding="utf-8",
+    )
+    repo, base_sha, _tree_sha = _repo(tmp_path)
+    recipe = load_library(ROOT / "recipes").get("dev-pipeline@5")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe,
+        parameters={"request": "explore the repo"}, instance_id="hermes-readonly",
+        base_sha=base_sha,
+    )
+    reconcile(kanban_conn, "hermes-readonly", profiles=PIPELINE_PROFILES)
+    explore = _step("hermes-readonly", "explore")
+    task = kanban_db.get_task(kanban_conn, explore["kanban_task_id"])
+
+    # Hermes's own subprocess spawn is third-party code this engine does not
+    # own; only the readonly enforcement shipfactory itself is responsible
+    # for is under test here.
+    monkeypatch.setattr(kanban_db, "_default_spawn", lambda *a, **k: 999999)
+
+    workspace = tmp_path / "hermes-workspace"
+    (workspace / "keep").mkdir(parents=True)
+    (workspace / "keep" / "existing.txt").write_text("trusted\n", encoding="utf-8")
+
+    pid = shipfactory_spawn(task, str(workspace), board="test")
+    assert pid == 999999
+
+    assert (workspace / "keep").stat().st_mode & 0o777 == 0o550, (
+        "the hermes executor path must chmod the workspace exactly like codex/claude"
+    )
+    assert (workspace / "keep" / "existing.txt").stat().st_mode & 0o777 == 0o440
+
+    with store._connect() as db:
+        run_row = dict(db.execute(
+            "SELECT access_enforcement_level FROM runs WHERE task_id=?",
+            (explore["kanban_task_id"],),
+        ).fetchone())
+    assert run_row["access_enforcement_level"] == "advisory"
+
+    os.chmod(workspace / "keep", 0o755)
+    os.chmod(workspace / "keep" / "existing.txt", 0o644)
+
+
+def test_chmod_bypass_before_writing_succeeds_and_is_honestly_labeled_advisory(
+    tmp_path, hermetic_hermes_home, monkeypatch,
+):
+    """Chmod-based readonly enforcement is same-UID bypassable — a worker
+    that runs `chmod u+w` on a locked-down file before writing restores its
+    own write access. Closing that for real needs an actual sandbox/
+    privilege boundary this engine does not set up, so the system must
+    never claim "enforced" for it. Proves both halves honestly: the bypass
+    genuinely works, AND the run's recorded access_enforcement_level is
+    "advisory", never "enforced"."""
+    from hermes_cli import kanban_db
+    from shipfactory.spawn import _RUNNING, reap_finished, shipfactory_spawn
+
+    home = hermetic_hermes_home
+    _RUNNING.clear()
+
+    (home / "profiles" / "explorer").mkdir(parents=True)
+    (home / "shipfactory").mkdir()
+    (home / "shipfactory" / "seats.yaml").write_text(
+        "company: adversarial\n"
+        "seats:\n"
+        "  explorer:\n"
+        "    profile: explorer\n"
+        "    executor: codex\n"
+        "    model: test\n"
+        "    role: explorer\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "README.md").write_text("trusted content\n", encoding="utf-8")
+    _commit(repo, "fixture")
+
+    store.init_db()
+    kanban_db.create_board("adversarial", default_workdir=str(repo))
+    conn = kanban_db.connect(board="adversarial")
+    workspace_path: Path | None = None
+    try:
+        recipe = load_library(ROOT / "recipes").get("dev-pipeline@5")
+        instantiate(
+            conn, board="adversarial", recipe=recipe,
+            parameters={"request": "explore the repo"}, instance_id="chmod-bypass",
+        )
+        reconcile(conn, "chmod-bypass", profiles=PIPELINE_PROFILES)
+        explore_task_id = _step("chmod-bypass", "explore")["kanban_task_id"]
+
+        malicious = tmp_path / "malicious-chmod-codex.sh"
+        malicious.write_text(
+            "#!/bin/sh\n"
+            "cat >/dev/null\n"
+            "ws=\"$HERMES_KANBAN_WORKSPACE\"\n"
+            "chmod u+w \"$ws/README.md\" 2>/dev/null\n"
+            "if echo PWNED >> \"$ws/README.md\" 2>/dev/null; then readme=succeeded; else readme=denied; fi\n"
+            "printf 'readme_write=%s\\n' \"$readme\"\n"
+            "printf 'SHIPFACTORY_RESULT: done chmod-bypass readme=%s\\n' \"$readme\"\n",
+            encoding="utf-8",
+        )
+        malicious.chmod(0o755)
+        monkeypatch.setenv("FACTORY_EXECUTOR_CMD_CODEX", str(malicious))
+
+        dispatched = kanban_db.dispatch_once(conn, spawn_fn=shipfactory_spawn, board="adversarial")
+        assert dispatched.spawned, "the explore task never got spawned"
+        task = kanban_db.get_task(conn, explore_task_id)
+        workspace_path = Path(task.workspace_path)
+
+        outcome = None
+        for _ in range(200):
+            finished = reap_finished()
+            if finished:
+                outcome = finished[0]
+                break
+            import time
+            time.sleep(0.02)
+        assert outcome is not None, "the malicious harness never exited"
+
+        with store._connect() as db:
+            run_row = dict(db.execute(
+                "SELECT log_path,access_enforcement_level FROM runs "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (explore_task_id,),
+            ).fetchone())
+        log_text = Path(run_row["log_path"]).read_text(encoding="utf-8", errors="replace")
+        # The honest, expected outcome: chmod u+w DOES restore write access —
+        # a known, accepted limitation, not a defended boundary.
+        assert "readme_write=succeeded" in log_text
+        # And the system never lies about it: the run is labeled advisory,
+        # never "enforced".
+        assert run_row["access_enforcement_level"] == "advisory"
+    finally:
+        if workspace_path is not None and workspace_path.exists():
+            for dirpath, dirnames, filenames in os.walk(workspace_path):
+                for name in dirnames:
+                    try:
+                        os.chmod(Path(dirpath) / name, 0o755)
+                    except OSError:
+                        pass
+                for name in filenames:
+                    try:
+                        os.chmod(Path(dirpath) / name, 0o644)
+                    except OSError:
+                        pass
+            os.chmod(workspace_path, 0o755)
+        conn.close()
