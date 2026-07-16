@@ -269,11 +269,18 @@ def _review_approval_blocker(db: Any, instance_id: str,
         if artifact["kind"] == "task-spec" and task_spec_has_clarifications(artifact):
             return "clarifications_nonempty"
     defs = defs or ({item["id"]: item for item in recipe["steps"]} if recipe else {})
+    ancestors: set[str] = set()
+    def collect(node: str) -> None:
+        for parent in defs.get(node, {}).get("needs", []):
+            if parent not in ancestors:
+                ancestors.add(parent)
+                collect(parent)
+    collect(definition["id"])
     # Evidence-bound review (§2.4.8): an approval that follows a verification
     # step must be bound to the exact live sealed bundle, never model prose
     # alone (finding #3, verification adversarial lane -- #9 and #18).
     verification_producers = [
-        needed for needed in definition.get("needs", [])
+        needed for needed in ancestors
         if defs.get(needed, {}).get("primitive") == "verification"
     ]
     for producer_id in verification_producers:
@@ -295,33 +302,55 @@ def _review_approval_blocker(db: Any, instance_id: str,
             return f"evidence_invariant:{exc}"
         if bundle["state"] != "done":
             return "verification_not_passed"
-        if conn is not None and latest is not None:
-            workspace, _owner = _step_change_set_workspace(conn, latest, definition)
-            if workspace:
-                try:
-                    assert_commit_binding(workspace, bundle["head_sha"], bundle["tree_sha"])
-                except CommitBindingError as exc:
-                    return f"candidate_mutated_after_verification:{exc}"
-        if not bundle.get("bundle_sha256") or bundle["bundle_sha256"] not in str(verdict_body or ""):
-            return "evidence_not_cited"
+        try:
+            from shipfactory.verification import _assert_workspace_owner
+            if bundle.get("workspace_path"):
+                _assert_workspace_owner({
+                    "workspace": bundle["workspace_path"],
+                    "workspace_owner_task_id": bundle.get("workspace_owner_task_id"),
+                    "workspace_owner_activation": bundle.get("workspace_owner_activation"),
+                    "workspace_owner_run_id": bundle.get("workspace_owner_run_id"),
+                })
+                assert_commit_binding(bundle["workspace_path"], bundle["head_sha"], bundle["tree_sha"])
+        except CommitBindingError as exc:
+            return f"candidate_mutated_after_verification:{exc}"
+    # Bind the task itself to the exact sealed inputs Factory opened.  A hash
+    # copied into model prose is not evidence that those bytes were supplied.
+    if (recipe is not None and recipe.get("schema") == "shipfactory.recipe/v2"
+            and conn is not None and latest is not None):
+        from hermes_cli import kanban_db
+        from .primitives import build_review_input_context
+        try:
+            review_context, review_digest = build_review_input_context(
+                db, _instance(db, instance_id), recipe, definition,
+            )
+        except Exception as exc:
+            return f"review_inputs_invalid:{exc}"
+        step_row = latest.get(definition["id"])
+        task = (
+            kanban_db.get_task(conn, step_row["kanban_task_id"])
+            if step_row and step_row.get("kanban_task_id") else None
+        )
+        marker = f"SHIPFACTORY_REVIEW_INPUT_SHA256: {review_digest}"
+        task_body = str(task.body or "") if task is not None else ""
+        if marker not in task_body or review_context not in task_body:
+            return "review_inputs_not_bound"
     # Reviewer/builder provider independence (finding #3): a differently
     # named reviewer seat configured identically to the builder seat is not
     # an independent review.
-    change_set_producer_id = next(
-        (item["from"] for item in definition.get("inputs", [])
-         if item.get("kind") == "change-set"),
-        None,
-    )
+    change_set_producer_id = next((item["from"] for step_id in [definition["id"], *ancestors]
+        for item in defs.get(step_id, {}).get("inputs", []) if item.get("kind") == "change-set"), None)
     if change_set_producer_id and defs.get(change_set_producer_id, {}).get("primitive") == "agent_task":
         builder_seat = defs[change_set_producer_id]["params"].get("seat")
         reviewer_seat = definition["params"].get("seat")
-        if builder_seat and reviewer_seat and builder_seat != reviewer_seat:
+        if builder_seat and reviewer_seat:
             from shipfactory.config import load_seats, reviewer_shares_builder_provider
             try:
                 cfg = load_seats()
-            except Exception:
-                cfg = None
-            if cfg is not None and reviewer_shares_builder_provider(cfg, builder_seat, reviewer_seat):
+                shared = reviewer_shares_builder_provider(cfg, builder_seat, reviewer_seat)
+            except Exception as exc:
+                return f"reviewer_provider_unresolved:{exc}"
+            if shared:
                 return "reviewer_shares_builder_provider"
     return None
 
@@ -815,7 +844,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                                 approval_blocker = _review_approval_blocker(
                                     db, instance_id, definition,
                                     verdict_body=verdict.get("body", ""), defs=defs,
-                                    conn=conn,
+                                    recipe=recipe, conn=conn,
                                     latest={x["step_id"]: x for x in _latest(db, instance_id)},
                                 )
                                 if approval_blocker:
@@ -945,8 +974,25 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             reason="verification candidate workspace missing",
                         )
                         continue
+                    owner_step = (
+                        db.execute(
+                            "SELECT activation,producer_run_id FROM recipe_steps "
+                            "WHERE kanban_task_id=?",
+                            (workspace_owner_task_id,),
+                        ).fetchone()
+                        if workspace_owner_task_id else None
+                    )
+                    if (owner_step is None or owner_step["producer_run_id"] is None):
+                        changed |= _transition(
+                            db, instance, step, "failed", "workspace",
+                            reason="verification exact producer task/activation/run is missing",
+                        )
+                        continue
+                    workspace_owner_activation = int(owner_step["activation"])
+                    workspace_owner_run_id = int(owner_step["producer_run_id"])
                     change_set = None
                     required_requirement_ids: set[str] = set()
+                    surface_documents: list[dict[str, Any]] = []
                     for declared_input in definition.get("inputs", []):
                         artifact = db.execute(
                             "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? "
@@ -958,10 +1004,14 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         if artifact and declared_input["kind"] == "task-spec":
                             from shipfactory.artifacts import artifact_document
                             spec = artifact_document(dict(artifact))
+                            surface_documents.append(spec)
                             required_requirement_ids.update(
                                 item["id"] for item in spec.get("requirements", [])
                                 if isinstance(item, dict) and isinstance(item.get("id"), str)
                             )
+                        if artifact and declared_input["kind"] == "plan":
+                            from shipfactory.artifacts import artifact_document
+                            surface_documents.append(artifact_document(dict(artifact)))
                     try:
                         head_sha = (
                             change_set.get("head_sha") if change_set else subprocess.check_output(
@@ -986,6 +1036,20 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             workspace, head_sha, manifest_relpath,
                             required_requirement_ids=required_requirement_ids,
                         )
+                        from shipfactory.verification import (
+                            classify_required_surface, surface_paths_from_documents,
+                        )
+                        diff_paths = subprocess.check_output(
+                            ["git", "diff", "--name-only", instance["base_sha"], head_sha],
+                            cwd=workspace, text=True, stderr=subprocess.PIPE, timeout=10,
+                        ).splitlines()
+                        surface_paths = sorted(set(diff_paths + surface_paths_from_documents(
+                            *surface_documents,
+                        )))
+                        required_surface = classify_required_surface(
+                            surface_paths,
+                            model_risk_surface=profile.get("model_risk_surface"),
+                        )
                     except Exception as exc:
                         changed |= _transition(
                             db, instance, step, "failed", "verification_manifest",
@@ -1004,6 +1068,10 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             "base_sha": instance["base_sha"], "head_sha": head_sha,
                             "tree_sha": tree_sha, "workspace": str(workspace),
                             "workspace_owner_task_id": workspace_owner_task_id,
+                            "workspace_owner_activation": workspace_owner_activation,
+                            "workspace_owner_run_id": workspace_owner_run_id,
+                            "required_surface": required_surface,
+                            "model_risk_surface": profile.get("model_risk_surface"),
                             "manifest_relpath": manifest_relpath,
                             "manifest_blob_sha": (candidate or protected).blob_sha,
                             "candidate_manifest_blob_sha": (
@@ -1382,6 +1450,14 @@ def _record_action_outcome(row: dict[str, Any], state: str,
                     "UPDATE outbox SET state='pending',attempts=?,next_attempt_at=?,last_error=?,"
                     "lease_owner=NULL,lease_until=NULL WHERE key=?",
                     (attempts, due, error, outbox_key),
+                )
+        if row["kind"] == "worker_task_transition" and state == "succeeded":
+            payload = json.loads(row["payload_json"])
+            if payload.get("result") == "done":
+                db.execute(
+                    "UPDATE recipe_steps SET producer_run_id=?,updated_at=? "
+                    "WHERE kanban_task_id=?",
+                    (int(payload["run_id"]), now, str(payload["task_id"])),
                 )
         if state == "retryable_failed" and row["kind"] != "notification_delivery":
             _new_action_attempt(db, row)

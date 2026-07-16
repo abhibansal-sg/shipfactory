@@ -341,6 +341,20 @@ _VERIFICATION_HARDENING_MIGRATION_STATEMENTS = (
 _VERIFICATION_HARDENING_MIGRATION_TEXT = (
     ";\n".join(_VERIFICATION_HARDENING_MIGRATION_STATEMENTS) + ";\n"
 )
+_VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS = (
+    "ALTER TABLE runs ADD COLUMN recipe_activation INTEGER",
+    "ALTER TABLE recipe_steps ADD COLUMN producer_run_id INTEGER",
+    "ALTER TABLE evidence_bundles ADD COLUMN workspace_path TEXT",
+    "ALTER TABLE evidence_bundles ADD COLUMN workspace_owner_task_id TEXT",
+    "ALTER TABLE evidence_bundles ADD COLUMN workspace_owner_activation INTEGER",
+    "ALTER TABLE evidence_bundles ADD COLUMN workspace_owner_run_id INTEGER",
+    "ALTER TABLE evidence_bundles ADD COLUMN required_surface TEXT",
+    "ALTER TABLE evidence_bundles ADD COLUMN environment_identity_json TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE evidence_items ADD COLUMN attempt INTEGER",
+)
+_VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT = (
+    ";\n".join(_VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -354,6 +368,7 @@ _MIGRATIONS = (
     (10, "sf9_verification_evidence", _VERIFICATION_MIGRATION_TEXT),
     (11, "sf11_bound_gate_decisions", _GATE_DECISION_MIGRATION_TEXT),
     (12, "verification_adversarial_hardening", _VERIFICATION_HARDENING_MIGRATION_TEXT),
+    (13, "verification_production_identity_binding", _VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -368,6 +383,7 @@ _MIGRATION_STATEMENTS = {
     10: _VERIFICATION_MIGRATION_STATEMENTS,
     11: _GATE_DECISION_MIGRATION_STATEMENTS,
     12: _VERIFICATION_HARDENING_MIGRATION_STATEMENTS,
+    13: _VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS,
 }
 
 
@@ -563,11 +579,30 @@ def init_db() -> None:
                     )
                 elif version == 11:
                     migration_artifacts = "gate_decisions" in existing_tables
-                else:
+                elif version == 12:
                     bundle_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(evidence_bundles)"
                     )}
                     migration_artifacts = "phase_b_eligible" in bundle_columns
+                else:
+                    run_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(runs)"
+                    )}
+                    step_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_steps)"
+                    )}
+                    bundle_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(evidence_bundles)"
+                    )}
+                    item_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(evidence_items)"
+                    )}
+                    migration_artifacts = bool(
+                        "recipe_activation" in run_columns
+                        or "producer_run_id" in step_columns
+                        or {"workspace_path", "environment_identity_json"} & bundle_columns
+                        or "attempt" in item_columns
+                    )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:
@@ -586,22 +621,23 @@ def record_run_start(task_id, seat, executor, model, pid=None, *, board=None,
                      workspace_path=None, log_path=None, prompt_path=None,
                      provider=None, resolved_model=None, executor_version=None,
                      process_start_token=None, task_attempt_id=None,
-                     access_enforcement_level=None) -> int:
+                     access_enforcement_level=None, recipe_activation=None) -> int:
     """Insert a running harness execution and return its run id."""
     init_db()
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO runs(task_id,seat,executor,model,pid,started_at,tokens_in,tokens_out,"
             "tokens_total,board,workspace_path,log_path,prompt_path,provider,resolved_model,"
-            "executor_version,process_start_token,task_attempt_id,access_enforcement_level) "
-            "VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?)",
+            "executor_version,process_start_token,task_attempt_id,access_enforcement_level,"
+            "recipe_activation) VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, seat, executor, model or "", pid, _now(), board,
              str(workspace_path) if workspace_path is not None else None,
              str(log_path) if log_path is not None else None,
              str(prompt_path) if prompt_path is not None else None,
              provider, resolved_model, executor_version, process_start_token,
              int(task_attempt_id) if task_attempt_id is not None else None,
-             access_enforcement_level),
+             access_enforcement_level,
+             int(recipe_activation) if recipe_activation is not None else None),
         )
         return int(cur.lastrowid)
 
@@ -655,6 +691,25 @@ def workspace_path_for_task(task_id: str) -> str | None:
             (task_id,),
         ).fetchone()
     return row["workspace_path"] if row else None
+
+
+def exact_workspace_run(
+    task_id: str, run_id: int, activation: int | None = None,
+) -> dict[str, Any] | None:
+    """Return the exact producer run only when task and activation match."""
+    init_db()
+    with _connect() as conn:
+        if activation is None:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE id=? AND task_id=?",
+                (int(run_id), str(task_id)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE id=? AND task_id=? AND recipe_activation=?",
+                (int(run_id), str(task_id), int(activation)),
+            ).fetchone()
+    return dict(row) if row else None
 
 
 def run_row(run_id: int) -> dict[str, Any] | None:
@@ -1376,4 +1431,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]

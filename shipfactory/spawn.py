@@ -173,6 +173,19 @@ def verified_killpg(pid: int | None, token: str | None, sig: int = signal.SIGKIL
         return False
 
 
+def verified_kill(pid: int | None, token: str | None, sig: int = signal.SIGKILL) -> bool:
+    """Signal one process only after re-checking its exact OS start identity."""
+    if not pid or not token:
+        return False
+    try:
+        if _process_start_token(int(pid)) != token:
+            return False
+        os.kill(int(pid), sig)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 class _AdoptedProcess:
     """Minimal pollable handle for a worker whose original parent restarted."""
 
@@ -338,6 +351,24 @@ def _step_access_mode(task_id: str) -> str | None:
     return params.get("access_mode") if isinstance(params, dict) else None
 
 
+def _step_recipe_activation(task_id: str) -> int | None:
+    """Resolve the durable recipe activation associated with a kanban task."""
+    store = _store_module()
+    if not hasattr(store, "_connect"):
+        return None
+    try:
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT activation FROM recipe_steps WHERE kanban_task_id=?",
+                (str(task_id),),
+            ).fetchone()
+    except Exception as exc:
+        raise AccessModeResolutionError(
+            f"recipe activation lookup failed for task {task_id}: {exc}"
+        ) from exc
+    return int(row["activation"]) if row is not None else None
+
+
 # ``access_mode: readonly`` enforcement is filesystem permission bits, not a
 # privilege or sandbox boundary: the worker runs under the SAME UID as this
 # call, and standard POSIX permission bits are the owning user's own
@@ -457,6 +488,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         "executor_version": str(getattr(executor, "version", "1")),
         "task_attempt_id": _value(task, "current_run_id"),
         "access_enforcement_level": enforcement_level,
+        "recipe_activation": _step_recipe_activation(str(task_id)),
     }
     try:
         run_id = store.record_run_start(

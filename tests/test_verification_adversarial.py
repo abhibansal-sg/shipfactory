@@ -1,13 +1,10 @@
 """Independent adversarial corpus attacking the merged verification engine.
 
 Each test constructs the real attack named in the external program review
-§2.4.6-§2.4.10 at the strongest feasible boundary given what is actually
-implemented (playwright/ffmpeg capture is not wired to a real browser in
-this codebase -- those attacks are constructed against the deterministic
-capture-container/identity-binding primitives that stand in for a runner-
-generated overlay, and against the honest fail-closed behavior of the
-playwright stub) and asserts the precise fail-closed outcome, not just a
-named pass.
+§2.4.6-§2.4.10 through the production action, case-loop, browser, review-task,
+or evidence-verification boundary. Host-only browser/loopback attacks skip
+when the host cannot provide that infrastructure; missing infrastructure is
+also separately asserted to block the production run.
 """
 from __future__ import annotations
 
@@ -16,6 +13,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -74,7 +72,7 @@ def _profile(**updates):
         "max_runtime_seconds": 10, "infrastructure_retries": 1,
         "max_evidence_bytes": 100_000, "max_log_bytes": 50_000,
         "capture_video": False, "capture_trace": False, "capture_har": False,
-        "browser_slots": 1,
+        "browser_slots": 1, "surface": "stricter",
     }
     value.update(updates)
     return value
@@ -119,21 +117,22 @@ def _finish_action(payload, timeout=10):
     return result
 
 
-def _bare_bundle(repo, head, tree, manifest, *, instance_id, step_id="verify", activation=1):
-    """Insert an evidence_bundles row directly, for low-level item/seal control."""
-    bundle_id = verify._bundle_id(instance_id, step_id, activation)
-    verify._insert_bundle(
-        bundle_id=bundle_id, instance_id=instance_id, step_id=step_id, activation=activation,
-        input_revision_hash="revision", base_sha=head, head_sha=head, tree_sha=tree,
-        environment_session_id=None, manifest=manifest,
-    )
-    return bundle_id
-
-
-def _item_path(item_id: str) -> str:
-    with store._connect() as db:
-        row = db.execute("SELECT path FROM evidence_items WHERE id=?", (item_id,)).fetchone()
-    return row["path"]
+def _capture_driver(tmp_path: Path, factory):
+    """Return a real case-loop driver that emits runner-format capture files."""
+    def driver(case, workspace, env, timeout):
+        started = store._now()
+        capture = factory(case, env, started)
+        path = tmp_path / f"{env['SHIPFACTORY_EVIDENCE_BUNDLE_ID']}-{case['id']}.sfev"
+        path.write_bytes(capture["bytes"])
+        return {
+            "classification": "passed", "stdout": b"", "stderr": b"", "exit_code": 0,
+            "started_at": started, "ended_at": store._now(),
+            "capture_containers": [{
+                "kind": capture["kind"], "path": str(path),
+                "mime_type": capture.get("mime_type", "application/json"),
+            }],
+        }
+    return driver
 
 
 @pytest.fixture(autouse=True)
@@ -164,12 +163,15 @@ def test_wrong_worktree_with_identical_shas_is_rejected(tmp_path):
     owner_task_id = "owner-task-1"
     run_id = store.record_run_start(
         owner_task_id, "build", "codex", "model", workspace_path=repo_a,
+        recipe_activation=1,
     )
     store.record_run_end(run_id, 0, None, None, 0.1, "done")
 
     payload = _action_payload(repo_a, head, head, tree, instance="wrong-worktree")
     payload["workspace"] = str(repo_b)  # scheduled against the wrong (decoy) worktree
     payload["workspace_owner_task_id"] = owner_task_id
+    payload["workspace_owner_activation"] = 1
+    payload["workspace_owner_run_id"] = run_id
     result = _finish_action(payload)
     assert result["status"] == "failed"
     with store._connect() as db:
@@ -182,12 +184,45 @@ def test_wrong_worktree_with_identical_shas_is_rejected(tmp_path):
 def test_correct_worktree_matching_its_recorded_owner_still_passes(tmp_path):
     repo, head, tree = _repo(tmp_path)
     owner_task_id = "owner-task-2"
-    run_id = store.record_run_start(owner_task_id, "build", "codex", "model", workspace_path=repo)
+    run_id = store.record_run_start(
+        owner_task_id, "build", "codex", "model", workspace_path=repo,
+        recipe_activation=1,
+    )
     store.record_run_end(run_id, 0, None, None, 0.1, "done")
     payload = _action_payload(repo, head, head, tree, instance="right-worktree")
     payload["workspace_owner_task_id"] = owner_task_id
+    payload["workspace_owner_activation"] = 1
+    payload["workspace_owner_run_id"] = run_id
     result = _finish_action(payload)
     assert result["status"] == "done"
+
+
+@pytest.mark.parametrize("attack", ["missing", "older_activation", "foreign_task"])
+def test_workspace_owner_requires_exact_task_activation_and_run(tmp_path, attack):
+    repo, head, tree = _repo(tmp_path)
+    owner_task_id = "exact-owner"
+    if attack == "missing":
+        run_id = 999_999
+    else:
+        run_id = store.record_run_start(
+            "foreign-owner" if attack == "foreign_task" else owner_task_id,
+            "build", "codex", "model", workspace_path=repo,
+            recipe_activation=0 if attack == "older_activation" else 1,
+        )
+        store.record_run_end(run_id, 0, None, None, 0.1, "done")
+    payload = _action_payload(repo, head, head, tree, instance=f"owner-{attack}")
+    payload.update({
+        "workspace_owner_task_id": owner_task_id,
+        "workspace_owner_activation": 1,
+        "workspace_owner_run_id": run_id,
+    })
+    result = verify.run_action(payload)
+    assert result["status"] == "failed"
+    with store._connect() as db:
+        reason = db.execute(
+            "SELECT invalid_reason FROM evidence_bundles WHERE id=?", (result["bundle_id"],),
+        ).fetchone()["invalid_reason"]
+    assert "exact workspace producer run is missing" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -198,55 +233,34 @@ def test_correct_worktree_matching_its_recorded_owner_still_passes(tmp_path):
 def test_stale_capture_copied_into_a_fresh_bundle_is_rejected(tmp_path):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
-    now = store._now()
-
-    bundle_a = _bare_bundle(repo, head, tree, manifest, instance_id="capture-a")
-    root_a = verify._evidence_root("capture-a", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_a, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
+    def source(case, env, started):
+        return {"kind": "trace", "bytes": verify.build_capture_container(
+            "trace", b'{"events":["real trace for run A"]}',
+            instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="clean",
+        )}
+    first = _run(
+        repo, head, tree, manifest, instance_id="capture-a",
+        drivers={"command": _capture_driver(tmp_path, source)},
     )
-    item_a = verify._persist_capture_item(
-        bundle_id=bundle_a, instance_id="capture-a", head_sha=head, case_id="unit-suite",
-        attempt=1, kind="trace", payload=b'{"events": ["real trace for run A"]}',
-        root=root_a, mime_type="application/json", started_at=now, ended_at=now,
-    )
-    verify._seal_bundle(
-        bundle_a, final_state="done", reason=None, phase_b_eligible=True,
-        required_case_ids=["unit-suite"],
-    )
-    stale_bytes = Path(_item_path(item_a["id"])).read_bytes()
-    assert stale_bytes.startswith(verify._CAPTURE_MAGIC)
-
-    # Bundle B: an unrelated, fresh verification run. An attacker (or a
-    # buggy capture step) copies bundle A's stale, internally-consistent
-    # trace bytes wholesale into bundle B's evidence directory.
-    bundle_b = _bare_bundle(repo, head, tree, manifest, instance_id="capture-b")
-    root_b = verify._evidence_root("capture-b", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_b, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
-    )
-    ident_b = verify._item_id(bundle_b, "unit-suite", 1, "trace")
-    forged_path = root_b / "items" / f"{ident_b}.trace"
-    written = verify._copy_once(forged_path, stale_bytes)
-    digest = hashlib.sha256(written).hexdigest()
+    assert first["state"] == "done"
     with store._connect() as db:
-        db.execute(
-            "INSERT INTO evidence_items"
-            "(id,bundle_id,case_id,kind,path,sha256,size_bytes,mime_type,producer,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (ident_b, bundle_b, "unit-suite", "trace", str(forged_path), digest, len(written),
-             "application/json", "verification-runner", json.dumps({"redaction_state": "clean"})),
-        )
-    verify._seal_bundle(
-        bundle_b, final_state="done", reason=None, phase_b_eligible=True,
-        required_case_ids=["unit-suite"],
+        item = db.execute(
+            "SELECT path FROM evidence_items WHERE bundle_id=? AND kind='trace'", (first["id"],),
+        ).fetchone()
+    stale_bytes = Path(item["path"]).read_bytes()
+
+    second = _run(
+        repo, head, tree, manifest, instance_id="capture-b",
+        drivers={"command": _capture_driver(
+            tmp_path, lambda case, env, started: {"kind": "trace", "bytes": stale_bytes},
+        )},
     )
-    with pytest.raises(verify.CaptureContainerError, match="identity does not match"):
-        verify.verify_evidence_bundle(bundle_b)
+    assert second["state"] == "failed"
+    assert "capture container identity does not match" in second["invalid_reason"]
 
 
 def test_evidence_item_bytes_replaced_after_hashing_is_rejected(tmp_path):
@@ -262,6 +276,43 @@ def test_evidence_item_bytes_replaced_after_hashing_is_rejected(tmp_path):
     # manifest's hash was computed and published.
     Path(item["path"]).write_bytes(b"[stdout]\nforged victory\n[stderr]\n")
     with pytest.raises(verify.EvidenceInvariantError, match="hash/size mismatch"):
+        verify.verify_evidence_bundle(bundle["id"])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("instance_id", "drifted-instance"), ("step_id", "drifted-step"),
+    ("activation", 99), ("input_revision_hash", "drifted-revision"),
+    ("base_sha", "0" * 40), ("head_sha", "1" * 40), ("tree_sha", "2" * 40),
+    ("manifest_relpath", ".shipfactory/other.yaml"), ("manifest_blob_sha", "3" * 40),
+    ("environment_session_id", "foreign-env"),
+    ("environment_identity_json", '{"app_session_id":"foreign"}'),
+    ("workspace_path", "/tmp/foreign-workspace"),
+    ("workspace_owner_task_id", "foreign-task"), ("workspace_owner_activation", 7),
+    ("workspace_owner_run_id", 700), ("required_surface", "api"),
+    ("redaction_state", "redacted"), ("phase_b_eligible", 0),
+    ("state", "blocked"), ("invalid_reason", "forged reason"),
+])
+def test_every_sealed_bundle_security_field_rejects_db_drift(tmp_path, field, value):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id=f"drift-{field}")
+    assert bundle["state"] == "done"
+    with store._connect() as db:
+        db.execute(f"UPDATE evidence_bundles SET {field}=? WHERE id=?", (value, bundle["id"]))
+    with pytest.raises(verify.EvidenceInvariantError):
+        verify.verify_evidence_bundle(bundle["id"])
+
+
+def test_sealed_item_manifest_rejects_legitimate_db_rehash_or_metadata_drift(tmp_path):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="item-manifest-drift")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE evidence_items SET producer='foreign-runner' WHERE bundle_id=?",
+            (bundle["id"],),
+        )
+    with pytest.raises(verify.EvidenceInvariantError, match="item DB fields drifted"):
         verify.verify_evidence_bundle(bundle["id"])
 
 
@@ -312,14 +363,147 @@ def test_runner_generated_env_identity_cannot_be_overridden_by_profile(tmp_path)
         )
 
 
+@pytest.mark.parametrize("stale_field", ["base_sha", "candidate_sha", "workspace"])
+def test_run_action_rejects_real_healthy_app_from_stale_environment(tmp_path, stale_field):
+    from shipfactory import spawn
+
+    repo, head, tree = _repo(tmp_path)
+    payload = _action_payload(
+        repo, head, head, tree, instance=f"stale-app-{stale_field}",
+        environment="app", environment_config={"healthcheck_timeout_seconds": 1},
+    )
+    app_key = (
+        f"verification/{payload['instance_id']}/{payload['step_id']}/{payload['activation']}/"
+        f"{hashlib.sha256((head + '|' + head + '|' + str(repo.resolve())).encode()).hexdigest()[:20]}"
+    )
+    stale_workspace = tmp_path / "foreign-workspace"
+    stale_workspace.mkdir()
+    env_values = {
+        "base_sha": "0" * 40 if stale_field == "base_sha" else head,
+        "candidate_sha": "1" * 40 if stale_field == "candidate_sha" else head,
+        "workspace_path": str(stale_workspace if stale_field == "workspace" else repo),
+    }
+    env_id = f"env-{stale_field}"
+    store.insert_env_session(
+        env_id, key=f"key-{stale_field}", manifest_path=".shipfactory/runtime.yaml",
+        manifest_blob_sha="2" * 40, tracked_input_hash="3" * 64,
+        control_plane_risk=False, control_plane_paths=[], lease_key=None,
+        stdout_path=None, stderr_path=None, **env_values,
+    )
+    store.update_env_session_state(env_id, "ready")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True,
+    )
+    token = spawn._capture_start_token(proc.pid, proc)
+    app_id = f"app-{stale_field}"
+    store.insert_app_session(
+        app_id, env_session_id=env_id, request_key=app_key,
+        workspace_path=str(repo), stdout_path=None, stderr_path=None,
+    )
+    store.mark_app_session_bound(
+        app_id, port=9, port_lease_key=f"port-{stale_field}", app_url="http://127.0.0.1:9",
+    )
+    store.mark_app_session_pid(app_id, proc.pid)
+    store.mark_app_session_token(app_id, token)
+    store.update_app_session_state(app_id, "healthy", health_status="200")
+    try:
+        result = verify.run_action(payload)
+    finally:
+        spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
+        proc.wait(timeout=5)
+    assert result["status"] == "blocked"
+    with store._connect() as db:
+        bundle = db.execute(
+            "SELECT invalid_reason FROM evidence_bundles WHERE id=?", (result["bundle_id"],),
+        ).fetchone()
+    assert "environment_identity_mismatch" in bundle["invalid_reason"]
+    assert "environment identity is stale" in bundle["invalid_reason"]
+
+
+def test_run_action_rejects_live_app_reporting_stale_instance_and_head(tmp_path):
+    from shipfactory import spawn
+
+    repo, head, tree = _repo(tmp_path)
+    server = tmp_path / "identity_server.py"
+    port_file = tmp_path / "identity.port"
+    server.write_text(
+        "import http.server, json, pathlib, sys\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        " def do_GET(self):\n"
+        "  body=json.dumps({'instance_id':'prior-instance','head_sha':'0'*40}).encode()\n"
+        "  self.send_response(200); self.send_header('Content-Length',str(len(body)))\n"
+        "  self.end_headers(); self.wfile.write(body)\n"
+        " def log_message(self,*args): pass\n"
+        "s=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(s.server_port))\n"
+        "s.serve_forever()\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(server), str(port_file)], start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    while not port_file.exists() and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not port_file.exists():
+        _out, err = proc.communicate(timeout=5)
+        pytest.skip(f"host loopback unavailable: {err.decode(errors='replace').strip()}")
+    token = spawn._capture_start_token(proc.pid, proc)
+    port = int(port_file.read_text())
+    payload = _action_payload(
+        repo, head, head, tree, instance="current-instance",
+        environment="app", environment_config={"healthcheck_timeout_seconds": 1},
+    )
+    app_key = (
+        f"verification/current-instance/verify/1/"
+        f"{hashlib.sha256((head + '|' + head + '|' + str(repo.resolve())).encode()).hexdigest()[:20]}"
+    )
+    store.insert_env_session(
+        "live-env", key="live-key", base_sha=head, candidate_sha=head,
+        manifest_path=".shipfactory/runtime.yaml", manifest_blob_sha="2" * 40,
+        tracked_input_hash="3" * 64, workspace_path=str(repo), control_plane_risk=False,
+        control_plane_paths=[], lease_key=None, stdout_path=None, stderr_path=None,
+    )
+    store.update_env_session_state("live-env", "ready")
+    store.insert_app_session(
+        "live-app", env_session_id="live-env", request_key=app_key,
+        workspace_path=str(repo), stdout_path=None, stderr_path=None,
+    )
+    store.mark_app_session_bound(
+        "live-app", port=port, port_lease_key="identity-port",
+        app_url=f"http://127.0.0.1:{port}",
+    )
+    store.mark_app_session_pid("live-app", proc.pid)
+    store.mark_app_session_token("live-app", token)
+    store.update_app_session_state("live-app", "healthy", health_status="200")
+    try:
+        result = verify.run_action(payload)
+    finally:
+        spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
+        proc.wait(timeout=5)
+    assert result["status"] == "blocked"
+    with store._connect() as db:
+        reason = db.execute(
+            "SELECT invalid_reason FROM evidence_bundles WHERE id=?", (result["bundle_id"],),
+        ).fetchone()["invalid_reason"]
+    assert "live instance/head identity is stale" in reason
+
+
 # ---------------------------------------------------------------------------
 # §2.4.10 #4 -- command prints "125 passed" but exits nonzero.
 # §2.4.10 #5 -- tests skip/deselect everything and exit zero.
 # ---------------------------------------------------------------------------
 
-def test_fabricated_pass_text_with_nonzero_exit_fails_closed(tmp_path):
+def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_closed(tmp_path):
+    fake_pytest = tmp_path / "pytest"
+    fake_pytest.write_text(
+        "#!/usr/bin/env python3\nprint('125 passed in 0.01s')\n",
+        encoding="utf-8",
+    )
+    fake_pytest.chmod(0o755)
     document = _manifest(
-        argv=["python3", "-c", "print('125 passed in 0.4s'); raise SystemExit(1)"],
+        argv=[str(fake_pytest)],
         oracle={"type": "pytest_summary", "min_passed": 1},
     )
     repo, head, tree = _repo(tmp_path, document)
@@ -346,10 +530,13 @@ def test_naive_output_contains_oracle_is_fooled_by_fabricated_text(tmp_path):
 
 def test_deselected_everything_exits_zero_fails_closed_with_pytest_summary(tmp_path):
     document = _manifest(
-        argv=["python3", "-c", "print('1 deselected in 0.01s')"],
+        argv=[sys.executable, "-m", "pytest", "tests/test_real.py", "-q", "-k", "does-not-match"],
         oracle={"type": "pytest_summary", "min_passed": 1},
     )
     repo, head, tree = _repo(tmp_path, document)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_real.py").write_text("def test_real(): assert True\n")
+    head, tree = _commit(repo, "add a real deselected test")
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest)
     assert bundle["state"] == "blocked"
@@ -357,10 +544,13 @@ def test_deselected_everything_exits_zero_fails_closed_with_pytest_summary(tmp_p
 
 def test_no_tests_ran_exits_zero_fails_closed_with_pytest_summary(tmp_path):
     document = _manifest(
-        argv=["python3", "-c", "print('no tests ran in 0.00s')"],
+        argv=[sys.executable, "-m", "pytest", "empty-tests", "-q"],
         oracle={"type": "pytest_summary", "min_passed": 1},
     )
     repo, head, tree = _repo(tmp_path, document)
+    (repo / "empty-tests").mkdir()
+    (repo / "empty-tests" / ".keep").write_text("")
+    head, tree = _commit(repo, "add empty test directory")
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest)
     assert bundle["state"] == "blocked"
@@ -368,10 +558,15 @@ def test_no_tests_ran_exits_zero_fails_closed_with_pytest_summary(tmp_path):
 
 def test_pytest_summary_requires_zero_failures_even_with_passes(tmp_path):
     document = _manifest(
-        argv=["python3", "-c", "print('3 passed, 1 failed in 0.2s'); raise SystemExit(1)"],
+        argv=[sys.executable, "-m", "pytest", "tests/test_real.py", "-q"],
         oracle={"type": "pytest_summary", "min_passed": 1},
     )
     repo, head, tree = _repo(tmp_path, document)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_real.py").write_text(
+        "def test_pass(): assert True\ndef test_fail(): assert False\n"
+    )
+    head, tree = _commit(repo, "add real pass and failure")
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest)
     assert bundle["state"] == "blocked"
@@ -379,64 +574,122 @@ def test_pytest_summary_requires_zero_failures_even_with_passes(tmp_path):
 
 def test_pytest_summary_honest_pass_seals_done(tmp_path):
     document = _manifest(
-        argv=["python3", "-c", "print('4 passed in 0.1s')"],
+        argv=[sys.executable, "-m", "pytest", "tests/test_real.py", "-q"],
         oracle={"type": "pytest_summary", "min_passed": 3},
     )
     repo, head, tree = _repo(tmp_path, document)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_real.py").write_text(
+        "\n".join(f"def test_{index}(): assert True" for index in range(4)) + "\n"
+    )
+    head, tree = _commit(repo, "add real passing pytest cases")
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest)
     assert bundle["state"] == "done"
 
 
 # ---------------------------------------------------------------------------
-# §2.4.10 #6/#7/#8 -- UI render without backend effect / state before-after
-# reload / stale service-worker cache: real browser oracle evaluation is
-# unimplemented in this codebase. The honest, fail-closed boundary is that
-# the playwright driver NEVER fabricates a pass -- it is unconditionally an
-# infrastructure error, so no UI-only claim can ever seal a bundle "done".
+# §2.4.10 #6/#7/#8 -- real backend, reload, and stale-cache attacks through
+# the production browser subprocess.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("case_id,assertions", [
-    # #6: UI route renders while the required backend side effect never occurs.
-    ("ui-renders-without-backend-effect", [
+@pytest.mark.parametrize("scenario,case_id,assertions", [
+    ("backend", "ui-renders-without-backend-effect", [
         {"type": "visible", "selector": "#success-banner"},
         {"type": "api-status", "request": "/api/orders", "status": 201},
     ]),
-    # #7: state appears correct before refresh and disappears after reload.
-    ("state-before-and-after-reload", [
+    ("reload", "state-before-and-after-reload", [
         {"type": "visible", "selector": "#saved-banner"},
-        {"type": "visible", "selector": "#saved-banner-after-reload"},
     ]),
-    # #8: a service worker / browser cache serves old assets.
-    ("service-worker-serves-old-assets", [
-        {"type": "api-status", "request": "/assets/app.js?fresh-hash", "status": 200},
+    ("cache", "stale-cache-serves-old-assets", [
+        {"type": "visible", "selector": "#fresh-version"},
     ]),
 ])
-def test_playwright_backed_ui_claims_never_silently_pass(tmp_path, case_id, assertions):
+def test_real_browser_catches_backend_reload_and_cache_attacks(
+    tmp_path, scenario, case_id, assertions,
+):
+    server = tmp_path / f"fixture-{scenario}.py"
+    port_file = tmp_path / f"fixture-{scenario}.port"
+    server.write_text(
+        "import http.server, pathlib, sys\n"
+        f"scenario={scenario!r}; count=0\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        " def do_GET(self):\n"
+        "  global count; count += 1\n"
+        "  if scenario=='backend' and self.path.startswith('/api/orders'):\n"
+        "   self.send_response(500); self.end_headers(); return\n"
+        "  if scenario=='reload': body=(b'<div id=\"saved-banner\">saved</div>' if count==1 else b'<div>lost</div>')\n"
+        "  elif scenario=='cache': body=(b'<div id=\"fresh-version\">fresh</div>' if count==1 else b'<div id=\"stale-version\">stale</div>')\n"
+        "  else: body=b'<div id=\"success-banner\">rendered</div>'\n"
+        "  self.send_response(200); self.send_header('Content-Type','text/html')\n"
+        "  self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(body)))\n"
+        "  self.end_headers(); self.wfile.write(body)\n"
+        " def log_message(self,*args): pass\n"
+        "s=http.server.ThreadingHTTPServer(('127.0.0.1',0),H)\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(s.server_port)); s.serve_forever()\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(server), str(port_file)], start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    while not port_file.exists() and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not port_file.exists():
+        _out, err = proc.communicate(timeout=5)
+        pytest.skip(f"host loopback unavailable: {err.decode(errors='replace').strip()}")
+    from shipfactory import spawn
+    token = spawn._capture_start_token(proc.pid, proc)
+    app_url = f"http://127.0.0.1:{int(port_file.read_text())}"
     document = {
         "schema": verify.VERIFICATION_SCHEMA,
         "cases": [{
             "id": case_id, "requirement_ids": ["REQ-UI"], "driver": "playwright",
             "script": "e2e/reload.spec.ts", "assertions": assertions,
         }],
-        "capture": {"video": False, "trace": False, "screenshots": "on-failure"},
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
     }
     repo, head, tree = _repo(tmp_path, document)
     (repo / "e2e").mkdir()
-    (repo / "e2e" / "reload.spec.ts").write_text("// stub\n", encoding="utf-8")
+    (repo / "e2e" / "reload.spec.ts").write_text("// declarative browser case\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "add spec"], cwd=repo, env=_GIT_ENV, check=True)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True).strip()
     manifest = verify.load_verification_manifest(repo, head)
     instance_id = f"pw-{case_id}"
-    bundle = _run(repo, head, tree, manifest, instance_id=instance_id)
+    try:
+        bundle = _run(
+            repo, head, tree, manifest, instance_id=instance_id,
+            environment_identity={"app_url": app_url}, profile=_profile(surface="browser"),
+        )
+    finally:
+        spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
+        proc.wait(timeout=5)
     assert bundle["state"] == "blocked"
-    assert bundle["invalid_reason"] == "test_infrastructure_error"
+    assert bundle["invalid_reason"] == "test_failed"
     assert json.loads(
         (Path(store._db_path()).parent / "runs" / instance_id / "verify" / "1"
          / "evidence" / "bundle.json").read_text()
     )["phase_b_eligible"] is False
+
+
+def test_missing_required_browser_infrastructure_fails_closed(tmp_path):
+    document = {
+        "schema": verify.VERIFICATION_SCHEMA,
+        "cases": [{
+            "id": "browser-required", "requirement_ids": ["REQ-UI"], "driver": "playwright",
+            "script": "e2e/required.spec.ts",
+            "assertions": [{"type": "visible", "selector": "#ok"}],
+        }],
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
+    }
+    repo, head, tree = _repo(tmp_path, document)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="browser-missing")
+    assert bundle["state"] == "blocked"
+    assert bundle["invalid_reason"] == "test_infrastructure_error"
 
 
 # ---------------------------------------------------------------------------
@@ -445,76 +698,287 @@ def test_playwright_backed_ui_claims_never_silently_pass(tmp_path, case_id, asse
 # §2.4.10 #17 -- reviewer and builder share a provider despite different seats.
 # ---------------------------------------------------------------------------
 
-def _seed_review_instance(conn, tmp_path, repo, head, tree, *, instance_id):
-    """Seed just enough real state (recipe_instances row + real kanban tasks)
-    for `_review_approval_blocker` to resolve workspace/seat identity through
-    its real dependencies, without needing a full recipe/reconcile harness.
-    """
+def _seed_review_instance(
+    conn, tmp_path, repo, head, tree, *, instance_id, bind_review_inputs=True,
+):
+    """Activate a real v2 review task with Factory-opened transitive evidence."""
     from hermes_cli import kanban_db
+    from shipfactory.recipes import primitives
+
+    seats = Path(os.environ["HERMES_HOME"]) / "shipfactory" / "seats.yaml"
+    seats.parent.mkdir(parents=True, exist_ok=True)
+    seats.write_text(
+        "company: test\nseats:\n"
+        "  dev-backend: {profile: default, executor: codex, model: gpt, role: engineer}\n"
+        "  qa: {profile: default, executor: claude, model: sonnet, role: qa}\n",
+        encoding="utf-8",
+    )
     with store._connect() as db:
         db.execute(
             "INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,"
             "recipe_hash,status,parameters_json,activation_count,tokens_charged,blocked_reason,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "created_at,updated_at,base_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (instance_id, "test", "collector", "fake", 1, "hash", "running", "{}", 0, 0, None,
-             store._now(), store._now()),
+             store._now(), store._now(), head),
         )
     build_task_id = kanban_db.create_task(
         conn, title="build", body="build", assignee="dev-backend",
         workspace_kind="worktree", board="test", workspace_path=str(repo),
     )
-    review_task_id = kanban_db.create_task(
-        conn, title="review", body="review", assignee="qa", board="test",
+    producer_run_id = store.record_run_start(
+        build_task_id, "dev-backend", "codex", "gpt", workspace_path=repo,
+        recipe_activation=1,
     )
+    store.record_run_end(producer_run_id, 0, 1, 1, 0.1, "done")
     definition = {
-        "id": "review", "primitive": "review_gate", "needs": ["verify"],
+        "id": "review", "title": "review", "primitive": "review_gate", "needs": ["verify"],
         "inputs": [{"from": "build", "kind": "change-set", "required": False}],
-        "params": {"seat": "qa"},
+        "params": {"seat": "qa", "workspace": "dir", "instructions": "review exact inputs"},
     }
-    defs = {
-        "build": {"id": "build", "primitive": "agent_task", "params": {"seat": "dev-backend"}},
-        "verify": {"id": "verify", "primitive": "verification"},
-        "review": definition,
-    }
+    steps = [
+        {"id": "build", "title": "build", "primitive": "agent_task", "needs": [],
+         "inputs": [], "params": {"seat": "dev-backend", "workspace": "worktree"}},
+        {"id": "verify", "title": "verify", "primitive": "verification", "needs": ["build"],
+         "inputs": [], "params": {}},
+        definition,
+    ]
+    recipe = {"schema": "shipfactory.recipe/v2", "id": "fake", "version": 1, "steps": steps}
+    defs = {item["id"]: item for item in steps}
+    now = store._now()
+    with store._connect() as db:
+        for step_id, primitive, task_id in (
+            ("build", "agent_task", build_task_id), ("verify", "verification", None),
+            ("review", "review_gate", None),
+        ):
+            db.execute(
+                "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,"
+                "kanban_task_id,producer_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (instance_id, step_id, 1, primitive, "active", task_id,
+                 producer_run_id if step_id == "build" else None, now, now),
+            )
+        instance = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone())
+        if bind_review_inputs:
+            review_task_id = primitives.activate(
+                conn, instance, recipe, definition,
+                {"step_id": "review", "activation": 1}, {}, [], db=db,
+            )
+        else:
+            review_task_id = kanban_db.create_task(
+                conn, title="review", body="unbound review", assignee="qa", board="test",
+            )
+        db.execute(
+            "UPDATE recipe_steps SET kanban_task_id=? WHERE instance_id=? AND step_id='review'",
+            (review_task_id, instance_id),
+        )
     latest = {
         "build": {"step_id": "build", "kanban_task_id": build_task_id},
         "verify": {"step_id": "verify", "kanban_task_id": None},
         "review": {"step_id": "review", "kanban_task_id": review_task_id},
     }
-    return definition, defs, latest
+    return definition, defs, latest, recipe
 
 
-def test_approval_without_citing_the_sealed_bundle_is_blocked(tmp_path, kanban_conn):
+def test_review_task_without_factory_opened_sealed_inputs_is_blocked(tmp_path, kanban_conn):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-nocite", step_id="verify")
     assert bundle["state"] == "done"
-    definition, defs, latest = _seed_review_instance(
+    definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-nocite",
+        bind_review_inputs=False,
     )
     with store._connect() as db:
         blocker = advancer._review_approval_blocker(
             db, "rvw-nocite", definition, verdict_body="APPROVE clean pass",
-            defs=defs, conn=kanban_conn, latest=latest,
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
-    assert blocker == "evidence_not_cited"
+    assert blocker == "review_inputs_not_bound"
 
 
-def test_approval_citing_the_exact_sealed_bundle_is_allowed(tmp_path, kanban_conn):
+def test_approval_uses_factory_opened_bundle_bytes_not_hash_testimony(tmp_path, kanban_conn):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-cite", step_id="verify")
     assert bundle["state"] == "done"
-    definition, defs, latest = _seed_review_instance(
+    definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-cite",
     )
     with store._connect() as db:
         blocker = advancer._review_approval_blocker(
             db, "rvw-cite", definition,
-            verdict_body=f"APPROVE reviewed sealed bundle {bundle['bundle_sha256']}",
-            defs=defs, conn=kanban_conn, latest=latest,
+            verdict_body="APPROVE after opening Factory-supplied inputs",
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker is None
+    from hermes_cli import kanban_db
+    task = kanban_db.get_task(kanban_conn, latest["review"]["kanban_task_id"])
+    assert "SHIPFACTORY_REVIEW_INPUT_SHA256:" in task.body
+    assert bundle["bundle_sha256"] in task.body
+
+
+def test_adversarial_review_receives_transitive_bundle_and_retry_history(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+    from shipfactory.recipes import primitives
+
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    def fail(case, workspace, env, timeout):
+        now = store._now()
+        return {"classification": "failed", "stdout": b"", "stderr": b"",
+                "exit_code": 1, "started_at": now, "ended_at": now}
+    first = _run(
+        repo, head, tree, manifest, instance_id="rvw-chain", step_id="verify",
+        activation=1, drivers={"command": fail},
+    )
+    second = _run(
+        repo, head, tree, manifest, instance_id="rvw-chain", step_id="verify", activation=2,
+    )
+    assert first["state"] == "blocked" and second["state"] == "done"
+    _definition, _defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-chain",
+    )
+    adversarial = {
+        "id": "adversarial-review", "title": "adversarial review",
+        "primitive": "review_gate", "needs": ["review"],
+        "inputs": [{"from": "build", "kind": "change-set", "required": False}],
+        "params": {"seat": "qa", "workspace": "dir", "instructions": "attack exact inputs"},
+    }
+    recipe["steps"].append(adversarial)
+    defs = {item["id"]: item for item in recipe["steps"]}
+    now = store._now()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("rvw-chain", "adversarial-review", 1, "review_gate", "active", now, now),
+        )
+        instance = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id='rvw-chain'",
+        ).fetchone())
+        task_id = primitives.activate(
+            kanban_conn, instance, recipe, adversarial,
+            {"step_id": "adversarial-review", "activation": 1}, {}, [], db=db,
+        )
+        db.execute(
+            "UPDATE recipe_steps SET kanban_task_id=? WHERE instance_id='rvw-chain' "
+            "AND step_id='adversarial-review'",
+            (task_id,),
+        )
+    latest["adversarial-review"] = {
+        "step_id": "adversarial-review", "kanban_task_id": task_id,
+    }
+    task = kanban_db.get_task(kanban_conn, task_id)
+    assert first["bundle_sha256"] in task.body
+    assert second["bundle_sha256"] in task.body
+    assert '"activation":1' in task.body and '"activation":2' in task.body
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-chain", adversarial,
+            verdict_body="APPROVE after Factory supplied the transitive history",
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker is None
+
+
+def test_review_task_gets_exact_sealed_spec_plan_change_set_diff_and_bundle(
+    tmp_path, kanban_conn,
+):
+    from hermes_cli import kanban_db
+    from shipfactory import artifacts
+    from shipfactory.recipes import primitives
+
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="rvw-full-inputs", step_id="verify")
+    _definition, _defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-full-inputs",
+        bind_review_inputs=False,
+    )
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
+            "VALUES('fake',1,'hash','active',?,?)",
+            (json.dumps({"schema": "shipfactory.recipe/v2", "budgets": {}}), store._now()),
+        )
+    output_dir = repo / ".shipfactory-output"
+    output_dir.mkdir(exist_ok=True)
+    spec_document = {
+        "schema": "shipfactory.task-spec/v1", "intent_artifact_id": "a" * 64,
+        "problem": "Review the exact candidate bytes.", "non_goals": [],
+        "requirements": [{"id": "REQ-1", "behavior": "Bind every review input.",
+                          "oracle": "Factory opens sealed bytes.", "risk": "security"}],
+        "target_files": ["tracked.txt"], "forbidden_paths": [], "risk_tags": ["security"],
+        "acceptance_cases": ["unit-suite"], "rollback_notes": "Revert.",
+        "assumptions": [], "clarifications": [],
+    }
+    (output_dir / "spec.json").write_text(json.dumps(spec_document), encoding="utf-8")
+    spec = artifacts.seal_artifact(
+        instance_id="rvw-full-inputs", step_id="spec", activation=1, run_id=101,
+        output={"kind": "task-spec", "schema": "shipfactory.task-spec/v1",
+                "path": ".shipfactory-output/spec.json"},
+        workspace=repo, producer="test",
+    )
+    (output_dir / "spec.json").unlink()
+    plan_document = {
+        "schema": "shipfactory.plan/v1", "task_spec_sha256": spec["sha256"],
+        "base_sha": head,
+        "nodes": [{"id": "build", "title": "Build", "needs": [], "kind": "implementation",
+                   "requirements": ["REQ-1"], "allowed_paths": ["tracked.txt"],
+                   "expected_outputs": ["change-set"], "test_cases": ["TEST-REQ-1"],
+                   "risk_tags": ["security"]}],
+        "integration_order": ["build"], "shared_file_overlaps": [], "residual_risks": [],
+    }
+    (output_dir / "plan.json").write_text(json.dumps(plan_document), encoding="utf-8")
+    plan = artifacts.seal_artifact(
+        instance_id="rvw-full-inputs", step_id="plan", activation=1, run_id=102,
+        output={"kind": "plan", "schema": "shipfactory.plan/v1",
+                "path": ".shipfactory-output/plan.json"},
+        workspace=repo, producer="test",
+    )
+    (output_dir / "plan.json").unlink()
+    build = next(item for item in recipe["steps"] if item["id"] == "build")
+    build["needs"] = ["plan"]
+    recipe["steps"][:0] = [
+        {"id": "spec", "title": "spec", "primitive": "agent_task", "needs": [],
+         "inputs": [], "params": {"seat": "dev-backend", "workspace": "dir"}},
+        {"id": "plan", "title": "plan", "primitive": "agent_task", "needs": ["spec"],
+         "inputs": [{"from": "spec", "kind": "task-spec", "required": True}],
+         "params": {"seat": "dev-backend", "workspace": "dir"}},
+    ]
+    full_review = {
+        "id": "full-review", "title": "full review", "primitive": "review_gate",
+        "needs": ["review"],
+        "inputs": [{"from": "build", "kind": "change-set", "required": True}],
+        "params": {"seat": "qa", "workspace": "dir", "instructions": "review everything"},
+    }
+    recipe["steps"].append(full_review)
+    now = store._now()
+    with store._connect() as db:
+        for step_id in ("spec", "plan"):
+            db.execute(
+                "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,"
+                "created_at,updated_at) VALUES(?,?,1,'agent_task','done',?,?)",
+                ("rvw-full-inputs", step_id, now, now),
+            )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) "
+            "VALUES(?,?,1,'review_gate','active',?,?)",
+            ("rvw-full-inputs", "full-review", now, now),
+        )
+        instance = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id='rvw-full-inputs'",
+        ).fetchone())
+        task_id = primitives.activate(
+            kanban_conn, instance, recipe, full_review,
+            {"step_id": "full-review", "activation": 1}, {}, [], db=db,
+        )
+    task = kanban_db.get_task(kanban_conn, task_id)
+    assert spec["sha256"] in task.body and plan["sha256"] in task.body
+    assert bundle["bundle_sha256"] in task.body
+    assert '"producer_run_id":' in task.body and '"bytes_b64":' in task.body
+    assert '"sealed_bytes_b64":' in task.body
 
 
 def test_approval_after_candidate_mutates_workspace_post_verification_is_blocked(tmp_path, kanban_conn):
@@ -522,7 +986,7 @@ def test_approval_after_candidate_mutates_workspace_post_verification_is_blocked
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-mutate", step_id="verify")
     assert bundle["state"] == "done"
-    definition, defs, latest = _seed_review_instance(
+    definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-mutate",
     )
     # Candidate silently edits the reviewed worktree after verification sealed
@@ -532,7 +996,7 @@ def test_approval_after_candidate_mutates_workspace_post_verification_is_blocked
         blocker = advancer._review_approval_blocker(
             db, "rvw-mutate", definition,
             verdict_body=f"APPROVE reviewed sealed bundle {bundle['bundle_sha256']}",
-            defs=defs, conn=kanban_conn, latest=latest,
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker is not None and blocker.startswith("candidate_mutated_after_verification")
 
@@ -543,14 +1007,14 @@ def test_approval_when_verification_never_passed_is_blocked(tmp_path, kanban_con
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-failed", step_id="verify")
     assert bundle["state"] == "blocked"
-    definition, defs, latest = _seed_review_instance(
+    definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-failed",
     )
     with store._connect() as db:
         blocker = advancer._review_approval_blocker(
             db, "rvw-failed", definition,
             verdict_body=f"APPROVE reviewed sealed bundle {bundle['bundle_sha256']}",
-            defs=defs, conn=kanban_conn, latest=latest,
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker == "verification_not_passed"
 
@@ -563,7 +1027,7 @@ def test_reviewer_sharing_builder_provider_despite_distinct_seat_names():
                 name="dev-backend", profile="claude-default", executor="claude", model="opus",
             ),
             "qa": config.Seat(
-                name="qa", profile="claude-default", executor="claude", model="opus",
+                name="qa", profile="claude-review", executor="claude", model="sonnet",
             ),
             "architect": config.Seat(
                 name="architect", profile="codex-default", executor="codex", model="gpt",
@@ -573,7 +1037,9 @@ def test_reviewer_sharing_builder_provider_despite_distinct_seat_names():
     )
     assert config.reviewer_shares_builder_provider(cfg, "dev-backend", "qa") is True
     assert config.reviewer_shares_builder_provider(cfg, "dev-backend", "architect") is False
-    assert config.reviewer_shares_builder_provider(cfg, "dev-backend", "dev-backend") is False
+    assert config.reviewer_shares_builder_provider(cfg, "dev-backend", "dev-backend") is True
+    with pytest.raises(config.FactoryConfigError):
+        config.reviewer_shares_builder_provider(cfg, "dev-backend", "missing-seat")
 
 
 def test_review_approval_blocked_when_reviewer_and_builder_collude_on_provider(
@@ -581,29 +1047,44 @@ def test_review_approval_blocked_when_reviewer_and_builder_collude_on_provider(
 ):
     from hermes_cli import profiles as hermes_profiles
     monkeypatch.setattr(hermes_profiles, "profile_exists", lambda name: True)
-    home = Path(os.environ["HERMES_HOME"]) / "shipfactory"
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "seats.yaml").write_text(
-        "company: acme\n"
-        "seats:\n"
-        "  dev-backend: {profile: shared-profile, executor: claude, model: opus, role: engineer}\n"
-        "  qa: {profile: shared-profile, executor: claude, model: opus, role: qa}\n",
-        encoding="utf-8",
-    )
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-collude", step_id="verify")
     assert bundle["state"] == "done"
-    definition, defs, latest = _seed_review_instance(
+    definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-collude",
+    )
+    home = Path(os.environ["HERMES_HOME"]) / "shipfactory"
+    (home / "seats.yaml").write_text(
+        "company: acme\nseats:\n"
+        "  dev-backend: {profile: build-profile, executor: claude, model: opus, role: engineer}\n"
+        "  qa: {profile: review-profile, executor: claude, model: sonnet, role: qa}\n",
+        encoding="utf-8",
     )
     with store._connect() as db:
         blocker = advancer._review_approval_blocker(
             db, "rvw-collude", definition,
             verdict_body=f"APPROVE reviewed sealed bundle {bundle['bundle_sha256']}",
-            defs=defs, conn=kanban_conn, latest=latest,
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker == "reviewer_shares_builder_provider"
+
+
+def test_review_provider_lookup_error_fails_closed(tmp_path, kanban_conn):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    _run(repo, head, tree, manifest, instance_id="rvw-provider-missing", step_id="verify")
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-provider-missing",
+    )
+    (Path(os.environ["HERMES_HOME"]) / "shipfactory" / "seats.yaml").unlink()
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-provider-missing", definition,
+            verdict_body="APPROVE after opening exact inputs", recipe=recipe,
+            defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker.startswith("reviewer_provider_unresolved:")
 
 
 # ---------------------------------------------------------------------------
@@ -684,55 +1165,40 @@ def test_control_plane_not_touched_when_manifest_is_untouched(tmp_path):
 def test_secret_in_trace_payload_is_redacted(tmp_path):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
-    now = store._now()
-    bundle_id = _bare_bundle(repo, head, tree, manifest, instance_id="trace-secret")
-    root = verify._evidence_root("trace-secret", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_id, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
+    raw_secret = json.dumps({
+        "headers": {"authorization": "Bearer sk-supersecrettoken1234567890"},
+    }).encode()
+    def unredacted(case, env, started):
+        return {"kind": "trace", "bytes": verify.build_capture_container(
+            "trace", raw_secret, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="clean",
+        )}
+    bundle = _run(
+        repo, head, tree, manifest, instance_id="trace-secret",
+        drivers={"command": _capture_driver(tmp_path, unredacted)},
     )
-    payload = json.dumps({"headers": {"authorization": "Bearer sk-supersecrettoken1234567890"}}).encode()
-    item = verify._persist_capture_item(
-        bundle_id=bundle_id, instance_id="trace-secret", head_sha=head, case_id="unit-suite",
-        attempt=1, kind="trace", payload=payload, root=root, mime_type="application/json",
-        started_at=now, ended_at=now,
-    )
-    assert item["redaction_state"] == "redacted"
-    _header, sealed_payload = verify._parse_capture_container(
-        Path(_item_path(item["id"])).read_bytes(),
-    )
-    assert b"supersecrettoken" not in sealed_payload
-    assert b"[REDACTED]" in sealed_payload
-    sealed = verify._seal_bundle(
-        bundle_id, final_state="done", reason=None, phase_b_eligible=True,
-        required_case_ids=["unit-suite"],
-    )
-    assert sealed["state"] == "done"
-    verify.verify_evidence_bundle(bundle_id)  # container + redaction both hold up
+    assert bundle["state"] == "failed"
+    assert "not structurally redacted" in bundle["invalid_reason"]
 
 
 def test_screenshot_capture_always_blocks_sealing_as_uncertain(tmp_path):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
-    now = store._now()
-    bundle_id = _bare_bundle(repo, head, tree, manifest, instance_id="screenshot-secret")
-    root = verify._evidence_root("screenshot-secret", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_id, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
-    )
     fake_png = b"\x89PNG\r\n\x1a\n" + b"pixels-that-might-contain-a-visible-api-key" * 4
-    item = verify._persist_capture_item(
-        bundle_id=bundle_id, instance_id="screenshot-secret", head_sha=head, case_id="unit-suite",
-        attempt=1, kind="screenshot", payload=fake_png, root=root, mime_type="image/png",
-        started_at=now, ended_at=now,
-    )
-    assert item["redaction_state"] == "uncertain"
-    sealed = verify._seal_bundle(
-        bundle_id, final_state="done", reason=None, phase_b_eligible=True,
-        required_case_ids=["unit-suite"],
+    def screenshot(case, env, started):
+        return {"kind": "screenshot", "mime_type": "image/png", "bytes": verify.build_capture_container(
+            "screenshot", fake_png, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="uncertain",
+        )}
+    sealed = _run(
+        repo, head, tree, manifest, instance_id="screenshot-secret",
+        drivers={"command": _capture_driver(tmp_path, screenshot)},
     )
     assert sealed["state"] == "blocked"
     assert "redaction is uncertain" in sealed["invalid_reason"]
@@ -745,38 +1211,84 @@ def test_screenshot_capture_always_blocks_sealing_as_uncertain(tmp_path):
 def test_har_cookies_and_auth_headers_are_stripped(tmp_path):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
-    now = store._now()
-    bundle_id = _bare_bundle(repo, head, tree, manifest, instance_id="har-secret")
-    root = verify._evidence_root("har-secret", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_id, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
-    )
+    # Reordered name/value keys and nested HAR cookie objects are the attack;
+    # the production parent independently rejects a runner that labels these
+    # bytes clean instead of preserving structurally valid redacted JSON.
     har_payload = json.dumps({
         "log": {"entries": [{"request": {"headers": [
-            {"name": "Cookie", "value": "session=abc123secret; csrftoken=xyz789"},
-            {"name": "Authorization", "value": "Bearer sk-realtoken1234567890abcdef"},
+            {"value": "session=abc123secret; csrftoken=xyz789", "name": "Cookie"},
+            {"value": "Bearer sk-realtoken1234567890abcdef", "name": "Authorization"},
             {"name": "Accept", "value": "application/json"},
-        ]}}]},
+        ], "cookies": [{"value": "nested-cookie-secret", "name": "session"}]}}]},
     }).encode()
-    item = verify._persist_capture_item(
-        bundle_id=bundle_id, instance_id="har-secret", head_sha=head, case_id="unit-suite",
-        attempt=1, kind="har", payload=har_payload, root=root, mime_type="application/json",
-        started_at=now, ended_at=now,
+    def dishonest_runner(case, env, started):
+        return {"kind": "har", "bytes": verify.build_capture_container(
+            "har", har_payload, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="clean",
+        )}
+    rejected = _run(
+        repo, head, tree, manifest, instance_id="har-secret",
+        drivers={"command": _capture_driver(tmp_path, dishonest_runner)},
     )
-    assert item["redaction_state"] == "redacted"
-    _header, sealed_payload = verify._parse_capture_container(
-        Path(_item_path(item["id"])).read_bytes(),
+    assert rejected["state"] == "failed"
+    assert "not structurally redacted" in rejected["invalid_reason"]
+
+    redacted_document = json.loads(har_payload)
+    headers = redacted_document["log"]["entries"][0]["request"]["headers"]
+    headers[0]["value"] = headers[1]["value"] = "[REDACTED]"
+    redacted_document["log"]["entries"][0]["request"]["cookies"][0]["value"] = "[REDACTED]"
+    redacted_payload = json.dumps(
+        redacted_document, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    def honest_runner(case, env, started):
+        return {"kind": "har", "bytes": verify.build_capture_container(
+            "har", redacted_payload, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="redacted",
+        )}
+    sealed = _run(
+        repo, head, tree, manifest, instance_id="har-redacted",
+        drivers={"command": _capture_driver(tmp_path, honest_runner)},
     )
-    assert b"abc123secret" not in sealed_payload
-    assert b"sk-realtoken1234567890abcdef" not in sealed_payload
-    assert b"[REDACTED]" in sealed_payload
-    # A header that was never secret survives untouched -- redaction must be
-    # targeted, not a blanket wipe of the evidence.
-    assert b"application/json" in sealed_payload
-    document = json.loads(sealed_payload)
-    assert document["log"]["entries"]  # still valid, parseable JSON after redaction
+    assert sealed["state"] == "done"
+    with store._connect() as db:
+        item = db.execute(
+            "SELECT path FROM evidence_items WHERE bundle_id=? AND kind='har'", (sealed["id"],),
+        ).fetchone()
+    _header, payload = verify._parse_capture_container(Path(item["path"]).read_bytes())
+    assert json.loads(payload)["log"]["entries"]
+    assert b"nested-cookie-secret" not in payload and b"application/json" in payload
+
+
+def test_binary_trace_is_never_rewritten_or_reported_clean(tmp_path):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    binary = b"PK\x03\x04\x00\xff\xfeAUTHORIZATION=binary-secret"
+    def binary_runner(case, env, started):
+        return {"kind": "trace", "bytes": verify.build_capture_container(
+            "trace", binary, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="uncertain",
+        )}
+    bundle = _run(
+        repo, head, tree, manifest, instance_id="binary-trace",
+        drivers={"command": _capture_driver(tmp_path, binary_runner)},
+    )
+    assert bundle["state"] == "blocked"
+    assert "redaction is uncertain" in bundle["invalid_reason"]
+    with store._connect() as db:
+        item = db.execute(
+            "SELECT path FROM evidence_items WHERE bundle_id=? AND kind='trace'", (bundle["id"],),
+        ).fetchone()
+    _header, payload = verify._parse_capture_container(Path(item["path"]).read_bytes())
+    assert payload == binary
 
 
 def test_review_approval_blocker_reverifies_bundle_integrity_not_just_the_db_row(
@@ -792,17 +1304,17 @@ def test_review_approval_blocker_reverifies_bundle_integrity_not_just_the_db_row
         item = dict(db.execute(
             "SELECT * FROM evidence_items WHERE bundle_id=?", (bundle["id"],),
         ).fetchone())
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-tampered",
+    )
     # Tamper with the sealed evidence bytes after sealing, without touching
     # the evidence_bundles row itself.
     Path(item["path"]).write_bytes(b"[stdout]\nforged after seal\n[stderr]\n")
-    definition, defs, latest = _seed_review_instance(
-        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-tampered",
-    )
     with store._connect() as db:
         blocker = advancer._review_approval_blocker(
             db, "rvw-tampered", definition,
             verdict_body=f"APPROVE reviewed sealed bundle {bundle['bundle_sha256']}",
-            defs=defs, conn=kanban_conn, latest=latest,
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker is not None and blocker.startswith("evidence_invariant:")
 
@@ -811,34 +1323,76 @@ def test_review_approval_blocker_reverifies_bundle_integrity_not_just_the_db_row
 # §2.4.10 #12 -- ffmpeg hangs after tests finish.
 # ---------------------------------------------------------------------------
 
-def test_supervised_sidecar_that_ignores_sigterm_is_forcibly_reaped(tmp_path):
-    home = Path(os.environ["HERMES_HOME"]) / "shipfactory" / "sidecar-home"
-    home.mkdir(parents=True, exist_ok=True)
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home)}
-    script = (
-        "import signal, time\n"
+def test_production_browser_sidecar_that_ignores_sigterm_is_forcibly_reaped(
+    tmp_path, monkeypatch,
+):
+    wrapper = tmp_path / "hung-capture-provider.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, signal, sys, time\n"
+        "request = json.loads(pathlib.Path(sys.argv[-1]).read_text())\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "time.sleep(60)\n"
+        "pathlib.Path(request['ready_path']).write_text('ready\\n')\n"
+        "while True: time.sleep(1)\n",
+        encoding="utf-8",
     )
-    proc, token = verify.run_supervised_sidecar(
-        ["python3", "-c", script], cwd=tmp_path, env=env,
-    )
-    # Give the child a moment to install its SIGTERM handler for real.
-    deadline = time.monotonic() + 5
-    while proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert proc.poll() is None  # still alive, ignoring signals as ffmpeg-that-hung would
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(verify, "_playwright_python", lambda: str(wrapper))
+    repo, head, _tree = _repo(tmp_path)
+    case = {
+        "id": "hung-capture", "requirement_ids": ["REQ-UI"], "driver": "playwright",
+        "script": "e2e/hung.spec.ts", "assertions": [{"type": "visible", "selector": "#ok"}],
+    }
+    env = {
+        "SHIPFACTORY_INSTANCE_ID": "hung-sidecar", "SHIPFACTORY_HEAD_SHA": head,
+        "SHIPFACTORY_EVIDENCE_BUNDLE_ID": "hung-sidecar:verify:1",
+        "SHIPFACTORY_CASE_ID": "hung-capture", "SHIPFACTORY_CASE_ATTEMPT": "1",
+        "SHIPFACTORY_CAPTURE_POLICY": "{}", "SHIPFACTORY_ENV_APP_URL": "http://127.0.0.1:9",
+    }
     started = time.monotonic()
-    exit_code = verify.stop_supervised_sidecar(proc, token, grace_seconds=0.5)
+    result = verify._playwright_driver(case, repo, env, 1)
     elapsed = time.monotonic() - started
     assert elapsed < 10, "sidecar cleanup must not hang evidence collection"
-    assert exit_code != 0
-    try:
-        os.kill(proc.pid, 0)
-        alive = True
-    except OSError:
-        alive = False
-    assert not alive, "SIGTERM-ignoring sidecar must be SIGKILLed, not left running"
+    assert result["classification"] == "timeout"
+    assert verify._SIDECAR_TRACKERS == {}
+
+
+def test_process_scope_enumeration_system_error_fails_closed():
+    """A transient macOS proc_environ failure cannot be labelled complete."""
+
+    class FakePsutilError(Exception):
+        pass
+
+    class RootProcess:
+        def children(self, recursive=False):
+            return []
+
+    class BrokenCandidate:
+        pid = 987_654
+
+        def environ(self):
+            raise SystemError("proc_environ returned a result with an exception set")
+
+    class FakePsutil:
+        Error = FakePsutilError
+
+        def Process(self, pid):
+            return RootProcess()
+
+        def process_iter(self, attrs):
+            return [BrokenCandidate()]
+
+    tracker = object.__new__(verify._ProcessTreeTracker)
+    tracker.__dict__["_psutil"] = FakePsutil()
+    tracker.__dict__["proc"] = type("Leader", (), {"pid": 123_456})()
+    tracker.scope = "scope"
+    tracker.identities = {}
+    tracker.available = True
+
+    tracker._scan()
+
+    assert tracker.available is False
+    assert tracker.identities == {}
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1415,7 @@ def test_detached_grandchild_does_not_outlive_a_normally_exiting_case(tmp_path):
         "grandchild = subprocess.Popen(\n"
         f"    [sys.executable, {str(grandchild_script)!r}],\n"
         "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "    start_new_session=True,\n"
         ")\n"  # no pipes inherited -> the launcher's own communicate() can return promptly
         f"pathlib_pid_file = {str(pid_file)!r}\n"
         "open(pathlib_pid_file, 'w').write(str(grandchild.pid))\n"
@@ -885,20 +1440,28 @@ def test_detached_grandchild_does_not_outlive_a_normally_exiting_case(tmp_path):
         time.sleep(0.05)
     assert marker.exists(), "grandchild must have actually started for this test to be meaningful"
     grandchild_pid = int(pid_file.read_text())
+    with store._connect() as db:
+        metadata = json.loads(db.execute(
+            "SELECT metadata_json FROM evidence_items WHERE bundle_id=? AND kind='log'",
+            (bundle["id"],),
+        ).fetchone()["metadata_json"])
+    if metadata["process_tree_supervision"] != "complete":
+        from shipfactory import spawn
+        token = spawn._process_start_token(grandchild_pid)
+        spawn.verified_killpg(grandchild_pid, token, signal.SIGKILL)
+        pytest.skip("host process-scope enumeration unavailable in this sandbox")
 
     deadline = time.monotonic() + 5
     alive = True
     while time.monotonic() < deadline:
         try:
-            os.kill(grandchild_pid, 0)
-        except OSError:
+            import psutil
+            descendant = psutil.Process(grandchild_pid)
+            alive = descendant.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, ProcessLookupError):
             alive = False
+        if not alive:
             break
-        # opportunistically reap our own child to avoid a zombie masking liveness
-        try:
-            os.waitpid(grandchild_pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
         time.sleep(0.05)
     assert not alive, "the launcher exited, but its grandchild ('the app') was left running"
 
@@ -910,41 +1473,22 @@ def test_detached_grandchild_does_not_outlive_a_normally_exiting_case(tmp_path):
 def test_truncated_capture_with_a_valid_header_is_rejected(tmp_path):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
-    now = store._now()
-    bundle_id = _bare_bundle(repo, head, tree, manifest, instance_id="truncated-capture")
-    root = verify._evidence_root("truncated-capture", "verify", 1)
-    verify._record_case(
-        bundle_id=bundle_id, case_id="unit-suite", attempt=1,
-        case=manifest.document["cases"][0], status="passed", item_ids=[],
-        started_at=now, ended_at=now,
-    )
     full_payload = b'{"frames": "' + b"X" * 2000 + b'"}'
-    container = verify.build_capture_container(
-        "trace", full_payload, instance_id="truncated-capture", head_sha=head,
-        bundle_id=bundle_id, case_id="unit-suite", attempt=1, captured_at=now,
-    )
-    # Simulate a capture pipeline that crashed mid-write: the header (written
-    # first, declaring the full intended length) survived; only a prefix of
-    # the actual payload made it to disk.
-    truncated = container[: len(container) - 500]
-    ident = verify._item_id(bundle_id, "unit-suite", 1, "trace")
-    path = root / "items" / f"{ident}.trace"
-    written = verify._copy_once(path, truncated)
-    digest = hashlib.sha256(written).hexdigest()
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO evidence_items"
-            "(id,bundle_id,case_id,kind,path,sha256,size_bytes,mime_type,producer,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (ident, bundle_id, "unit-suite", "trace", str(path), digest, len(written),
-             "application/json", "verification-runner", json.dumps({"redaction_state": "clean"})),
+    def truncated_runner(case, env, started):
+        container = verify.build_capture_container(
+            "trace", full_payload, instance_id=env["SHIPFACTORY_INSTANCE_ID"],
+            head_sha=env["SHIPFACTORY_HEAD_SHA"],
+            bundle_id=env["SHIPFACTORY_EVIDENCE_BUNDLE_ID"], case_id=case["id"],
+            attempt=int(env["SHIPFACTORY_CASE_ATTEMPT"]), captured_at=started,
+            redaction_state="clean",
         )
-    verify._seal_bundle(
-        bundle_id, final_state="done", reason=None, phase_b_eligible=True,
-        required_case_ids=["unit-suite"],
+        return {"kind": "trace", "bytes": container[:-500]}
+    bundle = _run(
+        repo, head, tree, manifest, instance_id="truncated-capture",
+        drivers={"command": _capture_driver(tmp_path, truncated_runner)},
     )
-    with pytest.raises(verify.CaptureContainerError, match="truncated or replaced"):
-        verify.verify_evidence_bundle(bundle_id)
+    assert bundle["state"] == "failed"
+    assert "payload was truncated or replaced" in bundle["invalid_reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -1131,20 +1675,47 @@ def test_profile_below_the_deterministic_surface_floor_fails_closed(tmp_path):
     assert "below the deterministic floor" in bundle["invalid_reason"]
 
 
-def test_profile_without_a_declared_surface_is_unaffected_by_the_floor(tmp_path):
-    """Opt-in: profiles that never declared `surface` keep their prior behavior."""
+def test_profile_without_a_declared_surface_fails_closed(tmp_path):
     repo, base, base_tree = _repo(tmp_path)
     (repo / "dashboard").mkdir()
     (repo / "dashboard" / "widget.tsx").write_text("export const x = 1;\n", encoding="utf-8")
     head, tree = _commit(repo, "touch a UI path")
     manifest = verify.load_verification_manifest(repo, base, verify_worktree_copy=False)
+    profile = _profile()
+    profile.pop("surface")
     bundle = verify.run_verification(
         instance_id="surface-optional", step_id="verify", activation=1,
         input_revision_hash="revision", base_sha=base, head_sha=head, tree_sha=tree,
-        workspace=repo, manifest=manifest, profile=_profile(), run_candidate_cases=False,
+        workspace=repo, manifest=manifest, profile=profile, run_candidate_cases=False,
         protected_manifest=verify.load_verification_manifest(repo, base, verify_worktree_copy=False),
     )
-    assert bundle["state"] == "done"
+    assert bundle["state"] == "failed"
+    assert "profile must declare a surface" in bundle["invalid_reason"]
+
+
+@pytest.mark.parametrize("path,surface,missing", [
+    ("dashboard/widget.tsx", "browser", "browser"),
+    ("server/api/routes.py", "api", "api"),
+    ("db/migrations/001.sql", "migration", "rollback"),
+])
+def test_surface_floor_requires_executed_behavior_not_only_a_profile_label(
+    tmp_path, path, surface, missing,
+):
+    repo, base, _tree = _repo(tmp_path)
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("changed\n", encoding="utf-8")
+    head, tree = _commit(repo, f"touch {surface}")
+    protected = verify.load_verification_manifest(repo, base, verify_worktree_copy=False)
+    bundle = verify.run_verification(
+        instance_id=f"surface-behavior-{surface}", step_id="verify", activation=1,
+        input_revision_hash="revision", base_sha=base, head_sha=head, tree_sha=tree,
+        workspace=repo, manifest=protected, profile=_profile(surface=surface),
+        run_candidate_cases=False, protected_manifest=protected,
+        required_surface=surface,
+    )
+    assert bundle["state"] == "failed"
+    assert f"required surface behaviors are missing: {missing}" in bundle["invalid_reason"]
 
 
 # ---------------------------------------------------------------------------
