@@ -185,6 +185,16 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   the run row (never `"enforced"`) — the SF-8 truthful-labeling pattern
   (see `_apply_network_policy`, finding #7) applied to the filesystem
   boundary (finding #1, cross-lab review of the SF-7 adversarial lane).
+- `_read_candidate` read a candidate artifact's bytes with no protection
+  against the file changing mid-read — a torn read spanning two writes
+  could produce a hybrid document that still parses as valid JSON and
+  passes schema validation (nothing hash-binds unrelated fields like
+  `unknowns` to `intent_sha256`), sealing as if it were one coherent
+  snapshot. It now re-`fstat`s the open fd after the read loop and rejects
+  with `"modified while being read"` if mtime/ctime/size differ from the
+  pre-read `fstat` — a real, deterministic TOCTOU guard, not a hope that a
+  racing writer never lands in the window (finding #2, cross-lab review of
+  the SF-7 adversarial lane).
 
 ## Conventions
 

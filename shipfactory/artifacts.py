@@ -419,6 +419,15 @@ def _candidate_parts(path: str) -> tuple[str, ...]:
     return parsed.parts
 
 
+# Test-only seam: a callable invoked exactly once, immediately after the
+# FIRST chunk of a candidate read, before any subsequent os.read() call on
+# the same fd. Production code never sets this; it exists so a test can
+# deterministically land a real, synchronized write in the middle of a
+# read — instead of an unsynchronized background thread that may or may
+# not overlap the read window by luck (finding #2).
+_CANDIDATE_READ_HOOK: Any = None
+
+
 def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> bytes:
     """Open every candidate component with O_NOFOLLOW semantics."""
     parts = _candidate_parts(candidate_path)
@@ -463,6 +472,7 @@ def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> byt
             )
         chunks: list[bytes] = []
         total = 0
+        first_chunk = True
         while True:
             chunk = os.read(fd, min(65536, int(max_bytes) + 1 - total))
             if not chunk:
@@ -473,6 +483,23 @@ def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> byt
                 raise ArtifactValidationError(
                     f"artifact size exceeds configured ceiling {int(max_bytes)}"
                 )
+            if first_chunk and _CANDIDATE_READ_HOOK is not None:
+                _CANDIDATE_READ_HOOK()
+            first_chunk = False
+        # TOCTOU guard: this fd stays open on the same inode for the whole
+        # read, so a concurrent in-place write to the candidate (the real
+        # attack this seam and finding #2 are about) changes this inode's
+        # mtime/ctime even when the byte length happens to match. A read
+        # that spanned such a write must never be sealed as if it were one
+        # coherent snapshot — reject it explicitly rather than silently
+        # accepting whatever bytes landed in the buffer.
+        after = os.fstat(fd)
+        if (after.st_mtime_ns, after.st_ctime_ns, after.st_size) != (
+            info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+        ):
+            raise ArtifactValidationError(
+                f"candidate path was modified while being read (torn read): {candidate_path}"
+            )
         return b"".join(chunks)
     except ArtifactValidationError:
         raise

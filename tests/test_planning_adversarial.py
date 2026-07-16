@@ -637,57 +637,67 @@ def test_sealed_destination_pre_seeded_with_a_real_swapped_file_is_replaced_not_
 
 
 def test_candidate_file_swapped_mid_seal_never_yields_a_torn_or_hybrid_artifact(tmp_path):
-    """A background thread races real writes against the same candidate
-    inode while ``seal_artifact`` reads and validates it. Whatever gets
-    sealed must be exactly one whole, self-consistent snapshot — never a
-    hybrid of two candidates, and never adopted without being the bytes
-    that were actually validated."""
+    """A real write to the candidate's inode is synchronized, via a hook at
+    the exact validate-then-copy read seam, to land strictly between the
+    first and a later ``os.read()`` call inside ``seal_artifact``'s own
+    candidate read — not an unsynchronized background thread hoping to
+    overlap a narrow window by luck. The swap is PROVABLY inside the read,
+    every single run, and the rejection must be specifically about the
+    torn/mismatched content, never an unrelated failure counted as a pass."""
+    from shipfactory import artifacts as artifacts_module
+
     repo, base_sha, tree_sha = _repo(tmp_path)
 
     def _padded(tag: str) -> dict:
         document = _exploration(base_sha, tree_sha)
         document["intent_sha256"] = hashlib.sha256(tag.encode()).hexdigest()
-        document["unknowns"] = [f"{tag}-{i}" for i in range(4000)]
+        document["unknowns"] = [f"{tag}-{i}" for i in range(5000)]
         return document
 
     v1, v2 = _padded("swap-v1"), _padded("swap-v2")
+    v1_bytes, v2_bytes = json.dumps(v1).encode(), json.dumps(v2).encode()
+    assert len(v1_bytes) > 65536, "the fixture must span more than one read() chunk"
     candidate = repo / ".shipfactory-output" / "exploration.json"
     candidate.parent.mkdir(parents=True, exist_ok=True)
-    candidate.write_text(json.dumps(v1), encoding="utf-8")
+    candidate.write_bytes(v1_bytes)
 
-    stop = threading.Event()
+    swap_requested = threading.Event()
+    swap_done = threading.Event()
+
+    def _swap_mid_read() -> None:
+        # Runs INSIDE seal_artifact's read, right after the first chunk is
+        # in hand and before any later os.read() on the same fd — this is
+        # the validate-then-copy seam finding #2 asked to synchronize on.
+        swap_requested.set()
+        assert swap_done.wait(timeout=5), "the racer thread never completed its swap"
 
     def racer() -> None:
-        toggle = False
-        for _ in range(400):
-            if stop.is_set():
-                return
-            payload = json.dumps(v2 if toggle else v1)
-            try:
-                candidate.write_text(payload, encoding="utf-8")
-            except OSError:
-                pass
-            toggle = not toggle
+        assert swap_requested.wait(timeout=5)
+        candidate.write_bytes(v2_bytes)
+        swap_done.set()
 
     thread = threading.Thread(target=racer, daemon=True)
     thread.start()
+    artifacts_module._CANDIDATE_READ_HOOK = _swap_mid_read
     try:
-        try:
-            sealed = seal_artifact(
+        with pytest.raises(ArtifactValidationError, match="modified while being read"):
+            seal_artifact(
                 instance_id="toctou-race", step_id="explore", activation=1, run_id=1,
                 output=_OUTPUT_EXPLORATION, workspace=repo, producer="run:1",
             )
-        except (ArtifactValidationError, ArtifactSealError):
-            # A torn read was correctly rejected rather than silently sealed.
-            return
     finally:
-        stop.set()
+        artifacts_module._CANDIDATE_READ_HOOK = None
         thread.join(timeout=5)
 
-    document = json.loads(Path(sealed["sealed_path"]).read_bytes())
-    assert document["intent_sha256"] in {v1["intent_sha256"], v2["intent_sha256"]}
-    matching = v1 if document["intent_sha256"] == v1["intent_sha256"] else v2
-    assert document["unknowns"] == matching["unknowns"]
+    # The rejected candidate row is durable audit history, not silently
+    # discarded — and its recorded state is unambiguously "rejected", not
+    # left dangling as if the seal might have partially succeeded.
+    with store._connect() as db:
+        row = dict(db.execute(
+            "SELECT state,validation_error FROM artifacts WHERE instance_id='toctou-race'"
+        ).fetchone())
+    assert row["state"] == "rejected"
+    assert "modified while being read" in row["validation_error"]
 
 
 # ---------------------------------------------------------------------------
