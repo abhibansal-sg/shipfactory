@@ -641,7 +641,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
 
             # Observe external task state before dependency readiness.
             for step in _latest(db, instance_id):
-                if (step["state"] == "waiting"
+                if (step["state"] == "running_verification"
                         and defs[step["step_id"]]["primitive"] == "verification"):
                     from shipfactory.verification import verify_evidence_bundle
                     bundle = db.execute(
@@ -834,7 +834,10 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                 definition = defs[sid]; primitive = definition["primitive"]
                 instance = _instance(db, instance_id)
                 if primitive == "verification":
-                    from shipfactory.verification import load_verification_manifest
+                    from shipfactory.verification import (
+                        load_verification_manifest,
+                        load_verification_manifest_if_present,
+                    )
                     profile_name = _bind_text(definition["params"]["profile"], params)
                     profile = verification_profiles.get(profile_name)
                     if profile is None:
@@ -895,8 +898,12 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         manifest_relpath = _bind_text(
                             definition["params"]["manifest"], params,
                         )
-                        pinned = load_verification_manifest(
+                        protected = load_verification_manifest(
                             workspace, instance["base_sha"], manifest_relpath,
+                            verify_worktree_copy=False,
+                        )
+                        candidate = load_verification_manifest_if_present(
+                            workspace, head_sha, manifest_relpath,
                             required_requirement_ids=required_requirement_ids,
                         )
                     except Exception as exc:
@@ -917,7 +924,11 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             "base_sha": instance["base_sha"], "head_sha": head_sha,
                             "tree_sha": tree_sha, "workspace": str(workspace),
                             "manifest_relpath": manifest_relpath,
-                            "manifest_blob_sha": pinned.blob_sha,
+                            "manifest_blob_sha": (candidate or protected).blob_sha,
+                            "candidate_manifest_blob_sha": (
+                                candidate.blob_sha if candidate is not None else None
+                            ),
+                            "protected_manifest_blob_sha": protected.blob_sha,
                             "required_requirement_ids": sorted(required_requirement_ids),
                             "profile": profile, "environment": "app",
                             "environment_config": environment_config,
@@ -925,7 +936,9 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         instance_id=instance_id, step_id=sid,
                         activation=int(step["activation"]),
                     )
-                    changed |= _transition(db, instance, step, "waiting", "activate")
+                    changed |= _transition(
+                        db, instance, step, "running_verification", "activate"
+                    )
                     continue
                 if primitive in {"agent_task", "review_gate"}:
                     profile_name = _bind_text(
@@ -1109,7 +1122,7 @@ def _current_action_target(row: dict[str, Any]) -> bool:
         ).fetchone()
     return bool(
         step and int(step["activation"]) == int(row["activation"])
-        and step["state"] == "waiting"
+        and step["state"] in {"waiting", "running_verification"}
     )
 
 

@@ -582,7 +582,7 @@ def nonterminal_runs() -> list[dict[str, Any]]:
     with _connect() as conn:
         return _rows(conn.execute(
             "SELECT * FROM runs WHERE ended_at IS NULL AND task_id<>? "
-            "AND executor<>'verification' ORDER BY id",
+            "AND executor NOT IN ('verification','verification-runner') ORDER BY id",
             (DAEMON_RUN_TASK_ID,),
         ))
 
@@ -592,7 +592,8 @@ def nonterminal_verification_runs() -> list[dict[str, Any]]:
     init_db()
     with _connect() as conn:
         return _rows(conn.execute(
-            "SELECT * FROM runs WHERE ended_at IS NULL AND executor='verification' ORDER BY id"
+            "SELECT * FROM runs WHERE ended_at IS NULL "
+            "AND executor IN ('verification','verification-runner') ORDER BY id"
         ))
 
 

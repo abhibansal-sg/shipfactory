@@ -42,6 +42,7 @@ VERIFICATION_PROFILE_FIELDS = frozenset({
     "max_log_bytes", "capture_video", "capture_trace", "capture_har",
     "browser_slots",
 })
+VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env"})
 
 
 class FactoryConfigError(ValueError):
@@ -212,7 +213,9 @@ def validate(cfg) -> None:
         for name, profile in verification_profiles.items():
             if not isinstance(name, str) or not name or not isinstance(profile, dict):
                 raise FactoryConfigError(f"invalid verification profile {name!r}")
-            if set(profile) != VERIFICATION_PROFILE_FIELDS:
+            if (not VERIFICATION_PROFILE_FIELDS.issubset(profile)
+                    or set(profile) - VERIFICATION_PROFILE_FIELDS
+                    - VERIFICATION_PROFILE_OPTIONAL_FIELDS):
                 raise FactoryConfigError(f"invalid verification profile {name!r}")
             for field in (
                 "max_runtime_seconds", "max_evidence_bytes", "max_log_bytes",
@@ -231,6 +234,16 @@ def validate(cfg) -> None:
                 "capture_video", "capture_trace", "capture_har",
             )):
                 raise FactoryConfigError(f"invalid verification profile {name!r}")
+            declared_env = profile.get("env", {})
+            if (not isinstance(declared_env, dict)
+                    or not all(isinstance(key, str) and key and "=" not in key
+                               and "\x00" not in key and key != "HOME"
+                               and not key.startswith("SHIPFACTORY_")
+                               and isinstance(value, str) and "\x00" not in value
+                               for key, value in declared_env.items())):
+                raise FactoryConfigError(
+                    f"verification profile {name!r} env must map names to strings"
+                )
         selector = recipes.get("selector", {}) or {}
         if not isinstance(selector, dict) or set(selector) - set(SELECTOR_DEFAULTS):
             raise FactoryConfigError("recipes.selector has unknown keys")

@@ -9,6 +9,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -79,9 +80,18 @@ def _safe_relpath(value: str, label: str) -> str:
 
 
 def _git(repo: Path, *args: str, binary: bool = False) -> Any:
+    git_home = store._db_path().parent / "verification-git-home"
+    git_home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(git_home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
     try:
         result = subprocess.check_output(
-            ["git", *args], cwd=repo, stderr=subprocess.PIPE, timeout=15,
+            ["git", *args], cwd=repo, env=env,
+            stderr=subprocess.PIPE, timeout=15,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise VerificationManifestError(f"git {' '.join(args)} failed: {exc}") from exc
@@ -241,6 +251,25 @@ def load_verification_manifest(
     return VerificationManifest(document, blob_sha, base_sha, relpath, raw)
 
 
+def load_verification_manifest_if_present(
+    repo_root: str | Path, revision_sha: str,
+    relpath: str = DEFAULT_MANIFEST_PATH, *,
+    required_requirement_ids: set[str] | None = None,
+    expected_blob_sha: str | None = None,
+) -> VerificationManifest | None:
+    """Load a candidate manifest, returning ``None`` only when the blob is absent."""
+    repo = Path(repo_root)
+    relpath = _safe_relpath(relpath, "manifest path")
+    if not _git(repo, "ls-tree", revision_sha, "--", relpath):
+        return None
+    return load_verification_manifest(
+        repo, revision_sha, relpath,
+        required_requirement_ids=required_requirement_ids,
+        expected_blob_sha=expected_blob_sha,
+        verify_worktree_copy=True,
+    )
+
+
 def control_plane_paths(manifest: VerificationManifest) -> frozenset[str]:
     """Paths whose candidate modification is a verification control-plane risk."""
     scripts = {
@@ -303,11 +332,45 @@ def _redact(data: bytes, secret_values: tuple[str, ...] = ()) -> tuple[bytes, bo
 
 
 def _environment_digest(env: dict[str, str]) -> str:
-    allowed = {
-        key: value for key, value in env.items()
-        if key.startswith("SHIPFACTORY_") or key in {"PATH", "LANG", "LC_ALL", "PORT"}
+    return hashlib.sha256(_canonical(env)).hexdigest()
+
+
+def _minimal_case_env(
+    workspace: Path, profile: dict[str, Any], bundle_id: str,
+) -> dict[str, str]:
+    """Build the complete allowlisted environment for candidate-owned commands."""
+    workspace_key = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:16]
+    home = store._db_path().parent / "verification-homes" / workspace_key / bundle_id
+    home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
     }
-    return hashlib.sha256(_canonical(allowed)).hexdigest()
+    for key, value in (profile.get("env", {}) or {}).items():
+        if (not isinstance(key, str) or not key or "=" in key or "\x00" in key
+                or key == "HOME" or key.startswith("SHIPFACTORY_")
+                or not isinstance(value, str) or "\x00" in value):
+            raise VerificationManifestError(
+                f"verification profile env contains unsafe variable {key!r}"
+            )
+        env[key] = value
+    return env
+
+
+def _runner_env(bundle_id: str) -> dict[str, str]:
+    """Build a secret-free environment for the trusted verification runner."""
+    home = store._db_path().parent / "verification-runner-homes" / bundle_id
+    home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        "HERMES_HOME": str(store._db_path().parent.parent),
+    }
+    python_paths = [str(Path(__file__).resolve().parent.parent)]
+    if os.environ.get("PYTHONPATH"):
+        python_paths.append(os.environ["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    return env
 
 
 def _output_bytes(value: Any) -> bytes:
@@ -404,10 +467,43 @@ DRIVERS: dict[str, Driver] = {
 }
 
 
+_RUNNING: dict[str, dict[str, Any]] = {}
+_RESTORED_HOMES: set[str] = set()
+
+
+def reap_runs() -> list[dict[str, Any]]:
+    """Poll locally-owned runner children without waiting for case completion."""
+    finished: list[dict[str, Any]] = []
+    for bundle_id, record in list(_RUNNING.items()):
+        code = record["proc"].poll()
+        if code is None:
+            continue
+        store.record_run_end(
+            record["run_id"], code, None, None,
+            monotonic() - record["started_monotonic"],
+            "done" if code == 0 else "verification_runner_failed",
+        )
+        with store._connect() as db:
+            bundle = db.execute(
+                "SELECT state,bundle_sha256 FROM evidence_bundles WHERE id=?", (bundle_id,),
+            ).fetchone()
+        if not bundle or bundle["state"] not in {"done", "blocked", "failed"}:
+            _runner_failure_bundle(
+                record["payload"], f"verification runner exited {code} before sealing"
+            )
+        finished.append({"bundle_id": bundle_id, "exit_code": code})
+        del _RUNNING[bundle_id]
+    return finished
+
+
 def restore_runs() -> list[int]:
     """Fence orphaned verification children by exact A1 process identity."""
     from shipfactory import spawn
 
+    reap_runs()
+    home_key = str(store._db_path())
+    if home_key in _RESTORED_HOMES:
+        return []
     crashed: list[int] = []
     for row in store.nonterminal_verification_runs():
         pid = row.get("pid")
@@ -416,6 +512,7 @@ def restore_runs() -> list[int]:
             spawn.verified_killpg(int(pid), token, signal.SIGKILL)
         store.record_run_crashed(int(row["id"]), "daemon restarted during verification")
         crashed.append(int(row["id"]))
+    _RESTORED_HOMES.add(home_key)
     return crashed
 
 
@@ -496,7 +593,8 @@ def _record_case(
 
 
 def _bundle_payload(bundle_id: str, *, phase_b_eligible: bool,
-                    outcome_state: str, invalid_reason: str | None) -> dict[str, Any]:
+                    outcome_state: str, invalid_reason: str | None,
+                    required_case_ids: list[str]) -> dict[str, Any]:
     with store._connect() as db:
         bundle = dict(db.execute(
             "SELECT * FROM evidence_bundles WHERE id=?", (bundle_id,),
@@ -521,6 +619,7 @@ def _bundle_payload(bundle_id: str, *, phase_b_eligible: bool,
         "phase_b_eligible": bool(phase_b_eligible),
         "outcome_state": outcome_state,
         "invalid_reason": invalid_reason,
+        "required_case_ids": sorted(required_case_ids),
         "cases": [{key: row[key] for key in (
             "case_id", "attempt", "requirement_ids_json", "oracle_type", "oracle_json",
             "status", "evidence_item_ids_json", "started_at", "ended_at",
@@ -533,10 +632,28 @@ def _bundle_payload(bundle_id: str, *, phase_b_eligible: bool,
 
 
 def _seal_bundle(bundle_id: str, *, final_state: str, reason: str | None,
-                 phase_b_eligible: bool) -> dict[str, Any]:
+                 phase_b_eligible: bool,
+                 required_case_ids: list[str] | None = None) -> dict[str, Any]:
+    required = sorted(set(required_case_ids or ()))
+    if final_state == "done":
+        with store._connect() as db:
+            rows = db.execute(
+                "SELECT case_id,attempt,status FROM verification_cases "
+                "WHERE bundle_id=? ORDER BY case_id,attempt", (bundle_id,),
+            ).fetchall()
+        latest: dict[str, tuple[int, str]] = {}
+        for row in rows:
+            latest[row["case_id"]] = (int(row["attempt"]), row["status"])
+        if set(latest) != set(required) or any(
+            status != "passed" for _attempt, status in latest.values()
+        ):
+            final_state = "failed"
+            reason = "evidence_invariant: required verification case results are missing"
+            phase_b_eligible = False
     payload = _bundle_payload(
         bundle_id, phase_b_eligible=phase_b_eligible,
         outcome_state=final_state, invalid_reason=reason,
+        required_case_ids=required,
     )
     digest = hashlib.sha256(_canonical(payload)).hexdigest()
     payload["bundle_sha256"] = digest
@@ -561,6 +678,7 @@ def run_verification(
     environment_session_id: str | None = None,
     environment_identity: dict[str, Any] | None = None,
     protected_manifest: VerificationManifest | None = None,
+    run_candidate_cases: bool = True,
     drivers: dict[str, Driver] | None = None,
     child_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -585,9 +703,11 @@ def run_verification(
         return bundle
     _set_bundle_state(bundle_id, "preparing_environment")
     try:
-        if manifest.base_sha != base_sha:
-            raise CommitBindingError("manifest is not bound to the instance trusted base")
         assert_commit_binding(workspace, head_sha, tree_sha)
+        if run_candidate_cases and manifest.base_sha != head_sha:
+            raise CommitBindingError("candidate manifest is not bound to the candidate revision")
+        if protected_manifest is not None and protected_manifest.base_sha != base_sha:
+            raise CommitBindingError("protected manifest is not bound to the trusted base")
     except VerificationError as exc:
         _set_bundle_state(bundle_id, "failed", f"evidence_invariant: {exc}")
         return _seal_bundle(
@@ -602,7 +722,10 @@ def run_verification(
     remaining_logs = max(0, min(
         int(profile["max_log_bytes"]), int(profile["max_evidence_bytes"]),
     ))
-    env = dict(os.environ if child_env is None else child_env)
+    env = dict(
+        _minimal_case_env(workspace, profile, bundle_id)
+        if child_env is None else child_env
+    )
     env.update({
         "SHIPFACTORY_INSTANCE_ID": instance_id,
         "SHIPFACTORY_HEAD_SHA": head_sha,
@@ -618,9 +741,14 @@ def run_verification(
     redacted_any = False
     infra_recovered = False
     failure_reason: str | None = None
-    case_sources = [("candidate", manifest)]
+    case_sources = [("candidate", manifest)] if run_candidate_cases else []
     if protected_manifest is not None:
         case_sources.append(("protected", protected_manifest))
+    required_case_ids = [
+        case["id"] if provenance == "candidate" else f"protected:{case['id']}"
+        for provenance, source_manifest in case_sources
+        for case in source_manifest.document["cases"]
+    ]
     for provenance, source_manifest in case_sources:
         for case in source_manifest.document["cases"]:
             persisted_case_id = case["id"] if provenance == "candidate" else f"protected:{case['id']}"
@@ -726,6 +854,7 @@ def run_verification(
     return _seal_bundle(
         bundle_id, final_state=final_state, reason=failure_reason,
         phase_b_eligible=(failure_reason is None and not infra_recovered),
+        required_case_ids=required_case_ids,
     )
 
 
@@ -744,35 +873,146 @@ def _preparation_failure_bundle(payload: dict[str, Any], manifest: VerificationM
     )
 
 
-def run_action(payload: dict[str, Any]) -> dict[str, Any]:
-    """Execute one journaled verification action or report environment preparation."""
+def _load_action_manifests(
+    payload: dict[str, Any],
+) -> tuple[VerificationManifest | None, VerificationManifest, VerificationManifest]:
     workspace = Path(payload["workspace"])
-    try:
-        manifest = load_verification_manifest(
-            workspace, payload["base_sha"], payload["manifest_relpath"],
-            required_requirement_ids=set(payload.get("required_requirement_ids", [])),
-            expected_blob_sha=payload.get("manifest_blob_sha"),
-        )
-    except VerificationError as exc:
-        placeholder = VerificationManifest(
-            {}, str(payload.get("manifest_blob_sha") or "unavailable"),
-            payload["base_sha"], payload["manifest_relpath"], b"",
-        )
-        bundle_id = _bundle_id(
-            payload["instance_id"], payload["step_id"], int(payload["activation"]),
-        )
+    relpath = payload["manifest_relpath"]
+    protected = load_verification_manifest(
+        workspace, payload["base_sha"], relpath,
+        expected_blob_sha=(
+            payload.get("protected_manifest_blob_sha")
+            or payload.get("manifest_blob_sha")
+        ),
+        verify_worktree_copy=False,
+    )
+    candidate = load_verification_manifest_if_present(
+        workspace, payload["head_sha"], relpath,
+        required_requirement_ids=set(payload.get("required_requirement_ids", [])),
+        expected_blob_sha=payload.get("candidate_manifest_blob_sha"),
+    )
+    return candidate, protected, candidate or protected
+
+
+def _manifest_failure_bundle(payload: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    placeholder = VerificationManifest(
+        {}, str(payload.get("manifest_blob_sha") or "unavailable"),
+        payload["base_sha"], payload["manifest_relpath"], b"",
+    )
+    bundle_id = _bundle_id(
+        payload["instance_id"], payload["step_id"], int(payload["activation"]),
+    )
+    _insert_bundle(
+        bundle_id=bundle_id, instance_id=payload["instance_id"],
+        step_id=payload["step_id"], activation=int(payload["activation"]),
+        input_revision_hash=payload["input_revision_hash"],
+        base_sha=payload["base_sha"], head_sha=payload["head_sha"],
+        tree_sha=payload["tree_sha"], environment_session_id=None,
+        manifest=placeholder,
+    )
+    return _seal_bundle(
+        bundle_id, final_state="failed",
+        reason=f"evidence_invariant: {exc}", phase_b_eligible=False,
+    )
+
+
+def _runner_failure_bundle(payload: dict[str, Any], reason: str) -> dict[str, Any]:
+    bundle_id = _bundle_id(
+        payload["instance_id"], payload["step_id"], int(payload["activation"]),
+    )
+    with store._connect() as db:
+        existing = db.execute(
+            "SELECT state FROM evidence_bundles WHERE id=?", (bundle_id,),
+        ).fetchone()
+    if not existing:
+        try:
+            _candidate, _protected, primary = _load_action_manifests(payload)
+        except Exception as exc:
+            return _manifest_failure_bundle(payload, exc)
         _insert_bundle(
             bundle_id=bundle_id, instance_id=payload["instance_id"],
             step_id=payload["step_id"], activation=int(payload["activation"]),
             input_revision_hash=payload["input_revision_hash"],
             base_sha=payload["base_sha"], head_sha=payload["head_sha"],
             tree_sha=payload["tree_sha"], environment_session_id=None,
-            manifest=placeholder,
+            manifest=primary,
         )
-        failed = _seal_bundle(
-            bundle_id, final_state="failed",
-            reason=f"evidence_invariant: {exc}", phase_b_eligible=False,
+    return _seal_bundle(
+        bundle_id, final_state="failed", reason=f"evidence_invariant: {reason}",
+        phase_b_eligible=False,
+    )
+
+
+def _run_action_sync(payload: dict[str, Any]) -> dict[str, Any]:
+    """Runner-child entry: execute cases after the daemon prepared the environment."""
+    candidate, protected, primary = _load_action_manifests(payload)
+    bundle = run_verification(
+        instance_id=payload["instance_id"], step_id=payload["step_id"],
+        activation=int(payload["activation"]),
+        input_revision_hash=payload["input_revision_hash"], base_sha=payload["base_sha"],
+        head_sha=payload["head_sha"], tree_sha=payload["tree_sha"],
+        workspace=payload["workspace"], manifest=primary, profile=payload["profile"],
+        environment_session_id=payload.get("resolved_environment_session_id"),
+        environment_identity=payload.get("resolved_environment_identity", {}),
+        protected_manifest=protected, run_candidate_cases=candidate is not None,
+    )
+    return {"status": bundle["state"], "bundle_id": bundle["id"]}
+
+
+def _spawn_runner(payload: dict[str, Any]) -> dict[str, Any]:
+    from shipfactory import spawn
+
+    bundle_id = _bundle_id(
+        payload["instance_id"], payload["step_id"], int(payload["activation"]),
+    )
+    if bundle_id in _RUNNING:
+        return {"status": "pending", "bundle_id": bundle_id, "reason": "verification running"}
+    action_root = store._db_path().parent / "verification-actions" / bundle_id
+    payload_path = action_root / "payload.json"
+    log_path = action_root / "runner.log"
+    _copy_once(payload_path, _canonical(payload) + b"\n")
+    action_root.mkdir(parents=True, exist_ok=True)
+    run_id = store.record_run_start(
+        f"verification-runner/{bundle_id}", "verification", "verification-runner", "",
+        workspace_path=payload["workspace"], log_path=log_path,
+        provider="shipfactory", resolved_model="non-model",
+        executor_version=VERIFICATION_SCHEMA,
+    )
+    started_monotonic = monotonic()
+    log_file = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "shipfactory.verification", "--runner", str(payload_path)],
+            cwd=payload["workspace"], env=_runner_env(bundle_id), stdin=subprocess.DEVNULL,
+            stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
         )
+    except Exception:
+        store.record_run_end(
+            run_id, -1, None, None, monotonic() - started_monotonic, "spawn_failed",
+        )
+        raise
+    finally:
+        log_file.close()
+    record = {
+        "proc": proc, "run_id": run_id, "payload": payload,
+        "started_monotonic": started_monotonic, "token": None,
+    }
+    _RUNNING[bundle_id] = record
+    store.record_run_spawned(run_id, proc.pid, None)
+    token = spawn._capture_start_token(proc.pid, proc)
+    store.record_run_spawned(run_id, proc.pid, token)
+    record["token"] = token
+    return {"status": "pending", "bundle_id": bundle_id, "reason": "verification running"}
+
+
+def run_action(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prepare one action and start or probe its asynchronous runner child."""
+    reap_runs()
+    workspace = Path(payload["workspace"])
+    try:
+        _candidate, _protected, primary = _load_action_manifests(payload)
+    except VerificationError as exc:
+        failed = _manifest_failure_bundle(payload, exc)
         return {"status": "failed", "bundle_id": failed["id"]}
     prepared_id = _bundle_id(
         payload["instance_id"], payload["step_id"], int(payload["activation"]),
@@ -782,9 +1022,12 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
         step_id=payload["step_id"], activation=int(payload["activation"]),
         input_revision_hash=payload["input_revision_hash"], base_sha=payload["base_sha"],
         head_sha=payload["head_sha"], tree_sha=payload["tree_sha"],
-        environment_session_id=payload.get("environment_session_id"), manifest=manifest,
+        environment_session_id=payload.get("environment_session_id"), manifest=primary,
     )
-    if prepared["state"] not in {"done", "blocked", "failed"}:
+    if prepared["state"] in {"done", "blocked", "failed"}:
+        verify_evidence_bundle(prepared_id)
+        return {"status": prepared["state"], "bundle_id": prepared_id}
+    if prepared["state"] == "ready":
         _set_bundle_state(prepared_id, "preparing_environment")
     environment_id = payload.get("environment_session_id")
     environment_identity: dict[str, Any] = {}
@@ -805,7 +1048,7 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
             if env_row is None:
                 return {"status": "pending", "reason": "environment capacity queued"}
             if env_row["state"] == "failed":
-                bundle = _preparation_failure_bundle(payload, manifest, "environment_failed")
+                bundle = _preparation_failure_bundle(payload, primary, "environment_failed")
                 return {"status": "blocked", "bundle_id": bundle["id"]}
             if env_row["state"] != "ready":
                 return {"status": "pending", "reason": "environment materializing"}
@@ -813,7 +1056,7 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
                 env_session_id=env_row["id"], request_key=app_key, cfg=cfg,
             )
         if app["state"] in {"crashed", "stopped"}:
-            bundle = _preparation_failure_bundle(payload, manifest, "environment_failed")
+            bundle = _preparation_failure_bundle(payload, primary, "environment_failed")
             return {"status": "blocked", "bundle_id": bundle["id"]}
         if app["state"] != "healthy":
             return {"status": "pending", "reason": "application starting"}
@@ -822,16 +1065,12 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
             "app_session_id": app["id"], "env_session_id": app["env_session_id"],
             "app_url": app["app_url"], "port": app["port"],
         }
-    bundle = run_verification(
-        instance_id=payload["instance_id"], step_id=payload["step_id"],
-        activation=int(payload["activation"]),
-        input_revision_hash=payload["input_revision_hash"], base_sha=payload["base_sha"],
-        head_sha=payload["head_sha"], tree_sha=payload["tree_sha"],
-        workspace=workspace, manifest=manifest, profile=payload["profile"],
-        environment_session_id=environment_id,
-        environment_identity=environment_identity,
-    )
-    return {"status": bundle["state"], "bundle_id": bundle["id"]}
+    runner_payload = {
+        **payload,
+        "resolved_environment_session_id": environment_id,
+        "resolved_environment_identity": environment_identity,
+    }
+    return _spawn_runner(runner_payload)
 
 
 def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str, Any]:
@@ -888,6 +1127,12 @@ def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str
     if claimed_digest != actual_digest or bundle["bundle_sha256"] != actual_digest:
         raise EvidenceInvariantError("bundle SHA-256 mismatch")
     if bundle["state"] == "done":
+        required_case_ids = document.get("required_case_ids")
+        if (not isinstance(required_case_ids, list)
+                or not required_case_ids
+                or not all(isinstance(case_id, str) for case_id in required_case_ids)
+                or len(set(required_case_ids)) != len(required_case_ids)):
+            raise EvidenceInvariantError("done bundle required case set is invalid")
         latest: dict[str, tuple[int, str]] = {}
         for case in document.get("cases", []):
             case_id = case.get("case_id")
@@ -896,7 +1141,8 @@ def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str
             if isinstance(case_id, str) and isinstance(attempt, int):
                 if case_id not in latest or attempt > latest[case_id][0]:
                     latest[case_id] = (attempt, status)
-        if not latest or any(status != "passed" for _attempt, status in latest.values()):
+        if (set(latest) != set(required_case_ids)
+                or any(status != "passed" for _attempt, status in latest.values())):
             raise EvidenceInvariantError("done bundle contains a non-passing required case")
     return bundle
 
@@ -917,7 +1163,24 @@ __all__ = [
     "VERIFICATION_SCHEMA", "EVIDENCE_SCHEMA", "DEFAULT_MANIFEST_PATH", "DRIVERS",
     "VerificationError", "VerificationManifestError", "EvidenceInvariantError",
     "CommitBindingError", "VerificationManifest", "validate_verification_manifest",
-    "load_verification_manifest", "control_plane_paths", "assert_commit_binding",
-    "run_verification", "run_action", "restore_runs", "verify_evidence_bundle",
+    "load_verification_manifest", "load_verification_manifest_if_present",
+    "control_plane_paths", "assert_commit_binding", "run_verification", "run_action",
+    "restore_runs", "reap_runs", "verify_evidence_bundle",
     "read_evidence_item",
 ]
+
+
+def _runner_main(payload_path: str) -> int:
+    try:
+        payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+        _run_action_sync(payload)
+    except Exception as exc:
+        print(f"verification runner failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[1] != "--runner":
+        raise SystemExit("usage: python -m shipfactory.verification --runner PAYLOAD")
+    raise SystemExit(_runner_main(sys.argv[2]))

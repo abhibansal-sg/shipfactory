@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ def _manifest(*, argv=None, oracle=None, driver="command"):
 
 def _repo(tmp_path: Path, document=None):
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     (repo / ".shipfactory").mkdir()
     import yaml
@@ -68,6 +69,56 @@ def _run(repo, head, tree, manifest, **kwargs):
         workspace=repo, manifest=manifest, profile=kwargs.pop("profile", _profile()),
         **kwargs,
     )
+
+
+def _commit(repo: Path, message: str) -> tuple[str, str]:
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=repo, env=_GIT_ENV, check=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True).strip()
+    return head, tree
+
+
+def _action_payload(repo: Path, base: str, head: str, tree: str, *, instance: str):
+    protected = verify.load_verification_manifest(
+        repo, base, verify_worktree_copy=False,
+    )
+    candidate = verify.load_verification_manifest_if_present(repo, head)
+    return {
+        "instance_id": instance, "step_id": "verify", "activation": 1,
+        "input_revision_hash": "revision", "base_sha": base, "head_sha": head,
+        "tree_sha": tree, "workspace": str(repo),
+        "manifest_relpath": verify.DEFAULT_MANIFEST_PATH,
+        "manifest_blob_sha": (candidate or protected).blob_sha,
+        "candidate_manifest_blob_sha": candidate.blob_sha if candidate else None,
+        "protected_manifest_blob_sha": protected.blob_sha,
+        "required_requirement_ids": ["REQ-1"], "profile": _profile(),
+        "environment": "source", "environment_config": {},
+    }
+
+
+def _finish_action(payload, timeout=10):
+    deadline = time.monotonic() + timeout
+    result = verify.run_action(payload)
+    while result["status"] == "pending" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        verify.reap_runs()
+        result = verify.run_action(payload)
+    assert result["status"] != "pending"
+    return result
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_async_verifiers():
+    yield
+    for record in list(verify._RUNNING.values()):
+        verify._kill_child(record["proc"], record.get("token"))
+        try:
+            record["proc"].wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    verify._RUNNING.clear()
+    verify._RESTORED_HOMES.clear()
 
 
 def test_schema_migration_is_normative_and_numbered():
@@ -225,6 +276,121 @@ def test_protected_baseline_failure_overrides_candidate_pass(tmp_path):
     bundle = _run(repo, head, tree, candidate, protected_manifest=protected)
     assert bundle["state"] == "blocked"
     assert bundle["invalid_reason"] == "protected_baseline_test_failed"
+
+
+def test_production_action_runs_base_manifest_and_blocks_candidate_pass(tmp_path):
+    repo, base, _base_tree = _repo(
+        tmp_path, _manifest(argv=["python3", "-c", "raise SystemExit(1)"]),
+    )
+    import yaml
+    (repo / verify.DEFAULT_MANIFEST_PATH).write_text(
+        yaml.safe_dump(_manifest(), sort_keys=False), encoding="utf-8",
+    )
+    head, tree = _commit(repo, "candidate passes")
+    result = _finish_action(_action_payload(repo, base, head, tree, instance="baseline"))
+    assert result["status"] == "blocked"
+    with store._connect() as db:
+        bundle = dict(db.execute(
+            "SELECT * FROM evidence_bundles WHERE id=?", (result["bundle_id"],),
+        ).fetchone())
+        cases = db.execute(
+            "SELECT case_id,status FROM verification_cases WHERE bundle_id=? ORDER BY case_id",
+            (result["bundle_id"],),
+        ).fetchall()
+    assert bundle["invalid_reason"] == "protected_baseline_test_failed"
+    assert [tuple(row) for row in cases] == [
+        ("protected:unit-suite", "failed"), ("unit-suite", "passed"),
+    ]
+
+
+def test_deleted_candidate_manifest_still_runs_trusted_base_cases(tmp_path):
+    repo, base, _base_tree = _repo(tmp_path)
+    (repo / verify.DEFAULT_MANIFEST_PATH).unlink()
+    head, tree = _commit(repo, "delete candidate manifest")
+    payload = _action_payload(repo, base, head, tree, instance="deleted-manifest")
+    assert payload["candidate_manifest_blob_sha"] is None
+    result = _finish_action(payload)
+    assert result["status"] == "done"
+    with store._connect() as db:
+        cases = db.execute(
+            "SELECT case_id,status FROM verification_cases WHERE bundle_id=?",
+            (result["bundle_id"],),
+        ).fetchall()
+    assert [tuple(row) for row in cases] == [("protected:unit-suite", "passed")]
+
+
+def test_slow_verification_runner_does_not_stall_an_unrelated_action(tmp_path):
+    slow_repo, slow_head, slow_tree = _repo(
+        tmp_path / "slow", _manifest(argv=["python3", "-c", "import time; time.sleep(2)"]),
+    )
+    fast_repo, fast_head, fast_tree = _repo(tmp_path / "fast")
+    slow = _action_payload(
+        slow_repo, slow_head, slow_head, slow_tree, instance="slow-instance",
+    )
+    fast = _action_payload(
+        fast_repo, fast_head, fast_head, fast_tree, instance="fast-instance",
+    )
+    started = time.monotonic()
+    assert verify.run_action(slow)["status"] == "pending"
+    assert time.monotonic() - started < 1.0
+    started = time.monotonic()
+    assert verify.run_action(fast)["status"] == "pending"
+    assert time.monotonic() - started < 1.0
+    fast_result = _finish_action(fast, timeout=5)
+    assert fast_result["status"] == "done"
+    assert verify._bundle_id("slow-instance", "verify", 1) in verify._RUNNING
+
+
+def test_candidate_child_gets_only_explicit_environment(tmp_path, monkeypatch):
+    canary = "daemon-only-canary-value"
+    monkeypatch.setenv("SHIPFACTORY_TEST_CANARY_SECRET", canary)
+    document = _manifest(
+        argv=[
+            "python3", "-c",
+            "import os; print('canary=' + str(os.getenv('SHIPFACTORY_TEST_CANARY_SECRET'))); "
+            "print('allowed=' + str(os.getenv('ALLOWED_CASE_VAR'))); "
+            "print('home=' + os.environ['HOME'])",
+        ],
+        oracle={"type": "output_contains", "contains": "canary=None"},
+    )
+    repo, head, tree = _repo(tmp_path, document)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(
+        repo, head, tree, manifest,
+        profile=_profile(env={"ALLOWED_CASE_VAR": "yes"}),
+    )
+    assert bundle["state"] == "done"
+    with store._connect() as db:
+        item = dict(db.execute(
+            "SELECT * FROM evidence_items WHERE bundle_id=?", (bundle["id"],),
+        ).fetchone())
+    output = Path(item["path"]).read_text(encoding="utf-8")
+    assert "canary=None" in output and "allowed=yes" in output
+    assert canary not in output
+    assert f"home={repo}" not in output
+
+
+def test_done_bundle_cannot_seal_without_protected_results(tmp_path):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle_id = verify._bundle_id("missing-protected", "verify", 1)
+    verify._insert_bundle(
+        bundle_id=bundle_id, instance_id="missing-protected", step_id="verify",
+        activation=1, input_revision_hash="revision", base_sha=head,
+        head_sha=head, tree_sha=tree, environment_session_id=None, manifest=manifest,
+    )
+    now = store._now()
+    verify._record_case(
+        bundle_id=bundle_id, case_id="unit-suite", attempt=1,
+        case=manifest.document["cases"][0], status="passed", item_ids=[],
+        started_at=now, ended_at=now,
+    )
+    sealed = verify._seal_bundle(
+        bundle_id, final_state="done", reason=None, phase_b_eligible=True,
+        required_case_ids=["unit-suite", "protected:unit-suite"],
+    )
+    assert sealed["state"] == "failed"
+    assert "required verification case results are missing" in sealed["invalid_reason"]
 
 
 def test_output_is_redacted_and_capped_by_profile(tmp_path):
