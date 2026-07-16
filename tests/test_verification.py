@@ -124,7 +124,7 @@ def _cleanup_async_verifiers():
 def test_schema_migration_is_normative_and_numbered():
     store.init_db()
     with store._connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
         assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_bundles)")] == [
             "id", "instance_id", "step_id", "activation", "input_revision_hash",
             "base_sha", "head_sha", "tree_sha", "environment_session_id",
