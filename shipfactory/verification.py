@@ -34,9 +34,21 @@ _CASE_ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _HASH = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _BLOB_MODES = {"100644", "100755"}
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+"),
-    re.compile(r"(?i)((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;]+"),
-    re.compile(r"\b(?:ghp|github_pat|sk)-[A-Za-z0-9_-]{12,}\b"),
+    (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+"), r"\1[REDACTED]"),
+    # Stops at quote/brace/bracket too, not just whitespace/,/; -- otherwise
+    # this greedily eats past a JSON string's closing quote into the next
+    # key when scanning structured (HAR-shaped) payloads (finding #10,
+    # verification adversarial lane).
+    (re.compile(r'(?i)((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;"}\]]+'), r"\1[REDACTED]"),
+    (re.compile(r"\b(?:ghp|github_pat|sk)-[A-Za-z0-9_-]{12,}\b"), "[REDACTED]"),
+    # HAR captures headers/cookies as JSON {"name": ..., "value": ...} pairs,
+    # not "Header: value" text -- §2.4.9 requires cookies and auth headers to
+    # be stripped from HAR specifically, which the plain-text patterns above
+    # cannot see (finding #10, verification adversarial lane).
+    (re.compile(
+        r'(?i)("name"\s*:\s*"(?:cookie|set-cookie|authorization)"\s*,\s*"value"\s*:\s*")[^"]*(")'
+    ), r"\1[REDACTED]\2"),
+    (re.compile(r"(?i)((?:^|[;\n])\s*(?:cookie|set-cookie)\s*:\s*)[^\r\n]+"), r"\1[REDACTED]"),
 )
 
 
@@ -132,6 +144,12 @@ def _validate_oracle(oracle: Any, label: str) -> None:
             raise VerificationManifestError(f"{label} output_contains value is invalid")
         if oracle.get("stream", "combined") not in {"stdout", "stderr", "combined"}:
             raise VerificationManifestError(f"{label} output_contains stream is invalid")
+    elif kind == "pytest_summary":
+        if set(oracle) not in ({"type"}, {"type", "min_passed"}):
+            raise VerificationManifestError(f"{label} pytest_summary oracle is invalid")
+        min_passed = oracle.get("min_passed", 1)
+        if not isinstance(min_passed, int) or isinstance(min_passed, bool) or min_passed < 1:
+            raise VerificationManifestError(f"{label} pytest_summary min_passed is invalid")
     else:
         raise VerificationManifestError(f"unknown oracle type {kind!r}")
 
@@ -279,6 +297,46 @@ def control_plane_paths(manifest: VerificationManifest) -> frozenset[str]:
     return frozenset({manifest.relpath, *scripts})
 
 
+# §2.4.7 deterministic surface policy: the model may raise the required
+# verification profile, never lower it. Ordered weakest -> strictest;
+# "stricter" is the floor for anything the deterministic path rules cannot
+# classify, since an unrecognized surface might touch anything.
+_SURFACE_LEVELS = {"api": 0, "migration": 1, "browser": 2, "stricter": 3}
+_UI_PATH_MARKERS = ("/dashboard/", "/frontend/", "/ui/", "/components/", "/pages/", "/views/")
+_UI_SUFFIXES = (".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".html")
+_API_PATH_MARKERS = ("/api/", "/routes/", "/endpoints/")
+_API_SUFFIXES = ("_api.py", "_routes.py")
+_MIGRATION_PATH_MARKERS = ("/migrations/", "/migrate/")
+
+
+def classify_path_surface(path: str) -> str:
+    """Deterministically classify one changed repo-relative path (§2.4.7)."""
+    lower = f"/{path.lower()}"
+    if any(marker in lower for marker in _MIGRATION_PATH_MARKERS):
+        return "migration"
+    if any(marker in lower for marker in _UI_PATH_MARKERS) or lower.endswith(_UI_SUFFIXES):
+        return "browser"
+    if any(marker in lower for marker in _API_PATH_MARKERS) or lower.endswith(_API_SUFFIXES):
+        return "api"
+    return "stricter"
+
+
+def classify_required_surface(
+    paths: list[str], *, model_risk_surface: str | None = None,
+) -> str:
+    """Return the floor verification surface for a changed-path set.
+
+    ``model_risk_surface`` (a model's own risk classification) may only
+    raise the deterministic floor, per §2.4.7 -- it is combined with
+    ``max``, never substituted for the deterministic result.
+    """
+    levels = {classify_path_surface(path) for path in paths} or {"stricter"}
+    floor = max(levels, key=lambda level: _SURFACE_LEVELS[level])
+    if model_risk_surface in _SURFACE_LEVELS:
+        floor = max([floor, model_risk_surface], key=lambda level: _SURFACE_LEVELS[level])
+    return floor
+
+
 def _repository_identity(workspace: Path) -> tuple[str, str, str]:
     status = _git(workspace, "status", "--porcelain")
     if status:
@@ -320,11 +378,8 @@ def _evidence_root(instance_id: str, step_id: str, activation: int) -> Path:
 def _redact(data: bytes, secret_values: tuple[str, ...] = ()) -> tuple[bytes, bool]:
     text = data.decode("utf-8", errors="replace")
     original = text
-    for pattern in _SECRET_PATTERNS:
-        if pattern.groups:
-            text = pattern.sub(lambda match: match.group(1) + "[REDACTED]", text)
-        else:
-            text = pattern.sub("[REDACTED]", text)
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
     for value in secret_values:
         if value and len(value) >= 6:
             text = text.replace(value, "[REDACTED]")
@@ -333,6 +388,150 @@ def _redact(data: bytes, secret_values: tuple[str, ...] = ()) -> tuple[bytes, bo
 
 def _environment_digest(env: dict[str, str]) -> str:
     return hashlib.sha256(_canonical(env)).hexdigest()
+
+
+_CAPTURE_KINDS = frozenset({"video", "trace", "screenshot", "har"})
+_CAPTURE_TEXT_KINDS = frozenset({"trace", "har"})
+_CAPTURE_BINARY_KINDS = frozenset({"video", "screenshot"})
+_CAPTURE_MAGIC = b"SFEV1\n"
+
+
+class CaptureContainerError(EvidenceInvariantError):
+    """A captured evidence item's container is malformed, foreign, or truncated."""
+
+
+def build_capture_container(
+    kind: str, payload: bytes, *, instance_id: str, head_sha: str, bundle_id: str,
+    case_id: str, attempt: int, captured_at: str,
+) -> bytes:
+    """Wrap capture bytes with a runner-owned identity header the driver cannot influence.
+
+    Real video/trace/screenshot capture should burn a runner-generated
+    overlay (instance ID, head SHA, case ID, timestamp) into evidence so a
+    copy of stale bytes into a fresh evidence directory is detectable even
+    though the copy's own sha256 is internally self-consistent (§2.4.6,
+    finding #2 verification adversarial lane -- attacks #2/#14/#19). This
+    container is the deterministic, codec-independent analog of that
+    overlay: the header's identity is compared against the bundle's own
+    trusted row at verify time, and the header's declared payload hash/
+    length are compared against the actual trailing bytes to catch
+    truncation after a valid header was written.
+    """
+    if kind not in _CAPTURE_KINDS:
+        raise ValueError(f"unknown capture kind {kind!r}")
+    header = _canonical({
+        "schema": "shipfactory.capture-identity/v1", "kind": kind,
+        "instance_id": instance_id, "head_sha": head_sha, "bundle_id": bundle_id,
+        "case_id": case_id, "attempt": int(attempt), "captured_at": captured_at,
+        "payload_sha256": hashlib.sha256(payload).hexdigest(), "payload_length": len(payload),
+    })
+    return _CAPTURE_MAGIC + len(header).to_bytes(4, "big") + header + payload
+
+
+def _parse_capture_container(data: bytes) -> tuple[dict[str, Any], bytes]:
+    if not data.startswith(_CAPTURE_MAGIC):
+        raise CaptureContainerError("capture container magic is missing or corrupt")
+    rest = data[len(_CAPTURE_MAGIC):]
+    if len(rest) < 4:
+        raise CaptureContainerError("capture container header length is truncated")
+    header_len = int.from_bytes(rest[:4], "big")
+    header_bytes = rest[4:4 + header_len]
+    if len(header_bytes) != header_len:
+        raise CaptureContainerError("capture container header is truncated")
+    try:
+        header = json.loads(header_bytes)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CaptureContainerError("capture container header is not valid JSON") from exc
+    if not isinstance(header, dict):
+        raise CaptureContainerError("capture container header is not an object")
+    return header, rest[4 + header_len:]
+
+
+def _validate_capture_container(
+    data: bytes, *, expected_instance_id: str, expected_head_sha: str,
+    expected_bundle_id: str, expected_case_id: str,
+) -> None:
+    header, payload = _parse_capture_container(data)
+    if (header.get("instance_id") != expected_instance_id
+            or header.get("head_sha") != expected_head_sha
+            or header.get("bundle_id") != expected_bundle_id
+            or header.get("case_id") != expected_case_id):
+        raise CaptureContainerError(
+            "capture container identity does not match this evidence bundle"
+        )
+    if (header.get("payload_sha256") != hashlib.sha256(payload).hexdigest()
+            or header.get("payload_length") != len(payload)):
+        raise CaptureContainerError("capture container payload was truncated or replaced")
+
+
+def _redact_capture_payload(
+    kind: str, payload: bytes, secret_values: tuple[str, ...] = (),
+) -> tuple[bytes, str]:
+    """Redact one captured artifact's payload, or mark it uncertain if it cannot be scanned.
+
+    Binary captures (screenshot, video) cannot be text-scanned for secrets;
+    per §2.4.9 an uncertain redaction must block sealing rather than claim a
+    clean pass. Text-shaped captures (trace, HAR) reuse the same pattern
+    scanner as command output.
+    """
+    if kind in _CAPTURE_BINARY_KINDS:
+        return payload, "uncertain"
+    redacted, changed = _redact(payload, secret_values)
+    return redacted, ("redacted" if changed else "clean")
+
+
+def _persist_capture_item(
+    *, bundle_id: str, instance_id: str, head_sha: str, case_id: str, attempt: int,
+    kind: str, payload: bytes, root: Path, mime_type: str,
+    started_at: str, ended_at: str, secret_values: tuple[str, ...] = (),
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Trusted-runner capture sealing: identity-stamp, redact, then seal by hash.
+
+    ``instance_id``/``head_sha``/``bundle_id`` are supplied by the caller's
+    own trusted scope, never read back from driver/case output -- the app
+    under test cannot influence the identity burned into its own evidence.
+    """
+    if kind not in _CAPTURE_KINDS:
+        raise ValueError(f"unknown capture kind {kind!r}")
+    redacted_payload, redaction_state = _redact_capture_payload(kind, payload, secret_values)
+    ident = _item_id(bundle_id, case_id, attempt, kind)
+    container = build_capture_container(
+        kind, redacted_payload, instance_id=instance_id, head_sha=head_sha,
+        bundle_id=bundle_id, case_id=case_id, attempt=attempt, captured_at=started_at,
+    )
+    path = root / "items" / f"{ident}.{kind}"
+    sealed = _copy_once(path, container)
+    digest = hashlib.sha256(sealed).hexdigest()
+    metadata = {"redaction_state": redaction_state, **(extra_metadata or {})}
+    with store._connect() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO evidence_items"
+            "(id,bundle_id,case_id,kind,path,sha256,size_bytes,mime_type,producer,"
+            "command_json,cwd_relpath,env_digest,exit_code,started_at,ended_at,metadata_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ident, bundle_id, case_id, kind, str(path), digest, len(sealed),
+             mime_type, "verification-runner", None, ".", None, None,
+             started_at, ended_at, json.dumps(metadata, sort_keys=True)),
+        )
+    return {"id": ident, "sha256": digest, "size_bytes": len(sealed), "kind": kind,
+            "redaction_state": redaction_state}
+
+
+def _uncertain_capture_reason(bundle_id: str) -> str | None:
+    with store._connect() as db:
+        rows = db.execute(
+            "SELECT id,metadata_json FROM evidence_items WHERE bundle_id=? ORDER BY id",
+            (bundle_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if metadata.get("redaction_state") == "uncertain":
+            return f"redaction_failed: evidence item {row['id']} redaction is uncertain"
+    return None
 
 
 def _minimal_case_env(
@@ -384,6 +583,91 @@ def _kill_child(proc: subprocess.Popen[bytes], token: str | None) -> None:
     spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
 
 
+def _reap_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort process-group cleanup for a leader that already exited normally.
+
+    ``verified_killpg`` cannot be used here: it re-verifies the leader's OS
+    start token immediately before signalling, but the leader has already
+    exited and been reaped by ``communicate()`` -- there is nothing left to
+    re-verify. Holding this exact ``Popen`` object end-to-end already proves
+    ``proc.pid`` was our own child and (via ``start_new_session=True``) its
+    own process-group leader; ``killpg`` on that group id catches any
+    grandchild the case detached before it exited (finding #10, verification
+    adversarial lane -- attack #13, "browser exits while the child app
+    remains").
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+_PYTEST_COUNT = re.compile(
+    r"(?i)\b(\d+)\s+(passed|failed|error|errors|deselected)\b"
+)
+_PYTEST_NO_TESTS_RAN = re.compile(r"(?i)\bno tests ran\b")
+
+
+def _pytest_summary_ok(output: bytes, min_passed: int) -> bool:
+    """Structurally require a real, positive pytest summary -- not just exit 0.
+
+    A command that prints a fabricated count, or one whose real run
+    deselected/collected nothing, must not read as success just because the
+    oracle text technically appears somewhere in the log (findings #9/#8,
+    verification adversarial lane -- attacks #4/#5).
+    """
+    text = output.decode("utf-8", errors="replace")
+    if _PYTEST_NO_TESTS_RAN.search(text):
+        return False
+    counts: dict[str, int] = {}
+    for value, label in _PYTEST_COUNT.findall(text):
+        counts[label.lower()] = counts.get(label.lower(), 0) + int(value)
+    failed = counts.get("failed", 0) + counts.get("error", 0) + counts.get("errors", 0)
+    return counts.get("passed", 0) >= min_passed and failed == 0
+
+
+def run_supervised_sidecar(
+    argv: list[str], *, cwd: Path, env: dict[str, str], grace_seconds: float = 2.0,
+) -> tuple[subprocess.Popen[bytes], str | None]:
+    """Start a background capture-style sidecar (e.g. a future ffmpeg wrapper).
+
+    Returns the process and its verified OS start token; the caller MUST
+    call :func:`stop_supervised_sidecar` before treating the case as
+    finished, or a hung sidecar (finding #10, verification adversarial lane
+    -- attack #12, "ffmpeg hangs after tests finish") outlives evidence
+    collection.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    from shipfactory import spawn
+    token = spawn._capture_start_token(proc.pid, proc)
+    return proc, token
+
+
+def stop_supervised_sidecar(
+    proc: subprocess.Popen[bytes], token: str | None, *, grace_seconds: float = 2.0,
+) -> int:
+    """Terminate a sidecar deterministically: SIGTERM, then SIGKILL escalation.
+
+    Never blocks indefinitely on a sidecar that ignores SIGTERM (a hung
+    ffmpeg-equivalent) -- evidence collection must proceed regardless.
+    """
+    from shipfactory import spawn
+    if proc.poll() is None:
+        spawn.verified_killpg(proc.pid, token, signal.SIGTERM)
+        try:
+            proc.wait(timeout=max(0.0, grace_seconds))
+        except subprocess.TimeoutExpired:
+            spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    return -1 if proc.returncode is None else proc.returncode
+
+
 Driver = Callable[[dict[str, Any], Path, dict[str, str], int], dict[str, Any]]
 
 
@@ -429,9 +713,20 @@ def _command_driver(
             "exit_code": proc.returncode, "started_at": started, "ended_at": store._now(),
             "run_id": run_id, "process_start_token": process_start_token,
         }
+    # The case's own process exiting does not guarantee a detached grandchild
+    # it spawned (e.g. a backgrounded "app" process, standing in for what a
+    # real browser/child-app pairing would leave behind) also exited: reap
+    # the whole process group defensively even on the normal-completion path,
+    # not just on timeout (finding #10, verification adversarial lane --
+    # attack #13, "browser process exits while the child app remains").
+    _reap_process_group(proc)
     oracle = case["oracle"]
     if oracle["type"] == "exit_code":
         passed = proc.returncode == int(oracle["equals"])
+    elif oracle["type"] == "pytest_summary":
+        passed = proc.returncode == 0 and _pytest_summary_ok(
+            stdout + stderr, int(oracle.get("min_passed", 1)),
+        )
     else:
         stream = oracle.get("stream", "combined")
         selected = stdout if stream == "stdout" else stderr if stream == "stderr" else stdout + stderr
@@ -633,8 +928,19 @@ def _bundle_payload(bundle_id: str, *, phase_b_eligible: bool,
 
 def _seal_bundle(bundle_id: str, *, final_state: str, reason: str | None,
                  phase_b_eligible: bool,
-                 required_case_ids: list[str] | None = None) -> dict[str, Any]:
+                 required_case_ids: list[str] | None = None,
+                 extra_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     required = sorted(set(required_case_ids or ()))
+    with store._connect() as db:
+        bundle_row = dict(db.execute(
+            "SELECT * FROM evidence_bundles WHERE id=?", (bundle_id,),
+        ).fetchone())
+    # §2.4.9: a captured artifact that cannot be redacted with confidence
+    # (binary screenshot/video) must block sealing outright, not seal silently
+    # as if it were scanned clean (finding #2, verification adversarial lane).
+    uncertain_reason = _uncertain_capture_reason(bundle_id)
+    if uncertain_reason is not None:
+        final_state, reason, phase_b_eligible = "blocked", uncertain_reason, False
     if final_state == "done":
         with store._connect() as db:
             rows = db.execute(
@@ -650,22 +956,43 @@ def _seal_bundle(bundle_id: str, *, final_state: str, reason: str | None,
             final_state = "failed"
             reason = "evidence_invariant: required verification case results are missing"
             phase_b_eligible = False
+    # Autonomous-graduation eligibility is visible cross-activation history,
+    # not a per-bundle fact alone: a step whose earlier activation failed or
+    # was itself ineligible cannot quietly graduate just because a *later*
+    # activation ran clean (finding #16, verification adversarial lane).
+    with store._connect() as db:
+        prior_rows = db.execute(
+            "SELECT activation,state,phase_b_eligible FROM evidence_bundles "
+            "WHERE instance_id=? AND step_id=? AND activation<? AND sealed_at IS NOT NULL "
+            "ORDER BY activation",
+            (bundle_row["instance_id"], bundle_row["step_id"], int(bundle_row["activation"])),
+        ).fetchall()
+    prior_failures = [
+        {"activation": int(prior["activation"]), "state": prior["state"],
+         "phase_b_eligible": bool(prior["phase_b_eligible"])}
+        for prior in prior_rows
+        if prior["state"] != "done" or not prior["phase_b_eligible"]
+    ]
+    if prior_failures and phase_b_eligible:
+        phase_b_eligible = False
     payload = _bundle_payload(
         bundle_id, phase_b_eligible=phase_b_eligible,
         outcome_state=final_state, invalid_reason=reason,
         required_case_ids=required,
     )
+    payload["prior_activation_failures"] = prior_failures
+    payload.update(extra_payload or {})
     digest = hashlib.sha256(_canonical(payload)).hexdigest()
     payload["bundle_sha256"] = digest
-    with store._connect() as db:
-        row = db.execute("SELECT * FROM evidence_bundles WHERE id=?", (bundle_id,)).fetchone()
-        root = _evidence_root(row["instance_id"], row["step_id"], int(row["activation"]))
+    root = _evidence_root(
+        bundle_row["instance_id"], bundle_row["step_id"], int(bundle_row["activation"]),
+    )
     _copy_once(root / "bundle.json", _canonical(payload) + b"\n")
     with store._connect() as db:
         db.execute(
-            "UPDATE evidence_bundles SET state=?,bundle_sha256=?,sealed_at=?,invalid_reason=? "
-            "WHERE id=?",
-            (final_state, digest, store._now(), reason, bundle_id),
+            "UPDATE evidence_bundles SET state=?,bundle_sha256=?,sealed_at=?,invalid_reason=?,"
+            "phase_b_eligible=? WHERE id=?",
+            (final_state, digest, store._now(), reason, int(bool(phase_b_eligible)), bundle_id),
         )
         row = db.execute("SELECT * FROM evidence_bundles WHERE id=?", (bundle_id,)).fetchone()
     return dict(row)
@@ -714,6 +1041,31 @@ def run_verification(
             bundle_id, final_state="failed", reason=f"evidence_invariant: {exc}",
             phase_b_eligible=False,
         )
+    diff_paths: list[str] = []
+    if base_sha != head_sha:
+        try:
+            diff_output = _git(workspace, "diff", "--name-only", base_sha, head_sha)
+            diff_paths = [line for line in diff_output.splitlines() if line]
+        except VerificationManifestError:
+            diff_paths = []
+    control_plane_touched = bool(diff_paths and set(diff_paths) & control_plane_paths(manifest))
+    # §2.4.7: deterministic surface floor. Opt-in via profile["surface"] so
+    # callers that have not wired a surface classification into their
+    # profile config keep their existing behavior (finding #4, verification
+    # adversarial lane).
+    declared_surface = profile.get("surface")
+    if declared_surface is not None:
+        required_surface = classify_required_surface(diff_paths)
+        if _SURFACE_LEVELS.get(declared_surface, -1) < _SURFACE_LEVELS[required_surface]:
+            reason = (
+                f"evidence_invariant: profile surface {declared_surface!r} is below "
+                f"the deterministic floor {required_surface!r} for this change"
+            )
+            _set_bundle_state(bundle_id, "failed", reason)
+            return _seal_bundle(
+                bundle_id, final_state="failed", reason=reason, phase_b_eligible=False,
+                extra_payload={"control_plane_touched": control_plane_touched},
+            )
     _set_bundle_state(bundle_id, "running")
     root = _evidence_root(instance_id, step_id, activation)
     registry = {**DRIVERS, **(drivers or {})}
@@ -855,6 +1207,7 @@ def run_verification(
         bundle_id, final_state=final_state, reason=failure_reason,
         phase_b_eligible=(failure_reason is None and not infra_recovered),
         required_case_ids=required_case_ids,
+        extra_payload={"control_plane_touched": control_plane_touched},
     )
 
 
@@ -1005,6 +1358,34 @@ def _spawn_runner(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "pending", "bundle_id": bundle_id, "reason": "verification running"}
 
 
+def _assert_workspace_owner(payload: dict[str, Any]) -> None:
+    """Cross-check a claimed workspace against its recorded task owner.
+
+    ``assert_commit_binding`` only proves that whatever directory is passed
+    in has the right HEAD/tree SHAs -- two different worktrees can share
+    identical content (a clone, a stale sibling checkout) and both satisfy
+    that check. When the caller declares which task's worktree this is
+    supposed to be (``workspace_owner_task_id``), require it to match the
+    workspace shipfactory itself actually recorded for that task's own run
+    (finding #1, verification adversarial lane). Opt-in: payloads that omit
+    the owner id (e.g. callers/tests with no task-run history yet) are
+    unaffected.
+    """
+    owner_task_id = payload.get("workspace_owner_task_id")
+    if not owner_task_id:
+        return
+    recorded = store.workspace_path_for_task(str(owner_task_id))
+    if recorded is None:
+        return
+    claimed = Path(payload["workspace"]).resolve()
+    expected = Path(recorded).resolve()
+    if claimed != expected:
+        raise CommitBindingError(
+            f"workspace {claimed} does not match the worktree recorded for "
+            f"task {owner_task_id} ({expected})"
+        )
+
+
 def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     """Prepare one action and start or probe its asynchronous runner child."""
     reap_runs()
@@ -1012,6 +1393,11 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         _candidate, _protected, primary = _load_action_manifests(payload)
     except VerificationError as exc:
+        failed = _manifest_failure_bundle(payload, exc)
+        return {"status": "failed", "bundle_id": failed["id"]}
+    try:
+        _assert_workspace_owner(payload)
+    except CommitBindingError as exc:
         failed = _manifest_failure_bundle(payload, exc)
         return {"status": "failed", "bundle_id": failed["id"]}
     prepared_id = _bundle_id(
@@ -1121,6 +1507,12 @@ def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str
         if (not stat.S_ISREG(info.st_mode) or len(data) != int(item["size_bytes"])
                 or hashlib.sha256(data).hexdigest() != item["sha256"]):
             raise EvidenceInvariantError(f"evidence item {item['id']} hash/size mismatch")
+        if item["kind"] in _CAPTURE_KINDS:
+            _validate_capture_container(
+                data, expected_instance_id=bundle["instance_id"],
+                expected_head_sha=bundle["head_sha"], expected_bundle_id=bundle_id,
+                expected_case_id=str(item["case_id"]),
+            )
     unsigned = dict(document)
     claimed_digest = unsigned.pop("bundle_sha256", None)
     actual_digest = hashlib.sha256(_canonical(unsigned)).hexdigest()
@@ -1162,11 +1554,13 @@ def read_evidence_item(item_id: str) -> tuple[dict[str, Any], bytes]:
 __all__ = [
     "VERIFICATION_SCHEMA", "EVIDENCE_SCHEMA", "DEFAULT_MANIFEST_PATH", "DRIVERS",
     "VerificationError", "VerificationManifestError", "EvidenceInvariantError",
-    "CommitBindingError", "VerificationManifest", "validate_verification_manifest",
+    "CommitBindingError", "CaptureContainerError", "VerificationManifest",
+    "validate_verification_manifest",
     "load_verification_manifest", "load_verification_manifest_if_present",
     "control_plane_paths", "assert_commit_binding", "run_verification", "run_action",
     "restore_runs", "reap_runs", "verify_evidence_bundle",
-    "read_evidence_item",
+    "read_evidence_item", "build_capture_container", "classify_required_surface",
+    "run_supervised_sidecar", "stop_supervised_sidecar",
 ]
 
 

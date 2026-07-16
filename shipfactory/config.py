@@ -42,7 +42,7 @@ VERIFICATION_PROFILE_FIELDS = frozenset({
     "max_log_bytes", "capture_video", "capture_trace", "capture_har",
     "browser_slots",
 })
-VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env"})
+VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env", "surface"})
 
 
 class FactoryConfigError(ValueError):
@@ -155,6 +155,23 @@ def load_seats(path=None) -> FactoryConfig:
     cfg = FactoryConfig(str(raw.get("company", "")), seats, raw.get("hierarchy_gates", {}) or {}, recipes)
     validate(cfg)
     return cfg
+
+
+def reviewer_shares_builder_provider(cfg: FactoryConfig, builder_seat: str, reviewer_seat: str) -> bool:
+    """True when two differently-named seats resolve to the identical execution identity.
+
+    A reviewer configured with the same (executor, profile, model) as the
+    builder it reviews is not an independent review even though the seat
+    *names* differ (finding #3, verification adversarial lane / attack #17).
+    """
+    builder = cfg.seats.get(builder_seat)
+    reviewer = cfg.seats.get(reviewer_seat)
+    if builder is None or reviewer is None or builder.name == reviewer.name:
+        return False
+    return (
+        (builder.executor, builder.profile, builder.model)
+        == (reviewer.executor, reviewer.profile, reviewer.model)
+    )
 
 
 def validate(cfg) -> None:

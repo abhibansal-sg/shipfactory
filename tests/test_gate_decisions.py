@@ -325,7 +325,7 @@ def test_gate_decision_migration_is_normative_sql():
         columns = [row["name"] for row in db.execute("PRAGMA table_info(gate_decisions)")]
         version = db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
         indexes = [row["name"] for row in db.execute("PRAGMA index_list(gate_decisions)")]
-    assert version == 11
+    assert version == 12
     assert columns == [
         "id", "instance_id", "step_id", "activation", "revision_hash",
         "evidence_bundle_id", "evidence_bundle_hash", "actor_kind", "actor_id",

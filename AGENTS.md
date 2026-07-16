@@ -218,12 +218,112 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   into `${request}` substitution, and a real plan node targeting the
   hidden file alongside the exploration deception (finding #4, cross-lab
   review of the SF-7 adversarial lane).
+- `assert_commit_binding` proved a workspace's git identity (clean, HEAD,
+  tree) but never proved that workspace was the *specific* one shipfactory
+  actually spawned for the candidate — two different worktrees checked out
+  from the same repo naturally share identical HEAD/tree SHAs, so a wrong-
+  worktree bug or swap would pass every existing check. `run_action` now
+  cross-checks an opt-in `workspace_owner_task_id` against the workspace
+  shipfactory's own `runs` table recorded for that task's real spawn,
+  independent of git content (finding #35, verification adversarial lane).
+- Evidence items were only ever integrity-checked by whole-file hash against
+  their own DB row — sufficient to catch tampering, but not to catch a
+  *legitimately re-hashed* copy of stale evidence (an old video/trace
+  wholesale-copied into a fresh bundle's directory, its own sha256 freshly
+  and honestly computed on those stale bytes). Captured evidence
+  (video/trace/screenshot/HAR) now goes through a runner-owned container
+  format (`build_capture_container`) that stamps instance/head/bundle/case
+  identity *inside* the sealed bytes, stamped by the trusted runner scope
+  only — never from driver/case output — and `verify_evidence_bundle` checks
+  that stamped identity against the bundle's own row, and the header's
+  declared payload hash/length against the actual trailing bytes (catches a
+  capture pipeline that crashed mid-write, header committed, body
+  truncated). Binary captures (screenshot/video) cannot be text-scanned for
+  secrets, so they are unconditionally `redaction_state="uncertain"` and
+  force sealing to `blocked(redaction_failed)` rather than seal silently
+  (finding #36, verification adversarial lane).
+- The engine had no mechanism binding a review approval to the evidence the
+  reviewer was supposed to have opened: `parse_verdict`/`citation_ok` only
+  required a file:line-shaped citation somewhere in the body, never the
+  sealed bundle's own hash, and nothing re-checked commit binding between
+  when verification sealed and when the approval was actually applied.
+  `_review_approval_blocker` now re-verifies the upstream verification
+  step's sealed bundle live (integrity + `state=="done"`), re-runs
+  `assert_commit_binding` against the candidate's own worktree at
+  decision-time (catching a candidate that mutates the workspace *after*
+  verification but *before* review), and requires the verdict body to
+  literally cite the bundle's `bundle_sha256` before an approve is honored.
+  The same blocker also now refuses an approval when the reviewing seat
+  resolves to the identical (executor, profile, model) as the seat that
+  produced the change-set it's reviewing, even under a different seat name
+  (`config.reviewer_shares_builder_provider`) — a same-provider "review" is
+  not independent just because the seat name differs (finding #37,
+  verification adversarial lane).
+- §2.4.7's deterministic surface policy (UI→browser, API→api, migration→
+  migration, unknown→stricter) did not exist anywhere; verification profile
+  selection was a bare recipe-declared string with zero relationship to what
+  the diff actually touched. `classify_required_surface` now derives a
+  floor from the changed-path set, and `run_verification` enforces it
+  opt-in via `profile["surface"]` (backward compatible with every profile
+  that hasn't declared one yet) — a model's own risk classification may
+  combine with the floor via `max()`, never substitute for or lower it
+  (finding #38, verification adversarial lane).
+- `verification.control_plane_paths()` (distinct from the SF-8
+  `environments.control_plane_paths()`) was defined and exported but never
+  called anywhere — nothing recorded whether a candidate's diff actually
+  touched the verification manifest or its playwright scripts, which the
+  SF-9 brief itself calls "control-plane risk." `run_verification` now
+  diffs base_sha..head_sha and embeds `control_plane_touched` in the sealed
+  bundle payload so this is auditable (finding #38, verification adversarial
+  lane).
+- Redaction only pattern-scanned "Header: value"-shaped text. HAR represents
+  headers as `{"name": ..., "value": ...}` JSON pairs, so a Cookie/
+  Authorization value sitting in a HAR capture sailed through untouched
+  even though §2.4.9 explicitly requires cookies/auth headers stripped from
+  HAR. Added a JSON-aware pattern for that shape. Separately, the existing
+  `token=`/`secret=`-style pattern's stop-character class excluded only
+  whitespace/comma/semicolon — inside JSON it happily consumed past the
+  closing quote into the next key, corrupting the document. Both are fixed
+  in `_SECRET_PATTERNS` (finding #39, verification adversarial lane).
+- `phase_b_eligible` ("autonomous graduation eligible") was computed purely
+  per-bundle: a step whose activation 1 genuinely failed and activation 2
+  then ran clean showed activation 2 as eligible with zero trace of
+  activation 1's failure. Sealing now looks up prior sealed activations of
+  the same instance/step, forces `phase_b_eligible=False` if any were
+  non-`done` or themselves ineligible, and records exactly which in
+  `prior_activation_failures` on the sealed bundle — history stays visible,
+  it does not just quietly reset every activation (finding #40,
+  verification adversarial lane).
+- `output_contains`/`exit_code` oracles cannot see both "did real tests run"
+  and "did the exit code lie" at once: a command that prints a fabricated
+  `"125 passed"` and exits nonzero, or one that deselects everything and
+  exits zero, can satisfy a naively-authored oracle. Added an explicit
+  `pytest_summary` oracle type that requires `exit_code==0`, a real parsed
+  passed-count ≥ `min_passed`, zero parsed failures/errors, and rejects
+  `"no tests ran"`/all-deselected outright — a structural fail-closed
+  alternative for manifest authors, not a fix to the other oracle types
+  (their honest text/exit-code semantics are unchanged and still footguns
+  if misused) (finding #41, verification adversarial lane).
+- The command driver only reaped its process group on timeout
+  (`_kill_child`), never on normal completion — a case whose own process
+  exited 0 could still leave a detached grandchild (a backgrounded "app",
+  standing in for what a real browser/child-app pairing would leave
+  behind) running past evidence collection. `verified_killpg`'s token
+  re-verification is meaningless for a leader that already exited and was
+  reaped (there is nothing left to verify against), so the fix is a
+  separate best-effort `_reap_process_group` (`os.killpg` directly) called
+  right after every successful `communicate()`, not a weakening of
+  `verified_killpg` itself. Added `run_supervised_sidecar`/
+  `stop_supervised_sidecar` (SIGTERM, then bounded SIGKILL escalation) as
+  the general primitive a future real ffmpeg/video-capture wrapper needs so
+  a hung sidecar can never block evidence collection (finding #42,
+  verification adversarial lane).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#34 so far). When you fix one: commit message
+- Findings get numbers (#22–#42 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

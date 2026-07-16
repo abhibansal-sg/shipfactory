@@ -227,8 +227,40 @@ def _review_stalled(db: Any, instance_id: str, step: dict[str, Any], count: int)
                 and int(previous["finding_count"]) >= 0 and count >= int(previous["finding_count"]))
 
 
+def _step_change_set_workspace(
+    conn: Any, latest: dict[str, dict[str, Any]], definition: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve a v2 step's declared change-set producer worktree and its owner task.
+
+    Shared by verification scheduling and review-approval binding so both
+    resolve "the candidate's own worktree" identically (finding #1,
+    verification adversarial lane).
+    """
+    from hermes_cli import kanban_db
+    workspace = None
+    owner_task_id = None
+    fallback_workspace = None
+    fallback_owner = None
+    for declared_input in definition.get("inputs", []):
+        producer = latest.get(declared_input["from"])
+        if producer and producer.get("kanban_task_id"):
+            producer_task = kanban_db.get_task(conn, producer["kanban_task_id"])
+            candidate_workspace = getattr(producer_task, "workspace_path", None)
+            if candidate_workspace:
+                fallback_workspace = fallback_workspace or candidate_workspace
+                fallback_owner = fallback_owner or producer["kanban_task_id"]
+                if declared_input["kind"] == "change-set":
+                    workspace = candidate_workspace
+                    owner_task_id = producer["kanban_task_id"]
+                    break
+    return workspace or fallback_workspace, owner_task_id or fallback_owner
+
+
 def _review_approval_blocker(db: Any, instance_id: str,
-                             definition: dict[str, Any]) -> str | None:
+                             definition: dict[str, Any], *,
+                             verdict_body: str = "", recipe: dict[str, Any] | None = None,
+                             conn: Any = None, latest: dict[str, dict[str, Any]] | None = None,
+                             defs: dict[str, dict[str, Any]] | None = None) -> str | None:
     """Return a factory-enforced reason that forbids a review approval."""
     if definition.get("primitive") != "review_gate":
         return None
@@ -236,6 +268,61 @@ def _review_approval_blocker(db: Any, instance_id: str,
     for artifact in input_artifacts(db, instance_id, definition):
         if artifact["kind"] == "task-spec" and task_spec_has_clarifications(artifact):
             return "clarifications_nonempty"
+    defs = defs or ({item["id"]: item for item in recipe["steps"]} if recipe else {})
+    # Evidence-bound review (§2.4.8): an approval that follows a verification
+    # step must be bound to the exact live sealed bundle, never model prose
+    # alone (finding #3, verification adversarial lane -- #9 and #18).
+    verification_producers = [
+        needed for needed in definition.get("needs", [])
+        if defs.get(needed, {}).get("primitive") == "verification"
+    ]
+    for producer_id in verification_producers:
+        bundle_row = db.execute(
+            "SELECT * FROM evidence_bundles WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1",
+            (instance_id, producer_id),
+        ).fetchone()
+        if bundle_row is None:
+            return "evidence_missing"
+        bundle = dict(bundle_row)
+        from shipfactory.verification import (
+            CommitBindingError, EvidenceInvariantError, assert_commit_binding,
+            verify_evidence_bundle,
+        )
+        try:
+            verify_evidence_bundle(bundle["id"], db=db)
+        except EvidenceInvariantError as exc:
+            return f"evidence_invariant:{exc}"
+        if bundle["state"] != "done":
+            return "verification_not_passed"
+        if conn is not None and latest is not None:
+            workspace, _owner = _step_change_set_workspace(conn, latest, definition)
+            if workspace:
+                try:
+                    assert_commit_binding(workspace, bundle["head_sha"], bundle["tree_sha"])
+                except CommitBindingError as exc:
+                    return f"candidate_mutated_after_verification:{exc}"
+        if not bundle.get("bundle_sha256") or bundle["bundle_sha256"] not in str(verdict_body or ""):
+            return "evidence_not_cited"
+    # Reviewer/builder provider independence (finding #3): a differently
+    # named reviewer seat configured identically to the builder seat is not
+    # an independent review.
+    change_set_producer_id = next(
+        (item["from"] for item in definition.get("inputs", [])
+         if item.get("kind") == "change-set"),
+        None,
+    )
+    if change_set_producer_id and defs.get(change_set_producer_id, {}).get("primitive") == "agent_task":
+        builder_seat = defs[change_set_producer_id]["params"].get("seat")
+        reviewer_seat = definition["params"].get("seat")
+        if builder_seat and reviewer_seat and builder_seat != reviewer_seat:
+            from shipfactory.config import load_seats, reviewer_shares_builder_provider
+            try:
+                cfg = load_seats()
+            except Exception:
+                cfg = None
+            if cfg is not None and reviewer_shares_builder_provider(cfg, builder_seat, reviewer_seat):
+                return "reviewer_shares_builder_provider"
     return None
 
 def _result_one_liner(value: str | None) -> str | None:
@@ -727,6 +814,9 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             if verdict["outcome"] == "approve":
                                 approval_blocker = _review_approval_blocker(
                                     db, instance_id, definition,
+                                    verdict_body=verdict.get("body", ""), defs=defs,
+                                    conn=conn,
+                                    latest={x["step_id"]: x for x in _latest(db, instance_id)},
                                 )
                                 if approval_blocker:
                                     changed |= _transition(
@@ -846,19 +936,9 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             reason="missing verification profile",
                         )
                         continue
-                    workspace = None
-                    fallback_workspace = None
-                    for declared_input in definition.get("inputs", []):
-                        producer = latest.get(declared_input["from"])
-                        if producer and producer.get("kanban_task_id"):
-                            producer_task = kanban_db.get_task(conn, producer["kanban_task_id"])
-                            candidate_workspace = getattr(producer_task, "workspace_path", None)
-                            if candidate_workspace:
-                                fallback_workspace = fallback_workspace or candidate_workspace
-                                if declared_input["kind"] == "change-set":
-                                    workspace = candidate_workspace
-                                    break
-                    workspace = workspace or fallback_workspace
+                    workspace, workspace_owner_task_id = _step_change_set_workspace(
+                        conn, latest, definition,
+                    )
                     if not workspace:
                         changed |= _transition(
                             db, instance, step, "failed", "workspace",
@@ -923,6 +1003,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             "input_revision_hash": step.get("input_artifact_set_hash") or "none",
                             "base_sha": instance["base_sha"], "head_sha": head_sha,
                             "tree_sha": tree_sha, "workspace": str(workspace),
+                            "workspace_owner_task_id": workspace_owner_task_id,
                             "manifest_relpath": manifest_relpath,
                             "manifest_blob_sha": (candidate or protected).blob_sha,
                             "candidate_manifest_blob_sha": (

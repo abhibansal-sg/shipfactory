@@ -335,6 +335,12 @@ _GATE_DECISION_MIGRATION_STATEMENTS = (
 _GATE_DECISION_MIGRATION_TEXT = (
     ";\n".join(_GATE_DECISION_MIGRATION_STATEMENTS) + ";\n"
 )
+_VERIFICATION_HARDENING_MIGRATION_STATEMENTS = (
+    "ALTER TABLE evidence_bundles ADD COLUMN phase_b_eligible INTEGER",
+)
+_VERIFICATION_HARDENING_MIGRATION_TEXT = (
+    ";\n".join(_VERIFICATION_HARDENING_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -347,6 +353,7 @@ _MIGRATIONS = (
     (9, "sf7_run_access_enforcement_level", _RUN_ACCESS_ENFORCEMENT_MIGRATION_TEXT),
     (10, "sf9_verification_evidence", _VERIFICATION_MIGRATION_TEXT),
     (11, "sf11_bound_gate_decisions", _GATE_DECISION_MIGRATION_TEXT),
+    (12, "verification_adversarial_hardening", _VERIFICATION_HARDENING_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -360,6 +367,7 @@ _MIGRATION_STATEMENTS = {
     9: _RUN_ACCESS_ENFORCEMENT_MIGRATION_STATEMENTS,
     10: _VERIFICATION_MIGRATION_STATEMENTS,
     11: _GATE_DECISION_MIGRATION_STATEMENTS,
+    12: _VERIFICATION_HARDENING_MIGRATION_STATEMENTS,
 }
 
 
@@ -553,8 +561,13 @@ def init_db() -> None:
                         {"evidence_bundles", "evidence_items", "verification_cases"}
                         & existing_tables
                     )
-                else:
+                elif version == 11:
                     migration_artifacts = "gate_decisions" in existing_tables
+                else:
+                    bundle_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(evidence_bundles)"
+                    )}
+                    migration_artifacts = "phase_b_eligible" in bundle_columns
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
                 for statement in _MIGRATION_STATEMENTS[version]:
@@ -623,6 +636,25 @@ def nonterminal_verification_runs() -> list[dict[str, Any]]:
             "SELECT * FROM runs WHERE ended_at IS NULL "
             "AND executor IN ('verification','verification-runner') ORDER BY id"
         ))
+
+
+def workspace_path_for_task(task_id: str) -> str | None:
+    """Return the most recently recorded workspace for a real shipfactory run.
+
+    Used to cross-check a verification action's claimed ``workspace`` against
+    the worktree shipfactory itself actually spawned for the candidate's
+    owning task, independent of git content (finding #1, verification
+    adversarial lane): two different worktrees can share identical head/tree
+    SHAs, so SHA equality alone cannot prove "this is the right worktree."
+    """
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT workspace_path FROM runs WHERE task_id=? AND workspace_path IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    return row["workspace_path"] if row else None
 
 
 def run_row(run_id: int) -> dict[str, Any] | None:

@@ -124,12 +124,13 @@ def _cleanup_async_verifiers():
 def test_schema_migration_is_normative_and_numbered():
     store.init_db()
     with store._connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 12
         assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_bundles)")] == [
             "id", "instance_id", "step_id", "activation", "input_revision_hash",
             "base_sha", "head_sha", "tree_sha", "environment_session_id",
             "manifest_relpath", "manifest_blob_sha", "state", "bundle_sha256",
             "redaction_state", "created_at", "sealed_at", "invalid_reason",
+            "phase_b_eligible",
         ]
         assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_items)")][-4:] == [
             "exit_code", "started_at", "ended_at", "metadata_json",
