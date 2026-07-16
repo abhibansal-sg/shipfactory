@@ -55,7 +55,7 @@ def _profile(**updates):
         "max_runtime_seconds": 10, "infrastructure_retries": 1,
         "max_evidence_bytes": 100_000, "max_log_bytes": 50_000,
         "capture_video": False, "capture_trace": False, "capture_har": False,
-        "browser_slots": 1,
+        "browser_slots": 1, "surface": "stricter",
     }
     value.update(updates)
     return value
@@ -124,16 +124,25 @@ def _cleanup_async_verifiers():
 def test_schema_migration_is_normative_and_numbered():
     store.init_db()
     with store._connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
         assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_bundles)")] == [
             "id", "instance_id", "step_id", "activation", "input_revision_hash",
             "base_sha", "head_sha", "tree_sha", "environment_session_id",
             "manifest_relpath", "manifest_blob_sha", "state", "bundle_sha256",
             "redaction_state", "created_at", "sealed_at", "invalid_reason",
+            "phase_b_eligible",
+            "workspace_path", "workspace_owner_task_id", "workspace_owner_activation",
+            "workspace_owner_run_id", "required_surface", "environment_identity_json",
         ]
-        assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_items)")][-4:] == [
-            "exit_code", "started_at", "ended_at", "metadata_json",
+        assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_items)")][-5:] == [
+            "exit_code", "started_at", "ended_at", "metadata_json", "attempt",
         ]
+        assert "recipe_activation" in {
+            row["name"] for row in db.execute("PRAGMA table_info(runs)")
+        }
+        assert "producer_run_id" in {
+            row["name"] for row in db.execute("PRAGMA table_info(recipe_steps)")
+        }
 
 
 def test_manifest_is_blob_pinned_covers_requirements_and_rejects_tamper(tmp_path):

@@ -40,9 +40,9 @@ ENVIRONMENT_RUNTIME_DEFAULTS = {
 VERIFICATION_PROFILE_FIELDS = frozenset({
     "max_runtime_seconds", "infrastructure_retries", "max_evidence_bytes",
     "max_log_bytes", "capture_video", "capture_trace", "capture_har",
-    "browser_slots",
+    "browser_slots", "surface",
 })
-VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env"})
+VERIFICATION_PROFILE_OPTIONAL_FIELDS = frozenset({"env", "model_risk_surface"})
 
 
 class FactoryConfigError(ValueError):
@@ -157,6 +157,23 @@ def load_seats(path=None) -> FactoryConfig:
     return cfg
 
 
+def reviewer_shares_builder_provider(cfg: FactoryConfig, builder_seat: str, reviewer_seat: str) -> bool:
+    """True when two seats resolve to the same provider family.
+
+    Profiles and models are variants inside a provider family, not independent
+    providers.  A Claude Opus builder and Claude Sonnet reviewer still share
+    one provider family.  Missing seats are a configuration error so callers
+    cannot turn an unresolved identity into an approval.
+    """
+    builder = cfg.seats.get(builder_seat)
+    reviewer = cfg.seats.get(reviewer_seat)
+    if builder is None or reviewer is None:
+        raise FactoryConfigError(
+            f"cannot resolve reviewer independence for {builder_seat!r}/{reviewer_seat!r}"
+        )
+    return builder.executor.casefold() == reviewer.executor.casefold()
+
+
 def validate(cfg) -> None:
     """Validate required values, profiles, executors, roles, and hierarchy."""
     if not isinstance(cfg.company, str) or not cfg.company.strip():
@@ -234,6 +251,16 @@ def validate(cfg) -> None:
                 "capture_video", "capture_trace", "capture_har",
             )):
                 raise FactoryConfigError(f"invalid verification profile {name!r}")
+            if profile["surface"] not in {"api", "migration", "browser", "stricter"}:
+                raise FactoryConfigError(
+                    f"verification profile {name!r} surface is invalid"
+                )
+            if profile.get("model_risk_surface") not in {
+                None, "api", "migration", "browser", "stricter",
+            }:
+                raise FactoryConfigError(
+                    f"verification profile {name!r} model_risk_surface is invalid"
+                )
             declared_env = profile.get("env", {})
             if (not isinstance(declared_env, dict)
                     or not all(isinstance(key, str) and key and "=" not in key
@@ -326,5 +353,6 @@ __all__ = [
     "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS",
     "ENVIRONMENT_RUNTIME_DEFAULTS", "Seat",
     "load_seats", "recipe_runtime_config", "environment_runtime_config",
-    "selector_config", "verification_profiles_config", "validate",
+    "reviewer_shares_builder_provider", "selector_config",
+    "verification_profiles_config", "validate",
 ]

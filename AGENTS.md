@@ -218,12 +218,100 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   into `${request}` substitution, and a real plan node targeting the
   hidden file alongside the exploration deception (finding #4, cross-lab
   review of the SF-7 adversarial lane).
+- Git SHA equality cannot identify the worktree that produced a candidate.
+  Verification actions now carry the exact producer task, recipe activation,
+  durable run id, and workspace; migration 13 stores activation on `runs` and
+  the successful `producer_run_id` on `recipe_steps`. Missing, older, foreign,
+  or path-mismatched producer identities fail closed. App reuse is separately
+  bound to environment base/candidate SHA and workspace, the live PID start
+  token, and a no-cache `/.shipfactory/identity` probe for the current
+  instance/head before a healthy row is trusted (finding #35, verification
+  adversarial lane).
+- Capture is part of the production case loop, not a post-hoc helper. The
+  trusted browser subprocess emits pre-stamped SFEV containers; the parent
+  never gives attacker bytes a fresh identity. Kind, attempt, instance, head,
+  bundle, case, timestamp, payload hash, and payload length are checked before
+  an item is inserted, cumulative evidence budgets include captures, and any
+  copied/truncated/mis-redacted or uncertain binary capture blocks sealing.
+  Capture subprocesses use the same bounded supervised-sidecar lifecycle as
+  real browser evidence collection (finding #36, verification adversarial
+  lane).
+- V2 review tasks are activated with Factory-opened exact inputs: verified
+  sealed spec/plan bytes, the producer task+activation+run and binary diff,
+  every transitive sealed evidence-bundle byte sequence, and prior activation
+  history. Approval reopens the same inputs, traverses verification through
+  intermediate reviews, rechecks the candidate worktree, and verifies the
+  task's Factory-generated input digest; model-written hash testimony is not
+  an evidence boundary. Independence is enforced at executor/provider-family
+  level across profiles and models, and missing or invalid seat configuration
+  blocks approval (finding #37, verification adversarial lane).
+- Surface selection is mandatory. The advancer combines changed paths with
+  sealed spec/plan path claims, applies UI→browser, API→api, migration→rollback,
+  unknown→stricter, and passes that floor into the production action. Profiles
+  must declare a surface at or above it and the manifest must actually execute
+  the corresponding browser/API/rollback/protected behavior; model risk may
+  only raise the floor. Verification-control-plane touches are recorded in the
+  sealed payload (finding #38, verification adversarial lane).
+- HAR and structured trace redaction parses JSON recursively and is independent
+  of object key order; authorization/cookie header pairs and nested cookie
+  objects are replaced while the output remains valid JSON. The production
+  parent independently confirms the runner's redaction claim. Non-JSON/binary
+  traces are never replacement-decoded or rewritten: without provider-backed
+  structured redaction they remain byte-identical, are marked `uncertain`, and
+  block sealing (finding #39, verification adversarial lane).
+- Bundle verification compares every sealed security field with its DB row:
+  instance/step/activation, input revision, base/head/tree, manifest,
+  environment, workspace producer identity, required surface, redaction,
+  phase-B eligibility, state/reason, full case attempts, and the complete item
+  manifest. Prior failed/ineligible activations remain in
+  `prior_activation_failures` and keep later activations ineligible; neither DB
+  drift nor a freshly re-hashed stale item can reset history (finding #40,
+  verification adversarial lane).
+- `pytest_summary` no longer parses candidate stdout. It accepts only an actual
+  pytest argv instrumented with the runner-owned structured-evidence plugin and
+  nonce, a zero pytest exit status, real collected/passed counts at or above
+  `min_passed`, and zero failures/errors; fabricated wrappers, no-tests,
+  all-deselected, and mixed pass/fail runs fail closed (finding #41,
+  verification adversarial lane).
+- A pytest-shaped argv is not enough to trust its interpreter. A candidate could
+  commit `./python3` or a `./pytest` shebang chain, inherit the evidence path and
+  nonce, and forge the runner-owned JSON. Pytest launchers and their resolved
+  targets must both be executable, absolute, and outside the candidate
+  workspace; preserve an external virtualenv launcher path rather than resolving
+  away its `pyvenv.cfg` context (finding #43, verification rereview).
+- Normal, error, and timeout cleanup retain the leader as a waitable process
+  until token-fenced group cleanup; there is no raw post-reap `killpg`. A
+  process-tree tracker records PID/start-token/PGID identities and also stamps a
+  runner-owned supervision nonce so detached/reparented sessions can be found
+  on hosts that permit process-scope enumeration. Browser capture sidecars use
+  deterministic readiness, token-fenced SIGTERM, bounded SIGKILL escalation,
+  and descendant cleanup on every exit path. An incomplete process-scope scan
+  fails closed as `infrastructure_error` (including transient macOS psutil
+  `proc_environ` failures) rather than allowing a case to pass with uncertain
+  cleanup. Browser children retain a private `HOME`; only the browser cache
+  resolved through the selected Playwright interpreter is exposed, so real
+  browser execution works without restoring operator-home access (finding #42,
+  verification adversarial lane).
+- Migration coverage cannot be inferred from the word `rollback` in a case id or
+  argv. The protected manifest must declare separate `migration_down` and
+  `migration_up` command behaviors, both requiring exit code zero, using the
+  same non-trivial migration tool, and each direction must be a bare positional
+  primary subcommand (`argv[1]`, or `argv[2]` for an exactly named Python
+  executable running `<script>`). Option flags such as `--rollback`, scanning
+  every argument for `--reason=rollback-please`, and broad `python*` executable
+  matching are not behavioral boundaries. Candidate-only declarations never
+  satisfy the floor (finding #44, verification rereview).
+- Review-input binding has both focused blocker tests and a public-path v2
+  `reconcile()` regression. The latter completes a real review task with an
+  approve verdict and proves an unbound task blocks the step and instance with
+  `review_inputs_not_bound`; testing only `_review_approval_blocker` would miss
+  a future call-site bypass (finding #45, verification rereview).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#34 so far). When you fix one: commit message
+- Findings get numbers (#22–#45 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
