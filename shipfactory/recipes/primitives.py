@@ -190,6 +190,27 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
             and step_def.get("inputs")):
         review_context, _digest = build_review_input_context(db, instance, recipe, step_def)
         body += review_context
+    if (primitive in {"agent_task", "review_gate"}
+            and recipe.get("schema") == "shipfactory.recipe/v2"
+            and step_def.get("outputs")):
+        lines = ["\n\n## Factory output contract"]
+        for output in step_def["outputs"]:
+            kind, schema, path = output["kind"], output["schema"], output["path"]
+            if kind == "change-set":
+                lines.append(
+                    f"- `{kind}` (`{schema}`) at `{path}`: Factory generates this "
+                    "artifact after your successful exit. Do not write or modify this path."
+                )
+            else:
+                lines.append(
+                    f"- Write the artifact `{kind}` to the exact relative path `{path}`. "
+                    f"Its JSON must validate as `{schema}`."
+                )
+        lines.append(
+            "Create the parent `.shipfactory-output/` directory when needed. "
+            "A chat response is not an artifact; the file must exist before you report success."
+        )
+        body += "\n".join(lines)
     if primitive in {"agent_task", "review_gate"}:
         # board= must be explicit: create_task's default_workdir inheritance
         # falls back to get_current_board() (the GLOBAL current board), which
