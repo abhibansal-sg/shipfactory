@@ -198,9 +198,12 @@ def run_stage(conn: Any, board: str) -> dict[str, int]:
     settings = selector_config(recipes)
     if not recipes.get("enabled") or not settings["enabled"] or board != cfg.company:
         return result
-    library = load_library(recipes["library_path"])
     seats = set(cfg.seats)
     profiles = set(recipes["execution_profiles"])
+    library = load_library(
+        recipes["library_path"], seats=seats, profiles=profiles,
+        verification_profiles=set(recipes.get("verification_profiles", {})),
+    )
     allowance = int(settings["selection_allowance"])
     ceiling = int(recipes["board_day_token_ceiling"])
     tasks = kanban_db.list_tasks(

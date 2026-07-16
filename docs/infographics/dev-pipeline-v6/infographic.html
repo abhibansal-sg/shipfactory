@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ShipFactory dev-pipeline@6</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;background:#06172a;overflow:hidden}
+  svg{display:block;width:1600px;height:900px;font-family:Inter,Arial,sans-serif}
+  .title{fill:#f8fafc;font-weight:800;font-size:42px;letter-spacing:-1px}
+  .subtitle{fill:#dbeafe;font-size:19px;font-weight:600}
+  .phase{fill:#08213b;fill-opacity:.82;stroke:#7dd3fc;stroke-width:2}
+  .phase-label{fill:#67e8f9;font-size:16px;font-weight:800;letter-spacing:1px}
+  .node-bg{fill:#0f2d52;stroke-width:2.5}
+  .work{stroke:#3b82f6}.review{stroke:#a78bfa}.factory{stroke:#5eead4}.human{stroke:#f59e0b}
+  .work-fill{fill:#103b7a}.review-fill{fill:#38236c}.factory-fill{fill:#0b4f59}.human-fill{fill:#4a3507}
+  .node-num{fill:#fff;font-size:22px;font-weight:800}
+  .node-title{fill:#fff;font-size:18px;font-weight:800;letter-spacing:.3px}
+  .node-cap{fill:#dbeafe;font-size:12px;font-weight:600}
+  .flow{fill:none;stroke:#f8fafc;stroke-width:3;marker-end:url(#arrow-white)}
+  .rework{fill:none;stroke:#67e8f9;stroke-width:2.5;stroke-dasharray:5 5;marker-end:url(#arrow-cyan)}
+  .rework-label{fill:#67e8f9;font-size:11px;font-weight:800;letter-spacing:.7px}
+  .badge{fill:#071b30;stroke:#5eead4;stroke-width:1.5}
+  .badge-title{fill:#f8fafc;font-size:13px;font-weight:700}
+  .badge-sub{fill:#cbd5e1;font-size:11px;font-weight:600}
+  .legend{fill:#e2e8f0;font-size:14px;font-weight:700}
+  .tiny{fill:#99f6e4;font-size:11px;font-weight:700}
+</style>
+</head>
+<body>
+<svg viewBox="0 0 1600 900" role="img" aria-label="ShipFactory dev-pipeline version 6 workflow infographic">
+<defs>
+  <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#17324d" stroke-width=".7"/></pattern>
+  <marker id="arrow-white" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#f8fafc"/></marker>
+  <marker id="arrow-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#67e8f9"/></marker>
+  <linearGradient id="humanGrad" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#6b4b08"/><stop offset="1" stop-color="#302506"/></linearGradient>
+</defs>
+<rect width="1600" height="900" fill="#06172a"/><rect width="1600" height="900" fill="url(#grid)"/>
+
+<text x="800" y="56" text-anchor="middle" class="title">ShipFactory dev-pipeline@6</text>
+<text x="800" y="88" text-anchor="middle" class="subtitle">Sealed inputs → independent evidence → human approval</text>
+
+<!-- Phase boundaries -->
+<rect x="30" y="112" width="1540" height="166" rx="18" class="phase"/>
+<text x="55" y="138" class="phase-label">PHASE 1 — DISCOVER &amp; SPECIFY</text>
+<rect x="30" y="298" width="1540" height="166" rx="18" class="phase"/>
+<text x="55" y="324" class="phase-label">PHASE 2 — BUILD &amp; PROVE</text>
+<rect x="30" y="484" width="1540" height="166" rx="18" class="phase"/>
+<text x="55" y="510" class="phase-label">PHASE 3 — DECIDE &amp; REPORT</text>
+
+<!-- Main flow arrows behind nodes -->
+<path d="M310 200H350" class="flow"/><path d="M600 200H640" class="flow"/><path d="M890 200H930" class="flow"/><path d="M1180 200H1220" class="flow"/>
+<path d="M1470 200H1520Q1540 200 1540 220V290H45Q30 290 30 305V386H60" class="flow"/>
+<path d="M310 386H335" class="flow"/><path d="M515 386H570" class="flow"/><path d="M820 386H840" class="flow"/><path d="M1090 386H1120" class="flow"/>
+<path d="M1370 386H1520Q1540 386 1540 406V480H45Q30 480 30 495V568H60" class="flow"/>
+<path d="M350 568H480" class="flow"/><path d="M880 568H1100" class="flow"/>
+
+<!-- Rework arrows -->
+<path d="M765 244V262H475V244" class="rework"/><text x="620" y="258" text-anchor="middle" class="rework-label">SPEC REWORK</text>
+<path d="M1345 244V268H1055V244" class="rework"/><text x="1200" y="264" text-anchor="middle" class="rework-label">PLAN REWORK</text>
+<path d="M965 430V448H185V430" class="rework"/><rect x="500" y="432" width="150" height="17" rx="4" fill="#06172a"/><text x="575" y="444" text-anchor="middle" class="rework-label">CORRECTNESS → BUILD</text>
+<path d="M1245 430V456H205V430" class="rework"/><rect x="820" y="442" width="150" height="17" rx="4" fill="#06172a"/><text x="895" y="454" text-anchor="middle" class="rework-label">ADVERSARIAL → BUILD</text>
+<!-- Human rejection explicitly returns to Build node 6 -->
+<path d="M680 526V468H165V430" class="rework"/><rect x="548" y="455" width="145" height="17" rx="4" fill="#06172a"/><text x="620" y="468" text-anchor="middle" class="rework-label">REJECTED → BUILD</text>
+
+<!-- Phase 1 nodes -->
+<g><rect x="60" y="160" width="250" height="84" rx="10" class="node-bg work work-fill"/><circle cx="88" cy="190" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="88" y="198" text-anchor="middle" class="node-num">1</text><text x="118" y="190" class="node-title">EXPLORE</text><text x="118" y="216" class="node-cap">readonly map</text></g>
+<g><rect x="350" y="160" width="250" height="84" rx="10" class="node-bg work work-fill"/><circle cx="378" cy="190" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="378" y="198" text-anchor="middle" class="node-num">2</text><text x="408" y="190" class="node-title">SPEC</text><text x="408" y="216" class="node-cap">typed task-spec</text></g>
+<g><rect x="640" y="160" width="250" height="84" rx="10" class="node-bg review review-fill"/><circle cx="668" cy="190" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="668" y="198" text-anchor="middle" class="node-num">3</text><text x="698" y="190" class="node-title">SPEC ATTACK</text><text x="698" y="216" class="node-cap">adversarial review</text></g>
+<g><rect x="930" y="160" width="250" height="84" rx="10" class="node-bg work work-fill"/><circle cx="958" cy="190" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="958" y="198" text-anchor="middle" class="node-num">4</text><text x="988" y="190" class="node-title">PLAN</text><text x="988" y="216" class="node-cap">executable plan</text></g>
+<g><rect x="1220" y="160" width="250" height="84" rx="10" class="node-bg review review-fill"/><circle cx="1248" cy="190" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="1248" y="198" text-anchor="middle" class="node-num">5</text><text x="1278" y="190" class="node-title">PLAN ATTACK</text><text x="1278" y="216" class="node-cap">adversarial review</text></g>
+
+<!-- Phase 2 nodes -->
+<g><rect x="60" y="344" width="250" height="86" rx="10" class="node-bg work work-fill"/><circle cx="88" cy="374" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="88" y="382" text-anchor="middle" class="node-num">6</text><text x="118" y="374" class="node-title">BUILD</text><text x="118" y="402" class="node-cap">approved source paths</text></g>
+<g><path d="M335 344H515V406L425 438L335 406Z" class="node-bg factory factory-fill"/><text x="425" y="370" text-anchor="middle" class="node-title">FACTORY COMMIT</text><text x="425" y="394" text-anchor="middle" class="node-cap">journal → atomic ref</text><path d="M407 412l12 11 25-26" fill="none" stroke="#99f6e4" stroke-width="4"/></g>
+<g><rect x="570" y="344" width="250" height="86" rx="10" class="node-bg work work-fill"/><circle cx="598" cy="374" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="598" y="382" text-anchor="middle" class="node-num">7</text><text x="628" y="374" class="node-title">VERIFY</text><text x="628" y="402" class="node-cap">runtime evidence</text></g>
+<g><rect x="840" y="344" width="250" height="86" rx="10" class="node-bg review review-fill"/><circle cx="868" cy="374" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="868" y="382" text-anchor="middle" class="node-num">8</text><text x="898" y="374" class="node-title">CORRECTNESS</text><text x="898" y="402" class="node-cap">exact sealed inputs</text></g>
+<g><rect x="1120" y="344" width="250" height="86" rx="10" class="node-bg review review-fill"/><circle cx="1148" cy="374" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="1148" y="382" text-anchor="middle" class="node-num">9</text><text x="1178" y="374" class="node-title">ADVERSARIAL</text><text x="1178" y="402" class="node-cap">exact sealed inputs</text></g>
+
+<!-- Phase 3 nodes -->
+<g><rect x="60" y="526" width="290" height="84" rx="10" class="node-bg review review-fill"/><circle cx="90" cy="556" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="90" y="564" text-anchor="middle" class="node-num">10</text><text x="122" y="556" class="node-title">REVIEW STORY</text><text x="122" y="584" class="node-cap">canonical operator view</text></g>
+<g><path d="M510 526H850L880 568L850 610H510L480 568Z" fill="url(#humanGrad)" stroke="#f59e0b" stroke-width="3"/><circle cx="540" cy="556" r="18" fill="none" stroke="#fbbf24" stroke-width="2"/><text x="540" y="564" text-anchor="middle" class="node-num">11</text><text x="570" y="556" class="node-title">HUMAN APPROVAL</text><text x="570" y="581" class="node-cap">operator only</text><text x="680" y="602" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="800">⚠ AGENTS NEVER APPROVE</text></g>
+<g><rect x="1100" y="526" width="270" height="84" rx="10" class="node-bg factory factory-fill"/><circle cx="1128" cy="556" r="18" fill="none" stroke="#fff" stroke-width="2"/><text x="1128" y="564" text-anchor="middle" class="node-num">12</text><text x="1158" y="556" class="node-title">NOTIFY</text><text x="1158" y="584" class="node-cap">after decision</text></g>
+
+<!-- Trust strip -->
+<rect x="30" y="674" width="1540" height="112" rx="16" fill="#071b30" stroke="#5eead4" stroke-width="1.5"/>
+<text x="55" y="702" class="phase-label">TRUST BOUNDARIES</text>
+<g><rect x="55" y="718" width="225" height="52" rx="8" class="badge"/><text x="70" y="740" class="badge-title">Git metadata ≠ identity</text><text x="70" y="758" class="badge-sub">durable intent required</text></g>
+<g><rect x="295" y="718" width="225" height="52" rx="8" class="badge"/><text x="310" y="740" class="badge-title">Recipe bytes rehashed</text><text x="310" y="758" class="badge-sub">publication + instance</text></g>
+<g><rect x="535" y="718" width="225" height="52" rx="8" class="badge"/><text x="550" y="740" class="badge-title">Durable run identity</text><text x="550" y="758" class="badge-sub">exact builder + reviewer</text></g>
+<g><rect x="775" y="718" width="265" height="52" rx="8" class="badge"/><text x="790" y="740" class="badge-title">App = instance + HEAD + workspace</text><text x="790" y="758" class="badge-sub">live process identity</text></g>
+<g><rect x="1055" y="718" width="235" height="52" rx="8" class="badge"/><text x="1070" y="740" class="badge-title">Review executor strict MCP</text><text x="1070" y="758" class="badge-sub">structural argv boundary</text></g>
+<g><rect x="1305" y="718" width="235" height="52" rx="8" class="badge"/><text x="1320" y="740" class="badge-title">Human-only approval</text><text x="1320" y="758" class="badge-sub">operator signal required</text></g>
+
+<!-- Legend -->
+<rect x="60" y="818" width="34" height="34" rx="6" class="node-bg work work-fill"/><text x="108" y="841" class="legend">Blue: model work</text>
+<rect x="400" y="818" width="34" height="34" rx="6" class="node-bg review review-fill"/><text x="448" y="841" class="legend">Violet: independent review</text>
+<rect x="810" y="818" width="34" height="34" rx="6" class="node-bg factory factory-fill"/><text x="858" y="841" class="legend">Teal: Factory control</text>
+<rect x="1190" y="818" width="34" height="34" rx="6" class="node-bg human human-fill"/><text x="1238" y="841" class="legend">Amber: human gate</text>
+</svg>
+</body>
+</html>

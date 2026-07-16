@@ -66,10 +66,10 @@ def _current_evidence(db: Any, instance_id: str) -> tuple[str | None, str | None
 def current_binding(db: Any, instance_id: str, step_id: str) -> dict[str, Any]:
     """Return the exact tuple currently eligible for a human decision."""
     instance = db.execute(
-        "SELECT recipe_hash FROM recipe_instances WHERE id=?", (instance_id,),
+        "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
     ).fetchone()
     step = db.execute(
-        "SELECT activation,primitive,state,input_revision_hash FROM recipe_steps "
+        "SELECT step_id,activation,primitive,state,input_revision_hash FROM recipe_steps "
         "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
         (instance_id, step_id),
     ).fetchone()
@@ -80,7 +80,68 @@ def current_binding(db: Any, instance_id: str, step_id: str) -> dict[str, Any]:
     revision = step["input_revision_hash"]
     if not isinstance(revision, str) or not revision:
         raise DecisionConflict("approval gate has no current revision binding")
-    evidence_id, evidence_hash = _current_evidence(db, instance_id)
+    try:
+        from shipfactory.recipes.instantiate import recipe_for_instance
+        recipe = recipe_for_instance(dict(instance), db=db).document
+    except Exception as exc:
+        raise DecisionConflict(
+            f"approval gate recipe policy cannot be verified: {exc}"
+        ) from exc
+    details: dict[str, Any] = {
+        "task_spec_sha256": None, "plan_sha256": None,
+        "change_set_sha256": None, "review_story_sha256": None,
+        "candidate_commit_sha": None, "candidate_tree_sha": None,
+    }
+    if recipe.get("schema") != "shipfactory.recipe/v2":
+        # Legacy gates predate typed input declarations and revision-vector
+        # rederivation. Preserve their original evidence-bound behavior.
+        evidence_id, evidence_hash = _current_evidence(db, instance_id)
+    else:
+        try:
+            definition = next(item for item in recipe["steps"] if item["id"] == step_id)
+            from shipfactory.artifacts import artifact_document, input_artifacts, rederive_change_set
+            from shipfactory.recipes.instantiate import revision_vector
+
+            resolved = input_artifacts(db, instance_id, definition)
+            recomputed = revision_vector(db, instance_id, dict(step), recipe)
+        except Exception as exc:
+            raise DecisionConflict(f"approval gate inputs cannot be verified: {exc}") from exc
+        if recomputed != revision:
+            raise DecisionConflict("approval gate revision binding is stale")
+
+        evidence_id = evidence_hash = None
+        for item in resolved:
+            kind = item["kind"]
+            if kind == "evidence-bundle":
+                evidence_id, evidence_hash = str(item["id"]), str(item["sha256"])
+                continue
+            if kind == "task-spec":
+                details["task_spec_sha256"] = str(item["sha256"])
+            elif kind == "plan":
+                details["plan_sha256"] = str(item["sha256"])
+            elif kind == "review-story":
+                details["review_story_sha256"] = str(item["sha256"])
+            elif kind == "change-set":
+                details["change_set_sha256"] = str(item["sha256"])
+                document = artifact_document(item)
+                details["candidate_commit_sha"] = document["head_sha"]
+                details["candidate_tree_sha"] = document["tree_sha"]
+                run = db.execute(
+                    "SELECT workspace_path FROM runs WHERE id=?", (item.get("run_id"),),
+                ).fetchone()
+                if run is None or not run["workspace_path"]:
+                    raise DecisionConflict("approval change-set producer workspace is unavailable")
+                try:
+                    live = rederive_change_set(
+                        run["workspace_path"], base_sha=document["base_sha"],
+                        allowed_paths=document["allowed_paths"],
+                    )
+                except Exception as exc:
+                    raise DecisionConflict(
+                        f"approval candidate commit/tree cannot be verified: {exc}"
+                    ) from exc
+                if live != document:
+                    raise DecisionConflict("approval candidate change-set changed after review")
     return {
         "instance_id": instance_id,
         "step_id": step_id,
@@ -89,6 +150,7 @@ def current_binding(db: Any, instance_id: str, step_id: str) -> dict[str, Any]:
         "evidence_bundle_id": evidence_id,
         "evidence_bundle_hash": evidence_hash,
         "policy_hash": str(instance["recipe_hash"]),
+        **details,
     }
 
 
@@ -158,6 +220,13 @@ def record_decision(
                 return dict(replay) | {"replayed": True}
             raise DecisionConflict("nonce was already used for a different decision")
 
+        latest = db.execute(
+            "SELECT activation FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1",
+            (submitted["instance_id"], submitted["step_id"]),
+        ).fetchone()
+        if latest is not None and int(latest["activation"]) != submitted["activation"]:
+            raise DecisionConflict("stale gate decision: activation does not match current state")
         current = current_binding(db, submitted["instance_id"], submitted["step_id"])
         _assert_current(current, submitted)
         already_bound = db.execute(
@@ -276,7 +345,8 @@ def issue_phone_token(
         "evidence_bundle_hash": evidence_bundle_hash or None,
     }
     with store._connect() as db:
-        _assert_current(current_binding(db, instance_id, step_id), submitted)
+        current = current_binding(db, instance_id, step_id)
+        _assert_current(current, submitted)
     issued = int(time.time() if now is None else now)
     payload = {
         "schema": _TOKEN_SCHEMA, "instance": instance_id, "step": step_id,
@@ -284,6 +354,13 @@ def issue_phone_token(
         "evidence_bundle_hash": evidence_bundle_hash or None,
         "nonce": nonce or uuid.uuid4().hex, "decision": decision,
         "issued_at": issued, "expires_at": issued + ttl,
+        "policy_hash": current["policy_hash"],
+        "task_spec_sha256": current["task_spec_sha256"],
+        "plan_sha256": current["plan_sha256"],
+        "change_set_sha256": current["change_set_sha256"],
+        "review_story_sha256": current["review_story_sha256"],
+        "candidate_commit_sha": current["candidate_commit_sha"],
+        "candidate_tree_sha": current["candidate_tree_sha"],
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     signature = hmac.new(_signing_key(), raw, hashlib.sha256).digest()
@@ -311,6 +388,8 @@ def consume_phone_token(
     required = {
         "schema", "instance", "step", "activation", "revision_hash",
         "evidence_bundle_hash", "nonce", "decision", "issued_at", "expires_at",
+        "policy_hash", "task_spec_sha256", "plan_sha256", "change_set_sha256",
+        "review_story_sha256", "candidate_commit_sha", "candidate_tree_sha",
     }
     if not isinstance(payload, dict) or set(payload) != required or payload.get("schema") != _TOKEN_SCHEMA:
         raise DecisionTokenError("malformed decision token payload")

@@ -140,27 +140,45 @@ def _reopen(task_id: str, board: str, seat: str, summary: str) -> None:
     # #16-V1: Hermes kanban takes comment text and assignee positionally.
     _run_kanban(board, ["comment", task_id, summary or "Execution policy stage pending."])
     _run_kanban(board, ["unblock", task_id])
-    _run_kanban(board, ["assign", task_id, seat])
     # #16-V1: current Hermes exposes no completed -> ready transition;
     # unblock intentionally refuses completed tasks.  The completion hook runs
-    # after that transition, so reopen the row atomically and retain an event.
+    # after that transition, so reopen AND reassign the row atomically.  Doing
+    # the CLI assignment while the task is still done left a dispatch window
+    # where status was ready but the old worker still owned the task.
     # The branch below preserves the lightweight module-contract test setup,
     # whose intentionally fake store has no real board to update.
     if not hasattr(_module("shipfactory.store"), "_db_path"):
+        _run_kanban(board, ["assign", task_id, seat])
         return
     from hermes_cli import kanban_db
 
     conn = kanban_db.connect(board=board)
     try:
         with kanban_db.write_txn(conn):
-            updated = conn.execute(
-                "UPDATE tasks SET status='ready', completed_at=NULL WHERE id=? AND status='done'",
-                (task_id,),
-            )
-            if updated.rowcount:
-                kanban_db._append_event(  # type: ignore[attr-defined]
-                    conn, task_id, "shipfactory_policy_reopened", {"seat": seat},
+            current = conn.execute(
+                "SELECT assignee FROM tasks WHERE id=? AND status='done'", (task_id,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError(
+                    f"cannot reopen policy task {task_id}: expected completed task"
                 )
+            normalized_seat = kanban_db._canonical_assignee(seat)  # type: ignore[attr-defined]
+            updated = conn.execute(
+                "UPDATE tasks SET status='ready', completed_at=NULL, assignee=?, "
+                "consecutive_failures=CASE WHEN assignee IS NOT ? THEN 0 ELSE consecutive_failures END, "
+                "last_failure_error=CASE WHEN assignee IS NOT ? THEN NULL ELSE last_failure_error END "
+                "WHERE id=? AND status='done'",
+                (normalized_seat, normalized_seat, normalized_seat, task_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"failed to reopen policy task {task_id}")
+            if current["assignee"] != normalized_seat:
+                kanban_db._append_event(  # type: ignore[attr-defined]
+                    conn, task_id, "assigned", {"assignee": normalized_seat},
+                )
+            kanban_db._append_event(  # type: ignore[attr-defined]
+                conn, task_id, "shipfactory_policy_reopened", {"seat": normalized_seat},
+            )
     finally:
         conn.close()
 

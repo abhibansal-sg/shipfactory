@@ -468,7 +468,8 @@ def test_run_action_rejects_live_app_reporting_stale_instance_and_head(tmp_path)
     store.update_env_session_state("live-env", "ready")
     store.insert_app_session(
         "live-app", env_session_id="live-env", request_key=app_key,
-        workspace_path=str(repo), stdout_path=None, stderr_path=None,
+        workspace_path=str(repo), expected_instance_id="current-instance",
+        expected_head_sha=head, stdout_path=None, stderr_path=None,
     )
     store.mark_app_session_bound(
         "live-app", port=port, port_lease_key="identity-port",
@@ -699,7 +700,13 @@ def test_real_browser_catches_backend_reload_and_cache_attacks(
     try:
         bundle = _run(
             repo, head, tree, manifest, instance_id=instance_id,
-            environment_identity={"app_url": app_url}, profile=_profile(surface="browser"),
+            environment_identity={"app_url": app_url},
+            # A real Chromium cold start can exceed the generic ten-second
+            # unit-driver budget after the process-heavy full suite.  Keep the
+            # assertion fail-closed, but give this real-browser control enough
+            # time to reach the intended backend/reload/cache oracle instead
+            # of misclassifying host load as the attack outcome (finding #53).
+            profile=_profile(surface="browser", max_runtime_seconds=30),
         )
     finally:
         spawn.verified_killpg(proc.pid, token, signal.SIGKILL)
@@ -737,6 +744,8 @@ def test_missing_required_browser_infrastructure_fails_closed(tmp_path):
 
 def _seed_review_instance(
     conn, tmp_path, repo, head, tree, *, instance_id, bind_review_inputs=True,
+    reviewer_executor="claude", reviewer_provider=None, reviewer_activation=1,
+    create_reviewer_run=True, reviewer_result="done", reviewer_exit_code=0,
 ):
     """Activate a real v2 review task with Factory-opened transitive evidence."""
     from hermes_cli import kanban_db
@@ -750,23 +759,6 @@ def _seed_review_instance(
         "  qa: {profile: default, executor: claude, model: sonnet, role: qa}\n",
         encoding="utf-8",
     )
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,"
-            "recipe_hash,status,parameters_json,activation_count,tokens_charged,blocked_reason,"
-            "created_at,updated_at,base_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (instance_id, "test", "collector", "fake", 1, "hash", "running", "{}", 0, 0, None,
-             store._now(), store._now(), head),
-        )
-    build_task_id = kanban_db.create_task(
-        conn, title="build", body="build", assignee="dev-backend",
-        workspace_kind="worktree", board="test", workspace_path=str(repo),
-    )
-    producer_run_id = store.record_run_start(
-        build_task_id, "dev-backend", "codex", "gpt", workspace_path=repo,
-        recipe_activation=1,
-    )
-    store.record_run_end(producer_run_id, 0, 1, 1, 0.1, "done")
     definition = {
         "id": "review", "title": "review", "primitive": "review_gate", "needs": ["verify"],
         "inputs": [{"from": "build", "kind": "change-set", "required": False}],
@@ -780,6 +772,33 @@ def _seed_review_instance(
         definition,
     ]
     recipe = {"schema": "shipfactory.recipe/v2", "id": "fake", "version": 1, "steps": steps}
+    normalized_recipe = json.dumps(
+        recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    recipe_hash = hashlib.sha256(normalized_recipe.encode("utf-8")).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
+            "VALUES('fake',1,?,'published',?,?)",
+            (recipe_hash, normalized_recipe, store._now()),
+        )
+        db.execute(
+            "INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,"
+            "recipe_hash,status,parameters_json,activation_count,tokens_charged,blocked_reason,"
+            "created_at,updated_at,base_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (instance_id, "test", "collector", "fake", 1, recipe_hash,
+             "running", "{}", 0, 0, None,
+             store._now(), store._now(), head),
+        )
+    build_task_id = kanban_db.create_task(
+        conn, title="build", body="build", assignee="dev-backend",
+        workspace_kind="worktree", board="test", workspace_path=str(repo),
+    )
+    producer_run_id = store.record_run_start(
+        build_task_id, "dev-backend", "codex", "gpt", workspace_path=repo,
+        recipe_activation=1,
+    )
+    store.record_run_end(producer_run_id, 0, 1, 1, 0.1, "done")
     defs = {item["id"]: item for item in steps}
     now = store._now()
     with store._connect() as db:
@@ -808,6 +827,15 @@ def _seed_review_instance(
         db.execute(
             "UPDATE recipe_steps SET kanban_task_id=? WHERE instance_id=? AND step_id='review'",
             (review_task_id, instance_id),
+        )
+    if create_reviewer_run:
+        reviewer_run_id = store.record_run_start(
+            review_task_id, "qa", reviewer_executor, "review-model",
+            workspace_path=repo, provider=reviewer_provider,
+            recipe_activation=reviewer_activation,
+        )
+        store.record_run_end(
+            reviewer_run_id, reviewer_exit_code, 1, 1, 0.1, reviewer_result,
         )
     latest = {
         "build": {"step_id": "build", "kanban_task_id": build_task_id},
@@ -849,11 +877,6 @@ def test_reconcile_blocks_v2_review_approval_without_factory_opened_inputs(
     )
     review_task_id = latest["review"]["kanban_task_id"]
     with store._connect() as db:
-        db.execute(
-            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
-            "VALUES('fake',1,'hash','published',?,?)",
-            (json.dumps(_recipe, sort_keys=True), store._now()),
-        )
         db.execute(
             "UPDATE recipe_steps SET state=CASE step_id "
             "WHEN 'review' THEN 'running' ELSE 'done' END "
@@ -955,6 +978,11 @@ def test_adversarial_review_receives_transitive_bundle_and_retry_history(tmp_pat
     latest["adversarial-review"] = {
         "step_id": "adversarial-review", "kanban_task_id": task_id,
     }
+    reviewer_run_id = store.record_run_start(
+        task_id, "qa", "claude", "review-model", workspace_path=repo,
+        recipe_activation=1,
+    )
+    store.record_run_end(reviewer_run_id, 0, 1, 1, 0.1, "done")
     task = kanban_db.get_task(kanban_conn, task_id)
     assert first["bundle_sha256"] in task.body
     assert second["bundle_sha256"] in task.body
@@ -982,12 +1010,6 @@ def test_review_task_gets_exact_sealed_spec_plan_change_set_diff_and_bundle(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-full-inputs",
         bind_review_inputs=False,
     )
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
-            "VALUES('fake',1,'hash','active',?,?)",
-            (json.dumps({"schema": "shipfactory.recipe/v2", "budgets": {}}), store._now()),
-        )
     output_dir = repo / ".shipfactory-output"
     output_dir.mkdir(exist_ok=True)
     spec_document = {
@@ -1139,6 +1161,7 @@ def test_review_approval_blocked_when_reviewer_and_builder_collude_on_provider(
     assert bundle["state"] == "done"
     definition, defs, latest, recipe = _seed_review_instance(
         kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-collude",
+        reviewer_executor="codex",
     )
     home = Path(os.environ["HERMES_HOME"]) / "shipfactory"
     (home / "seats.yaml").write_text(
@@ -1156,7 +1179,7 @@ def test_review_approval_blocked_when_reviewer_and_builder_collude_on_provider(
     assert blocker == "reviewer_shares_builder_provider"
 
 
-def test_review_provider_lookup_error_fails_closed(tmp_path, kanban_conn):
+def test_review_provider_identity_does_not_read_mutable_seats(tmp_path, kanban_conn):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
     _run(repo, head, tree, manifest, instance_id="rvw-provider-missing", step_id="verify")
@@ -1170,7 +1193,89 @@ def test_review_provider_lookup_error_fails_closed(tmp_path, kanban_conn):
             verdict_body="APPROVE after opening exact inputs", recipe=recipe,
             defs=defs, conn=kanban_conn, latest=latest,
         )
-    assert blocker.startswith("reviewer_provider_unresolved:")
+    assert blocker is None
+
+
+def test_review_approval_blocks_when_exact_reviewer_run_is_missing(tmp_path, kanban_conn):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="rvw-reviewer-missing", step_id="verify")
+    assert bundle["state"] == "done"
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-reviewer-missing",
+        create_reviewer_run=False,
+    )
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-reviewer-missing", definition,
+            verdict_body="APPROVE after opening exact inputs", recipe=recipe,
+            defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker == "review_reviewer_run_missing:exact_task_activation"
+
+
+def test_review_approval_blocks_stale_reviewer_run_activation(tmp_path, kanban_conn):
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="rvw-reviewer-stale", step_id="verify")
+    assert bundle["state"] == "done"
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-reviewer-stale",
+        reviewer_activation=0,
+    )
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-reviewer-stale", definition,
+            verdict_body="APPROVE after opening exact inputs", recipe=recipe,
+            defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker.startswith("review_reviewer_run_stale_activation:")
+
+
+def test_reconcile_blocks_collusion_from_durable_run_provider_identity(
+    tmp_path, kanban_conn,
+):
+    from hermes_cli import kanban_db
+
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="rvw-reconcile-collude", step_id="verify")
+    assert bundle["state"] == "done"
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-reconcile-collude",
+        reviewer_executor="codex",
+    )
+    # The run rows say Codex performed both tasks.  A post-spawn seat edit
+    # must not turn that fact into an independent Claude review.
+    (Path(os.environ["HERMES_HOME"]) / "shipfactory" / "seats.yaml").write_text(
+        "company: acme\nseats:\n"
+        "  dev-backend: {profile: build-profile, executor: claude, model: opus, role: engineer}\n"
+        "  qa: {profile: review-profile, executor: claude, model: sonnet, role: qa}\n",
+        encoding="utf-8",
+    )
+    review_task_id = latest["review"]["kanban_task_id"]
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state=CASE step_id "
+            "WHEN 'review' THEN 'running' ELSE 'done' END "
+            "WHERE instance_id='rvw-reconcile-collude'"
+        )
+    result = "SHIPFACTORY_VERDICT: " + json.dumps({
+        "outcome": "approve", "body": "APPROVE clean pass; no findings",
+    }, separators=(",", ":"))
+    assert kanban_db.complete_task(kanban_conn, review_task_id, result=result)
+
+    reconciled = advancer.reconcile(kanban_conn, "rvw-reconcile-collude")
+
+    assert reconciled["status"] == "blocked"
+    with store._connect() as db:
+        review = db.execute(
+            "SELECT state,blocked_reason FROM recipe_steps "
+            "WHERE instance_id='rvw-reconcile-collude' AND step_id='review'",
+        ).fetchone()
+    assert dict(review) == {
+        "state": "blocked", "blocked_reason": "reviewer_shares_builder_provider",
+    }
 
 
 # ---------------------------------------------------------------------------

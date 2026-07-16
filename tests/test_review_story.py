@@ -141,6 +141,29 @@ steps:
         workspace=repo, producer="test",
     )
 
+    change_document = artifacts.rederive_change_set(
+        repo, base_sha=base, allowed_paths=sorted(changed),
+    )
+    change_bytes = json.dumps(
+        change_document, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    change_path = tmp_path / f"{instance_id}-change-set.json"
+    change_path.write_bytes(change_bytes)
+    change_sha256 = hashlib.sha256(change_bytes).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO artifacts(id,instance_id,step_id,activation,run_id,kind,"
+            "schema_version,state,candidate_path,sealed_path,sha256,size_bytes,producer,"
+            "base_sha,head_sha,repo_tree_sha,created_at,sealed_at) "
+            "VALUES(?,?, 'build',1,NULL,'change-set',1,'sealed',?,?,?,?,'test',?,?,?,?,?)",
+            (
+                artifacts.artifact_id(instance_id, "build", 1, "change-set"),
+                instance_id, ".shipfactory-output/change-set.json", str(change_path),
+                change_sha256, len(change_bytes), base, head, tree,
+                store._now(), store._now(),
+            ),
+        )
+
     manifest = verification.load_verification_manifest(repo, head)
     bundle_id = verification._bundle_id(instance_id, "verify", 1)
     verification._insert_bundle(
@@ -167,7 +190,8 @@ steps:
     story = {
         "schema": "shipfactory.review-story/v1", "instance_id": instance_id,
         "revision_hash": "b" * 64, "task_spec_sha256": spec["sha256"],
-        "plan_sha256": plan["sha256"], "evidence_bundle_sha256": bundle["bundle_sha256"],
+        "plan_sha256": plan["sha256"], "change_set_sha256": change_sha256,
+        "evidence_bundle_sha256": bundle["bundle_sha256"],
         "headline": "Complete review story",
         "changes": [{
             "importance": 1, "requirement_ids": ["REQ-1"], "files": sorted(changed),
@@ -202,8 +226,9 @@ def test_lockfile_cannot_be_hidden_as_generated(tmp_path):
         artifacts._validate_review_story_context(story, "lockfile", repo)
 
 
-def test_html_story_is_stored_escaped_and_dashboard_output_is_safe(tmp_path):
-    repo, story, output = _story_fixture(tmp_path, "html", {"app.py": "new\n"})
+def test_html_story_seals_canonical_bytes_and_dashboard_projection_is_safe(tmp_path):
+    path = 'src/<script data-x="&">.py'
+    repo, story, output = _story_fixture(tmp_path, "html", {path: "new\n"})
     payload = '<script>alert("x")</script>'
     story["headline"] = payload
     story["changes"][0]["why"] = payload + " preserves security."
@@ -214,8 +239,11 @@ def test_html_story_is_stored_escaped_and_dashboard_output_is_safe(tmp_path):
     )
     raw = artifacts.artifact_document(sealed)
     safe = artifacts.dashboard_safe_review_story(raw)
-    assert raw["headline"] != payload and "&lt;script&gt;" in raw["headline"]
+    assert raw["headline"] == payload
+    assert raw["changes"][0]["files"] == [path]
+    assert artifacts._validate_review_story(raw) is None
     assert "<script>" not in safe["headline"] and "&lt;script&gt;" in safe["headline"]
+    assert safe["changes"][0]["files"] != raw["changes"][0]["files"]
 
 
 def test_large_diff_truncation_cannot_omit_changed_files(tmp_path):
@@ -254,5 +282,5 @@ def test_residual_risks_reject_blank_entries(tmp_path, placeholder, retry):
 def test_story_hash_fields_are_authoritative(tmp_path):
     repo, story, _output = _story_fixture(tmp_path, "hashes", {"app.py": "new\n"})
     story["evidence_bundle_sha256"] = hashlib.sha256(b"decoy").hexdigest()
-    with pytest.raises(artifacts.ArtifactValidationError, match="not a current sealed bundle"):
+    with pytest.raises(artifacts.ArtifactValidationError, match="not an exact sealed input"):
         artifacts._validate_review_story_context(story, "hashes", repo)

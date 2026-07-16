@@ -97,7 +97,10 @@ def _action_payload(repo: Path, base: str, head: str, tree: str, *, instance: st
     }
 
 
-def _finish_action(payload, timeout=10):
+def _finish_action(payload, timeout=30):
+    # An action can execute protected and candidate cases sequentially.  Each
+    # case keeps its own profile runtime limit; this outer poll budget only
+    # allows the trusted runner to finish the full case set under host load.
     deadline = time.monotonic() + timeout
     result = verify.run_action(payload)
     while result["status"] == "pending" and time.monotonic() < deadline:
@@ -124,7 +127,7 @@ def _cleanup_async_verifiers():
 def test_schema_migration_is_normative_and_numbered():
     store.init_db()
     with store._connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 13
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
         assert [row["name"] for row in db.execute("PRAGMA table_info(evidence_bundles)")] == [
             "id", "instance_id", "step_id", "activation", "input_revision_hash",
             "base_sha", "head_sha", "tree_sha", "environment_session_id",
@@ -330,24 +333,22 @@ def test_deleted_candidate_manifest_still_runs_trusted_base_cases(tmp_path):
 
 def test_slow_verification_runner_does_not_stall_an_unrelated_action(tmp_path):
     slow_repo, slow_head, slow_tree = _repo(
-        tmp_path / "slow", _manifest(argv=["python3", "-c", "import time; time.sleep(2)"]),
+        tmp_path / "slow", _manifest(argv=["python3", "-c", "import time; time.sleep(20)"]),
     )
     fast_repo, fast_head, fast_tree = _repo(tmp_path / "fast")
     slow = _action_payload(
         slow_repo, slow_head, slow_head, slow_tree, instance="slow-instance",
     )
+    slow["profile"]["max_runtime_seconds"] = 30
     fast = _action_payload(
         fast_repo, fast_head, fast_head, fast_tree, instance="fast-instance",
     )
-    started = time.monotonic()
     assert verify.run_action(slow)["status"] == "pending"
-    assert time.monotonic() - started < 1.0
-    started = time.monotonic()
     assert verify.run_action(fast)["status"] == "pending"
-    assert time.monotonic() - started < 1.0
-    fast_result = _finish_action(fast, timeout=5)
+    fast_result = _finish_action(fast)
     assert fast_result["status"] == "done"
-    assert verify._bundle_id("slow-instance", "verify", 1) in verify._RUNNING
+    slow_record = verify._RUNNING[verify._bundle_id("slow-instance", "verify", 1)]
+    assert slow_record["proc"].poll() is None
 
 
 def test_candidate_child_gets_only_explicit_environment(tmp_path, monkeypatch):

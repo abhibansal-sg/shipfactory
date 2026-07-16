@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -21,6 +22,11 @@ from shipfactory import store
 
 
 DEFAULT_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024
+_FACTORY_GIT_NAME = "Abhinav Bansal"
+_FACTORY_GIT_EMAIL = "abhibansal-sg@users.noreply.github.com"
+_FACTORY_COMMIT_PREFIX = "ShipFactory: canonical build"
+_FACTORY_COMMIT_INTENT_KIND = "factory_commit_ref_update"
+_FACTORY_COMMIT_INTENT_PREPARED = "prepared"
 
 
 class ArtifactValidationError(ValueError):
@@ -394,11 +400,82 @@ def _validate_plan(document: dict[str, Any]) -> None:
             )
 
 
+def _validate_change_set(document: dict[str, Any]) -> None:
+    """Validate the strict, model-untrusted change-set document shape."""
+    schema = "shipfactory.change-set/v1"
+    required = {
+        "schema", "base_sha", "head_sha", "tree_sha", "commits",
+        "changed_paths", "allowed_paths", "dirty_tree",
+    }
+    _require_keys(document, schema, required)
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
+    for field in ("base_sha", "head_sha", "tree_sha"):
+        if not _hash_string(document[field], (40, 64)):
+            raise ArtifactValidationError(f"{schema} field {field} must be a git hash")
+    _string_list(document, schema, ("commits", "allowed_paths"))
+    if (not document["commits"]
+            or any(not _hash_string(value, (40, 64)) for value in document["commits"])):
+        raise ArtifactValidationError(f"{schema} commits must be an ordered git-hash list")
+    if not document["allowed_paths"]:
+        raise ArtifactValidationError(f"{schema} allowed_paths must not be empty")
+    normalized_allowed = [
+        _plan_path(value, label=f"{schema} allowed_paths entry")
+        for value in document["allowed_paths"]
+    ]
+    if normalized_allowed != document["allowed_paths"] or len(set(normalized_allowed)) != len(
+        normalized_allowed
+    ):
+        raise ArtifactValidationError(f"{schema} allowed_paths must be normalized and unique")
+    if document["dirty_tree"] is not False:
+        raise ArtifactValidationError(f"{schema} dirty_tree must be false")
+    changes = document["changed_paths"]
+    if not isinstance(changes, list) or not changes:
+        raise ArtifactValidationError(f"{schema} changed_paths must be a nonempty list")
+    seen: set[tuple[str | None, str]] = set()
+    for index, item in enumerate(changes):
+        if (not isinstance(item, dict)
+                or set(item) != {"status", "path", "previous_path", "blob_sha"}):
+            raise ArtifactValidationError(f"{schema} changed path {index} has invalid shape")
+        status_value = item["status"]
+        if (not isinstance(status_value, str)
+                or not re.fullmatch(r"(?:[AMDTUXB]|[RC](?:[0-9]{1,3}))", status_value)):
+            raise ArtifactValidationError(f"{schema} changed path {index} has invalid status")
+        path = _repository_path(item["path"], label=f"{schema} changed path {index}")
+        previous = item["previous_path"]
+        if status_value.startswith(("R", "C")):
+            previous = _repository_path(
+                previous, label=f"{schema} changed path {index} previous_path",
+            )
+            if previous == path:
+                raise ArtifactValidationError(
+                    f"{schema} changed path {index} rename/copy identity is unchanged"
+                )
+        elif previous is not None:
+            raise ArtifactValidationError(
+                f"{schema} changed path {index} previous_path is only valid for rename/copy"
+            )
+        blob_sha = item["blob_sha"]
+        if status_value == "D":
+            if blob_sha is not None:
+                raise ArtifactValidationError(
+                    f"{schema} deleted path {index} must have null blob_sha"
+                )
+        elif not _hash_string(blob_sha, (40, 64)):
+            raise ArtifactValidationError(
+                f"{schema} changed path {index} must have a resulting blob_sha"
+            )
+        identity = (previous, path)
+        if identity in seen:
+            raise ArtifactValidationError(f"{schema} changed_paths contains a duplicate")
+        seen.add(identity)
+
+
 def _validate_review_story(document: dict[str, Any]) -> None:
     schema = "shipfactory.review-story/v1"
     required = {
         "schema", "instance_id", "revision_hash", "task_spec_sha256",
-        "plan_sha256", "evidence_bundle_sha256", "headline", "changes",
+        "plan_sha256", "change_set_sha256", "evidence_bundle_sha256", "headline", "changes",
         "generated_or_mechanical_files", "not_changed", "residual_risks",
     }
     _require_keys(document, schema, required)
@@ -406,12 +483,13 @@ def _validate_review_story(document: dict[str, Any]) -> None:
         raise ArtifactValidationError(f"{schema} has unknown fields")
     for field in (
         "instance_id", "revision_hash", "task_spec_sha256", "plan_sha256",
-        "evidence_bundle_sha256", "headline",
+        "change_set_sha256", "evidence_bundle_sha256", "headline",
     ):
         if not isinstance(document[field], str) or not document[field]:
             raise ArtifactValidationError(f"{schema} field {field} must be a nonempty string")
     for field in (
-        "revision_hash", "task_spec_sha256", "plan_sha256", "evidence_bundle_sha256",
+        "revision_hash", "task_spec_sha256", "plan_sha256", "change_set_sha256",
+        "evidence_bundle_sha256",
     ):
         if not _hash_string(document[field], (64,)):
             raise ArtifactValidationError(f"{schema} field {field} must be a sha256")
@@ -473,6 +551,7 @@ _VALIDATORS = {
     ("exploration", 1): _validate_exploration,
     ("task-spec", 1): _validate_task_spec,
     ("plan", 1): _validate_plan,
+    ("change-set", 1): _validate_change_set,
     ("review-story", 1): _validate_review_story,
 }
 
@@ -632,6 +711,670 @@ def _repository_path(path: Any, *, label: str) -> str:
     return parsed.as_posix()
 
 
+def _tree_entry(workspace: Path, ref: str, path: str) -> tuple[str, str]:
+    """Return ``(mode, object_sha)`` for one exact tree path."""
+    raw = _git_bytes(workspace, "ls-tree", "-z", "--full-tree", ref, "--", path)
+    entries = [entry for entry in raw.split(b"\0") if entry]
+    if len(entries) != 1:
+        raise ArtifactValidationError(
+            f"change-set path {path!r} does not resolve to one resulting tree entry"
+        )
+    try:
+        metadata, encoded_path = entries[0].split(b"\t", 1)
+        mode, object_type, object_sha = metadata.decode("ascii").split(" ", 2)
+        actual_path = encoded_path.decode("utf-8", errors="surrogateescape")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ArtifactValidationError(
+            f"change-set tree entry for {path!r} is malformed"
+        ) from exc
+    if actual_path != path or object_type != "blob":
+        raise ArtifactValidationError(
+            f"change-set path {path!r} is not an exact resulting blob"
+        )
+    return mode, object_sha
+
+
+def _path_is_allowed(path: str, allowed_paths: Iterable[str]) -> bool:
+    for allowed in allowed_paths:
+        if fnmatchcase(path, allowed):
+            return True
+        if not any(character in allowed for character in "*?["):
+            prefix = allowed.rstrip("/")
+            if allowed.endswith("/") and path.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def _assert_change_set_not_forbidden(
+    document: dict[str, Any], forbidden_paths: Iterable[str],
+) -> None:
+    """Apply task-spec exclusions to the final canonical rename-aware diff."""
+    forbidden = list(forbidden_paths)
+    if not forbidden:
+        return
+    for change in document["changed_paths"]:
+        paths = [change["path"]]
+        if change.get("previous_path") is not None:
+            paths.append(change["previous_path"])
+        for path in paths:
+            if any(_path_is_allowed(path, [pattern]) for pattern in forbidden):
+                raise ArtifactValidationError(
+                    f"change-set path {path!r} is forbidden by the task specification"
+                )
+
+
+def _change_set_dirty(workspace: Path) -> bool:
+    """Detect source dirt while excluding Factory's out-of-band output root."""
+    raw = _git_bytes(
+        workspace, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        "--", ".", ":(exclude).shipfactory-output",
+    )
+    return bool(raw)
+
+
+def _changed_worktree_paths(workspace: Path) -> list[str]:
+    """Return every tracked or untracked source path in a dirty worktree."""
+    conflicted = _git_bytes(workspace, "diff", "--name-only", "-z", "--diff-filter=U")
+    if conflicted:
+        raise ArtifactValidationError("change-set worktree contains unresolved conflicts")
+    tracked = _git_bytes(workspace, "diff", "--name-only", "-z", "HEAD", "--", ".")
+    untracked = _git_bytes(
+        workspace, "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
+    )
+    paths: list[str] = []
+    for encoded in [item for item in (tracked + untracked).split(b"\0") if item]:
+        path = _repository_path(
+            encoded.decode("utf-8", errors="surrogateescape"),
+            label="change-set dirty path",
+        )
+        if path == ".shipfactory-output" or path.startswith(".shipfactory-output/"):
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _assert_worktree_path_not_symlink(workspace: Path, path: str) -> None:
+    """Reject a symlink at any existing component of one candidate path."""
+    current = workspace
+    for component in PurePosixPath(path).parts:
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ArtifactSealError(f"change-set path {path!r} cannot be inspected: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ArtifactValidationError(f"change-set path {path!r} traverses a symlink")
+
+
+def _factory_commit_message(instance_id: str, step_id: str, activation: int) -> str:
+    return f"{_FACTORY_COMMIT_PREFIX} {instance_id}/{step_id}/{int(activation)}"
+
+
+def _factory_commit_timestamp(started_at: str) -> str:
+    """Return one stable Git timestamp derived from the durable run identity."""
+    try:
+        parsed = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone missing")
+        seconds = int(parsed.astimezone(timezone.utc).timestamp())
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ArtifactValidationError("change-set run has no valid durable start timestamp") from exc
+    return f"@{seconds} +0000"
+
+
+def _factory_commit_logical_key(instance_id: str, step_id: str, activation: int) -> str:
+    identity = f"factory-commit|{instance_id}|{step_id}|{int(activation)}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _factory_commit_action_key(logical_key: str) -> str:
+    return hashlib.sha256(f"{logical_key}|attempt|1".encode()).hexdigest()
+
+
+def _factory_commit_intent_row(
+    *, instance_id: str, step_id: str, activation: int,
+) -> dict[str, Any] | None:
+    """Load and validate the non-claimable journal envelope for one build."""
+    logical_key = _factory_commit_logical_key(instance_id, step_id, activation)
+    with store._connect() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT * FROM action_intents WHERE logical_key=? ORDER BY attempt",
+            (logical_key,),
+        ).fetchall()]
+    if not rows:
+        return None
+    row = rows[0]
+    if (len(rows) != 1 or row["key"] != _factory_commit_action_key(logical_key)
+            or int(row["attempt"]) != 1
+            or row["kind"] != _FACTORY_COMMIT_INTENT_KIND
+            or row["state"] not in {_FACTORY_COMMIT_INTENT_PREPARED, "succeeded"}
+            or row["instance_id"] != instance_id or row["step_id"] != step_id
+            or row["activation"] is None or int(row["activation"]) != int(activation)
+            or row["lease_owner"] is not None or row["lease_until"] is not None):
+        raise ArtifactValidationError("change-set Factory commit intent envelope mismatched")
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ArtifactValidationError("change-set Factory commit intent payload is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ArtifactValidationError("change-set Factory commit intent payload is invalid")
+    row["payload"] = payload
+    return row
+
+
+def _persist_factory_commit_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    """Durably authenticate an exact commit before its ref can move."""
+    logical_key = _factory_commit_logical_key(
+        payload["instance_id"], payload["step_id"], int(payload["activation"]),
+    )
+    key = _factory_commit_action_key(logical_key)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute(
+            "SELECT * FROM action_intents WHERE logical_key=? ORDER BY attempt",
+            (logical_key,),
+        ).fetchall()
+        if not existing:
+            db.execute(
+                "INSERT INTO action_intents"
+                "(key,logical_key,attempt,instance_id,step_id,activation,kind,payload_json,"
+                "state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    key, logical_key, 1, payload["instance_id"], payload["step_id"],
+                    int(payload["activation"]), _FACTORY_COMMIT_INTENT_KIND, encoded,
+                    _FACTORY_COMMIT_INTENT_PREPARED, store._now(),
+                ),
+            )
+        elif len(existing) != 1 or existing[0]["payload_json"] != encoded:
+            raise ArtifactValidationError("change-set Factory commit intent payload mismatched")
+    row = _factory_commit_intent_row(
+        instance_id=payload["instance_id"], step_id=payload["step_id"],
+        activation=int(payload["activation"]),
+    )
+    if row is None or row["payload"] != payload:
+        raise ArtifactValidationError("change-set Factory commit intent was not durable")
+    return row
+
+
+def _write_factory_commit_object(
+    workspace: Path, *, tree_sha: str, base_sha: str, message: str, timestamp: str,
+) -> str:
+    """Create the deterministic commit object without changing any Git ref."""
+    git_config = ["-c", f"core.hooksPath={os.devnull}", "-c", "commit.gpgsign=false"]
+    commit_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": _FACTORY_GIT_NAME,
+        "GIT_AUTHOR_EMAIL": _FACTORY_GIT_EMAIL,
+        "GIT_COMMITTER_NAME": _FACTORY_GIT_NAME,
+        "GIT_COMMITTER_EMAIL": _FACTORY_GIT_EMAIL,
+        "GIT_AUTHOR_DATE": timestamp,
+        "GIT_COMMITTER_DATE": timestamp,
+    }
+    try:
+        completed = subprocess.run(
+            ["git", *git_config, "commit-tree", tree_sha, "-p", base_sha, "-m", message],
+            cwd=workspace, env=commit_env, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=20,
+        )
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.decode("utf-8", errors="replace")[:1000]
+        raise ArtifactSealError(f"Factory change-set commit object failed: {error}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(f"Factory change-set commit object unavailable: {exc}") from exc
+    expected = completed.stdout.decode("ascii", errors="strict").strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", expected):
+        raise ArtifactSealError("Factory change-set commit object returned an invalid SHA")
+    return expected
+
+
+def _expected_factory_commit_payload(
+    *, instance_id: str, step_id: str, activation: int, run_id: int,
+    workspace: Path, base_sha: str, tree_sha: str, expected_commit_sha: str,
+    message: str, timestamp: str,
+) -> dict[str, Any]:
+    return {
+        "schema": "shipfactory.factory-commit-intent/v1",
+        "instance_id": instance_id,
+        "step_id": step_id,
+        "activation": int(activation),
+        "run_id": int(run_id),
+        "workspace": str(workspace.resolve()),
+        "base_sha": base_sha,
+        "tree_sha": tree_sha,
+        "expected_commit_sha": expected_commit_sha,
+        "message": message,
+        "author_name": _FACTORY_GIT_NAME,
+        "author_email": _FACTORY_GIT_EMAIL,
+        "committer_name": _FACTORY_GIT_NAME,
+        "committer_email": _FACTORY_GIT_EMAIL,
+        "author_timestamp": timestamp,
+        "committer_timestamp": timestamp,
+    }
+
+
+def _verify_factory_commit_payload(
+    workspace: Path, *, payload: dict[str, Any], instance_id: str, step_id: str,
+    activation: int, run_id: int, base_sha: str, tree_sha: str, message: str,
+    timestamp: str,
+) -> str:
+    """Bind a journaled SHA to the complete current finalization context."""
+    expected_sha = payload.get("expected_commit_sha")
+    if not isinstance(expected_sha, str):
+        raise ArtifactValidationError("change-set Factory commit intent payload mismatched")
+    expected = _expected_factory_commit_payload(
+        instance_id=instance_id, step_id=step_id, activation=activation, run_id=run_id,
+        workspace=workspace, base_sha=base_sha, tree_sha=tree_sha,
+        expected_commit_sha=expected_sha, message=message, timestamp=timestamp,
+    )
+    if payload != expected:
+        raise ArtifactValidationError("change-set Factory commit intent payload mismatched")
+    actual = _write_factory_commit_object(
+        workspace, tree_sha=tree_sha, base_sha=base_sha,
+        message=message, timestamp=timestamp,
+    )
+    if actual != expected_sha:
+        raise ArtifactValidationError("change-set Factory commit intent SHA mismatched")
+    return expected_sha
+
+
+def _update_factory_commit_ref(workspace: Path, *, expected_sha: str, base_sha: str) -> None:
+    """Atomically publish exactly the authenticated commit from exactly base."""
+    try:
+        subprocess.run(
+            ["git", "-c", f"core.hooksPath={os.devnull}", "update-ref", "HEAD",
+             expected_sha, base_sha],
+            cwd=workspace, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20,
+        )
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.decode("utf-8", errors="replace")[:1000]
+        raise ArtifactValidationError(
+            f"change-set Factory commit ref compare-and-swap failed: {error}"
+        ) from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(f"Factory change-set ref update unavailable: {exc}") from exc
+
+
+def _mark_factory_commit_intent_succeeded(row: dict[str, Any], expected_sha: str) -> None:
+    """Audit the terminal ref state without exposing the intent to the action runner."""
+    if row["state"] == "succeeded":
+        return
+    now = store._now()
+    result = json.dumps(
+        {"expected_commit_sha": expected_sha, "probe": "head_matches_authenticated_intent"},
+        sort_keys=True, separators=(",", ":"),
+    )
+    with store._connect() as db:
+        changed = db.execute(
+            "UPDATE action_intents SET state='succeeded',finished_at=?,result_json=?,"
+            "last_error=NULL WHERE key=? AND state=? AND kind=?",
+            (
+                now, result, row["key"], _FACTORY_COMMIT_INTENT_PREPARED,
+                _FACTORY_COMMIT_INTENT_KIND,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise ArtifactValidationError("change-set Factory commit intent terminal state lost")
+
+
+def _write_factory_candidate(workspace: Path, candidate_path: str, data: bytes) -> None:
+    """Atomically publish Factory-generated bytes below the output root."""
+    parts = _candidate_parts(candidate_path)
+    output_root = workspace / parts[0]
+    try:
+        info = output_root.lstat()
+    except FileNotFoundError:
+        output_root.mkdir(mode=0o700)
+    else:
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ArtifactValidationError(".shipfactory-output must be a real directory")
+    target = workspace.joinpath(*parts)
+    if output_root.resolve() not in (target.parent.resolve(), *target.parent.resolve().parents):
+        raise ArtifactValidationError("Factory change-set output escapes its output root")
+    _copy_once(target, data)
+
+
+def finalize_change_set_for_task(
+    *, instance_id: str, step_id: str, activation: int, run_id: int,
+    workspace: str | Path, output: dict[str, Any], inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Create the one Factory-owned build commit and canonical manifest.
+
+    Workers only edit approved source paths. On their successful exit the
+    trusted reaper validates the dirty tree, creates a hook-disabled commit,
+    and derives the manifest from Git facts. A retry after the commit but
+    before manifest publication recognizes only this exact Factory commit.
+    """
+    worktree = Path(workspace)
+    with store._connect() as db:
+        ownership = db.execute(
+            "SELECT r.task_id,r.recipe_activation,r.workspace_path,r.started_at,s.kanban_task_id "
+            "FROM runs r JOIN recipe_steps s ON s.instance_id=? AND s.step_id=? "
+            "AND s.activation=? WHERE r.id=?",
+            (instance_id, step_id, int(activation), int(run_id)),
+        ).fetchone()
+    if (ownership is None or not ownership["kanban_task_id"]
+            or str(ownership["task_id"]) != str(ownership["kanban_task_id"])
+            or ownership["recipe_activation"] is None
+            or int(ownership["recipe_activation"]) != int(activation)
+            or not ownership["workspace_path"]
+            or Path(ownership["workspace_path"]).resolve() != worktree.resolve()):
+        raise ArtifactValidationError(
+            "change-set finalization is not bound to the exact assigned run/worktree"
+        )
+    top = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
+    if top != worktree.resolve():
+        raise ArtifactValidationError("change-set workspace is not its isolated git worktree root")
+    plans = [item for item in inputs if item.get("kind") == "plan"]
+    if len(plans) != 1:
+        raise ArtifactValidationError("change-set build requires exactly one declared plan input")
+    plan = artifact_document(plans[0])
+    allowed_paths: list[str] = []
+    for node in plan["nodes"]:
+        for path in node["allowed_paths"]:
+            if path not in allowed_paths:
+                allowed_paths.append(path)
+    forbidden_paths: list[str] = []
+    for item in inputs:
+        if item.get("kind") == "task-spec":
+            forbidden_paths.extend(artifact_document(item).get("forbidden_paths", []))
+
+    base = _git(worktree, "rev-parse", f"{plan['base_sha']}^{{commit}}")
+    head = _git(worktree, "rev-parse", "HEAD^{commit}")
+    message = _factory_commit_message(instance_id, step_id, activation)
+    timestamp = _factory_commit_timestamp(ownership["started_at"])
+    intent = _factory_commit_intent_row(
+        instance_id=instance_id, step_id=step_id, activation=activation,
+    )
+    dirty_paths = _changed_worktree_paths(worktree)
+    if head != base:
+        if dirty_paths:
+            raise ArtifactValidationError("change-set Factory commit has post-commit source mutations")
+        if intent is None:
+            raise ArtifactValidationError(
+                "change-set HEAD has no exact durable Factory commit intent"
+            )
+        tree = _git(worktree, "rev-parse", f"{head}^{{tree}}")
+        expected_sha = _verify_factory_commit_payload(
+            worktree, payload=intent["payload"], instance_id=instance_id,
+            step_id=step_id, activation=activation, run_id=run_id, base_sha=base,
+            tree_sha=tree, message=message, timestamp=timestamp,
+        )
+        if head != expected_sha:
+            raise ArtifactValidationError(
+                "change-set HEAD does not match the exact durable Factory commit intent"
+            )
+        _mark_factory_commit_intent_succeeded(intent, expected_sha)
+    else:
+        if intent is not None and intent["state"] == "succeeded":
+            raise ArtifactValidationError(
+                "change-set HEAD moved away from its completed Factory commit intent"
+            )
+        if not dirty_paths:
+            raise ArtifactValidationError("change-set build produced no source changes")
+        for path in dirty_paths:
+            if not _path_is_allowed(path, allowed_paths):
+                raise ArtifactValidationError(
+                    f"change-set dirty path {path!r} is outside the approved plan"
+                )
+            if any(_path_is_allowed(path, [forbidden]) for forbidden in forbidden_paths):
+                raise ArtifactValidationError(
+                    f"change-set dirty path {path!r} is forbidden by the task specification"
+                )
+            _assert_worktree_path_not_symlink(worktree, path)
+        git_config = [
+            "-c", f"core.hooksPath={os.devnull}", "-c", "commit.gpgsign=false",
+        ]
+        try:
+            subprocess.run(
+                ["git", *git_config, "add", "--all", "--", ".",
+                 ":(exclude).shipfactory-output"],
+                cwd=worktree, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=20,
+            )
+            staged_paths = [
+                _repository_path(
+                    value.decode("utf-8", errors="surrogateescape"),
+                    label="change-set staged path",
+                )
+                for value in _git_bytes(
+                    # Compare the same source/result path set validated before
+                    # staging.  Rename-aware --name-only collapses a rename to
+                    # its destination and would falsely reject the old path;
+                    # --no-renames preserves the deletion and addition here.
+                    worktree, "diff", "--cached", "--name-only", "--no-renames", "-z",
+                ).split(b"\0") if value
+            ]
+            if staged_paths != dirty_paths and set(staged_paths) != set(dirty_paths):
+                raise ArtifactValidationError("change-set staged paths differ from validated dirt")
+            tree = _git(worktree, "write-tree")
+        except subprocess.CalledProcessError as exc:
+            error = exc.stderr.decode("utf-8", errors="replace")[:1000]
+            raise ArtifactSealError(f"Factory change-set staging failed: {error}") from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ArtifactSealError(f"Factory change-set staging unavailable: {exc}") from exc
+
+        if intent is None:
+            expected_sha = _write_factory_commit_object(
+                worktree, tree_sha=tree, base_sha=base,
+                message=message, timestamp=timestamp,
+            )
+            payload = _expected_factory_commit_payload(
+                instance_id=instance_id, step_id=step_id, activation=activation,
+                run_id=run_id, workspace=worktree, base_sha=base, tree_sha=tree,
+                expected_commit_sha=expected_sha, message=message, timestamp=timestamp,
+            )
+            intent = _persist_factory_commit_intent(payload)
+        else:
+            expected_sha = _verify_factory_commit_payload(
+                worktree, payload=intent["payload"], instance_id=instance_id,
+                step_id=step_id, activation=activation, run_id=run_id, base_sha=base,
+                tree_sha=tree, message=message, timestamp=timestamp,
+            )
+        _update_factory_commit_ref(worktree, expected_sha=expected_sha, base_sha=base)
+        head = _git(worktree, "rev-parse", "HEAD^{commit}")
+        if head != expected_sha:
+            raise ArtifactSealError("Factory change-set ref update did not persist")
+        _mark_factory_commit_intent_succeeded(intent, expected_sha)
+        if _change_set_dirty(worktree):
+            raise ArtifactValidationError("change-set Factory commit has post-commit source mutations")
+
+    document = rederive_change_set(
+        worktree, base_sha=base, allowed_paths=allowed_paths,
+    )
+    # Public commit metadata is never authority, and even an authenticated
+    # crash-retry intent must satisfy the current sealed task-spec exclusions.
+    # Recheck the final rename-aware Git diff rather than relying only on the
+    # pre-stage dirty-path snapshot (finding #55 / cross-lab blocker 1).
+    _assert_change_set_not_forbidden(document, forbidden_paths)
+    data = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    _write_factory_candidate(worktree, output["path"], data)
+    return document
+
+
+def rederive_change_set(
+    workspace: str | Path, *, base_sha: str, allowed_paths: Iterable[str],
+) -> dict[str, Any]:
+    """Rederive the complete committed change identity from an assigned clone.
+
+    No caller-supplied manifest value participates in this calculation.  The
+    returned object is the exact canonical claim a worker must match before
+    Factory will seal it.
+    """
+    worktree = Path(workspace)
+    base = _git(worktree, "rev-parse", f"{base_sha}^{{commit}}")
+    head = _git(worktree, "rev-parse", "HEAD^{commit}")
+    tree = _git(worktree, "rev-parse", "HEAD^{tree}")
+    try:
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, head], cwd=worktree,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactSealError(f"change-set ancestry validation unavailable: {exc}") from exc
+    if ancestry.returncode == 1:
+        raise ArtifactValidationError("change-set head is not descended from base")
+    if ancestry.returncode != 0:
+        raise ArtifactValidationError(
+            "change-set ancestry validation failed: "
+            + ancestry.stderr.decode("utf-8", errors="replace")[:500]
+        )
+    if _change_set_dirty(worktree):
+        raise ArtifactValidationError("change-set assigned clone has a dirty tree")
+
+    normalized_allowed: list[str] = []
+    for value in allowed_paths:
+        normalized = _plan_path(value, label="change-set approved allowed path")
+        if normalized not in normalized_allowed:
+            normalized_allowed.append(normalized)
+    if not normalized_allowed:
+        raise ArtifactValidationError("change-set approved plan has no allowed paths")
+    commits_text = _git(
+        worktree, "rev-list", "--reverse", "--topo-order", f"{base}..{head}",
+    )
+    commits = commits_text.splitlines() if commits_text else []
+    if not commits or commits[-1] != head:
+        raise ArtifactValidationError(
+            "change-set head must contain at least one ordered commit after base"
+        )
+
+    raw = _git_bytes(
+        worktree, "diff", "--name-status", "-z", "--find-renames", base, head,
+    )
+    fields = raw.split(b"\0")
+    if fields and not fields[-1]:
+        fields.pop()
+    changes: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(fields):
+        try:
+            status_value = fields[cursor].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ArtifactValidationError("change-set diff status is not ASCII") from exc
+        cursor += 1
+        rename_or_copy = status_value.startswith(("R", "C"))
+        path_count = 2 if rename_or_copy else 1
+        if cursor + path_count > len(fields):
+            raise ArtifactValidationError("change-set rename-aware diff is truncated")
+        names = [
+            fields[cursor + offset].decode("utf-8", errors="surrogateescape")
+            for offset in range(path_count)
+        ]
+        cursor += path_count
+        previous = (
+            _repository_path(names[0], label="change-set previous path")
+            if rename_or_copy else None
+        )
+        path = _repository_path(names[-1], label="change-set resulting path")
+        if not _path_is_allowed(path, normalized_allowed):
+            raise ArtifactValidationError(
+                f"change-set path {path!r} is outside the approved plan"
+            )
+        if previous is not None and not _path_is_allowed(previous, normalized_allowed):
+            raise ArtifactValidationError(
+                f"change-set previous path {previous!r} is outside the approved plan"
+            )
+        if previous is not None:
+            previous_mode, _previous_sha = _tree_entry(worktree, base, previous)
+            if previous_mode == "120000":
+                raise ArtifactValidationError(
+                    f"change-set previous path {previous!r} is a symlink"
+                )
+        if status_value == "D":
+            deleted_mode, _deleted_sha = _tree_entry(worktree, base, path)
+            if deleted_mode == "120000":
+                raise ArtifactValidationError(f"change-set path {path!r} is a symlink")
+            blob_sha = None
+        else:
+            mode, blob_sha = _tree_entry(worktree, head, path)
+            if mode == "120000":
+                raise ArtifactValidationError(f"change-set path {path!r} is a symlink")
+        changes.append({
+            "status": status_value, "path": path, "previous_path": previous,
+            "blob_sha": blob_sha,
+        })
+    if not changes:
+        raise ArtifactValidationError("change-set contains no changed paths")
+    document = {
+        "schema": "shipfactory.change-set/v1", "base_sha": base,
+        "head_sha": head, "tree_sha": tree, "commits": commits,
+        "changed_paths": changes, "allowed_paths": normalized_allowed,
+        "dirty_tree": False,
+    }
+    _validate_change_set(document)
+    return document
+
+
+def _validate_change_set_context(
+    document: dict[str, Any], instance_id: str, step_id: str, activation: int,
+    run_id: int | None, workspace: Path,
+) -> dict[str, Any]:
+    """Bind a change-set to its exact run, current instance base, and plan."""
+    if run_id is None:
+        raise ArtifactValidationError("change-set requires an exact producer run")
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone()
+        step = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+            (instance_id, step_id, int(activation)),
+        ).fetchone()
+        run = db.execute(
+            "SELECT * FROM runs WHERE id=?", (int(run_id),),
+        ).fetchone()
+        if instance is None or step is None or run is None:
+            raise ArtifactValidationError("change-set producer identity is incomplete")
+        if (not step["kanban_task_id"] or str(run["task_id"]) != str(step["kanban_task_id"])
+                or run["recipe_activation"] is None
+                or int(run["recipe_activation"]) != int(activation)):
+            raise ArtifactValidationError(
+                "change-set producer task/run/activation does not match the assigned build"
+            )
+        if not run["workspace_path"] or Path(run["workspace_path"]).resolve() != workspace.resolve():
+            raise ArtifactValidationError(
+                "change-set was not produced in the assigned producer workspace"
+            )
+        from shipfactory.recipes.instantiate import recipe_for_instance
+        recipe = recipe_for_instance(dict(instance), db=db).document
+        definition = next(
+            (item for item in recipe["steps"] if item["id"] == step_id), None,
+        )
+        if definition is None:
+            raise ArtifactValidationError("change-set build definition is missing")
+        plans = [
+            artifact for artifact in input_artifacts(db, instance_id, definition)
+            if artifact["kind"] == "plan"
+        ]
+        if len(plans) != 1:
+            raise ArtifactValidationError(
+                "change-set build must consume exactly one approved sealed plan"
+            )
+        trusted_base = str(instance["base_sha"] or "")
+    plan = artifact_document(plans[0])
+    if plan["base_sha"] != trusted_base:
+        raise ArtifactValidationError("change-set approved plan base differs from instance base")
+    allowed_paths: list[str] = []
+    for node in plan["nodes"]:
+        for path in node["allowed_paths"]:
+            if path not in allowed_paths:
+                allowed_paths.append(path)
+    expected = rederive_change_set(
+        workspace, base_sha=trusted_base, allowed_paths=allowed_paths,
+    )
+    if document != expected:
+        raise ArtifactValidationError(
+            "shipfactory.change-set/v1 worker claim differs from the daemon-rederived manifest"
+        )
+    return expected
+
+
 def _validate_exploration_repository(document: dict[str, Any], workspace: Path) -> None:
     """Bind every existing exploration citation to bytes at its declared base."""
     base_sha = document["base_sha"]
@@ -785,7 +1528,8 @@ def _not_changed_requirement_ids(items: list[dict[str, Any]]) -> set[str]:
 
 
 def _validate_review_story_context(
-    document: dict[str, Any], instance_id: str, workspace: Path,
+    document: dict[str, Any], instance_id: str, workspace: Path, *,
+    step_id: str | None = None, activation: int | None = None,
 ) -> None:
     """Bind narrative claims to the complete diff, spec, plan, and evidence."""
     schema = "shipfactory.review-story/v1"
@@ -793,32 +1537,77 @@ def _validate_review_story_context(
         raise ArtifactValidationError(f"{schema} instance_id does not match producer instance")
     with store._connect() as db:
         instance = db.execute(
-            "SELECT base_sha FROM recipe_instances WHERE id=?", (instance_id,),
+            "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
         ).fetchone()
         if instance is None or not instance["base_sha"]:
             raise ArtifactValidationError(f"{schema} instance has no trusted base")
-        spec_row = db.execute(
-            "SELECT * FROM artifacts WHERE instance_id=? AND kind='task-spec' "
-            "AND state='sealed' AND sha256=? ORDER BY activation DESC LIMIT 1",
-            (instance_id, document["task_spec_sha256"]),
-        ).fetchone()
-        plan_row = db.execute(
-            "SELECT * FROM artifacts WHERE instance_id=? AND kind='plan' "
-            "AND state='sealed' AND sha256=? ORDER BY activation DESC LIMIT 1",
-            (instance_id, document["plan_sha256"]),
-        ).fetchone()
-        bundle = db.execute(
-            "SELECT * FROM evidence_bundles WHERE instance_id=? AND state='done' "
-            "AND bundle_sha256=? ORDER BY activation DESC LIMIT 1",
-            (instance_id, document["evidence_bundle_sha256"]),
-        ).fetchone()
+        story_step = None
+        exact_inputs: list[dict[str, Any]] | None = None
+        if step_id is not None and activation is not None:
+            story_step = db.execute(
+                "SELECT * FROM recipe_steps WHERE instance_id=? "
+                "AND step_id=? AND activation=?",
+                (instance_id, step_id, int(activation)),
+            ).fetchone()
+            from shipfactory.recipes.instantiate import recipe_for_instance
+            recipe = recipe_for_instance(dict(instance), db=db).document
+            if recipe.get("schema") == "shipfactory.recipe/v2":
+                if story_step is None:
+                    raise ArtifactValidationError(f"{schema} producer activation is unavailable")
+                definition = next(
+                    (item for item in recipe["steps"] if item["id"] == step_id), None,
+                )
+                if definition is None:
+                    raise ArtifactValidationError(f"{schema} producer definition is unavailable")
+                exact_inputs = input_artifacts(db, instance_id, definition)
+                if artifact_set_hash(exact_inputs) != story_step["input_artifact_set_hash"]:
+                    raise ArtifactValidationError(f"{schema} producer input artifact set changed")
+                required_kinds = {"task-spec", "plan", "change-set", "evidence-bundle"}
+                if {item["kind"] for item in exact_inputs} != required_kinds:
+                    raise ArtifactValidationError(f"{schema} exact declared inputs are incomplete")
+
+        def exact_artifact(kind: str, digest: str) -> Any:
+            if exact_inputs is not None:
+                matches = [
+                    item for item in exact_inputs
+                    if item["kind"] == kind and item["sha256"] == digest
+                ]
+                if len(matches) != 1:
+                    return None
+                if kind == "evidence-bundle":
+                    return db.execute(
+                        "SELECT * FROM evidence_bundles WHERE id=? AND state='done'",
+                        (matches[0]["id"],),
+                    ).fetchone()
+                return db.execute(
+                    "SELECT * FROM artifacts WHERE id=? AND state='sealed'",
+                    (matches[0]["id"],),
+                ).fetchone()
+            if kind == "evidence-bundle":
+                return db.execute(
+                    "SELECT * FROM evidence_bundles WHERE instance_id=? AND state='done' "
+                    "AND bundle_sha256=? ORDER BY activation DESC LIMIT 1",
+                    (instance_id, digest),
+                ).fetchone()
+            return db.execute(
+                "SELECT * FROM artifacts WHERE instance_id=? AND kind=? "
+                "AND state='sealed' AND sha256=? ORDER BY activation DESC LIMIT 1",
+                (instance_id, kind, digest),
+            ).fetchone()
+
+        spec_row = exact_artifact("task-spec", document["task_spec_sha256"])
+        plan_row = exact_artifact("plan", document["plan_sha256"])
+        change_row = exact_artifact("change-set", document["change_set_sha256"])
+        bundle = exact_artifact("evidence-bundle", document["evidence_bundle_sha256"])
         if spec_row is None:
-            raise ArtifactValidationError(f"{schema} task_spec_sha256 is not a sealed input")
+            raise ArtifactValidationError(f"{schema} task_spec_sha256 is not an exact input")
         if plan_row is None:
-            raise ArtifactValidationError(f"{schema} plan_sha256 is not a sealed input")
+            raise ArtifactValidationError(f"{schema} plan_sha256 is not an exact input")
+        if change_row is None:
+            raise ArtifactValidationError(f"{schema} change_set_sha256 is not an exact input")
         if bundle is None:
             raise ArtifactValidationError(
-                f"{schema} evidence_bundle_sha256 is not a current sealed bundle"
+                f"{schema} evidence_bundle_sha256 is not an exact sealed input"
             )
         from shipfactory.verification import verify_evidence_bundle
         verified_bundle = verify_evidence_bundle(bundle["id"], db=db)
@@ -836,6 +1625,11 @@ def _validate_review_story_context(
         raise ArtifactValidationError(f"{schema} evidence bundle hash changed")
     if waiting and waiting["input_revision_hash"] != document["revision_hash"]:
         raise ArtifactValidationError(f"{schema} revision_hash is not the waiting gate revision")
+    if (story_step is not None and story_step["input_artifact_set_hash"]
+            and story_step["input_artifact_set_hash"] != document["revision_hash"]):
+        raise ArtifactValidationError(
+            f"{schema} revision_hash is not the producer input artifact revision"
+        )
 
     spec = artifact_document(dict(spec_row))
     plan = artifact_document(dict(plan_row))
@@ -879,7 +1673,28 @@ def _validate_review_story_context(
         )
 
     head_sha = str(bundle["head_sha"])
-    changed = _changed_paths(workspace, str(instance["base_sha"]), head_sha)
+    diff_workspace = workspace
+    if change_row is not None:
+        change = dict(change_row)
+        change_document = artifact_document(change)
+        if (change_document["base_sha"] != str(instance["base_sha"])
+                or change_document["head_sha"] != head_sha
+                or change_document["tree_sha"] != str(bundle["tree_sha"])):
+            raise ArtifactValidationError(
+                f"{schema} change-set identity differs from the evidence bundle"
+            )
+        if exact_inputs is not None:
+            run = store.run_row(int(change["run_id"])) if change.get("run_id") is not None else None
+            if run is None or not run.get("workspace_path"):
+                raise ArtifactValidationError(
+                    f"{schema} exact change-set producer workspace is unavailable"
+                )
+            diff_workspace = Path(run["workspace_path"])
+            _validate_change_set_context(
+                change_document, instance_id, str(change["step_id"]),
+                int(change["activation"]), int(change["run_id"]), diff_workspace,
+            )
+    changed = _changed_paths(diff_workspace, str(instance["base_sha"]), head_sha)
     generated = list(document["generated_or_mechanical_files"])
     all_declared = narrated_paths + generated
     duplicates = sorted({path for path in all_declared if all_declared.count(path) != 1})
@@ -1214,7 +2029,7 @@ def _validate_plan_context(
             raise ArtifactValidationError("shipfactory.plan/v1 requires a recipe instance")
         instance = dict(instance_row)
         from shipfactory.recipes.instantiate import recipe_for_instance
-        recipe = recipe_for_instance(instance).document
+        recipe = recipe_for_instance(instance, db=db).document
         _validate_plan_budget(document, instance, recipe, db)
     if task_spec is None:
         raise ArtifactValidationError("shipfactory.plan/v1 requires a sealed task-spec")
@@ -1311,19 +2126,40 @@ def seal_artifact(
             _validate_exploration_repository(document, worktree)
         elif kind == "plan":
             _validate_plan_context(document, instance_id, worktree)
-        elif kind == "review-story":
-            _validate_review_story_context(document, instance_id, worktree)
-            # Issue/request text is untrusted narrative. Store its safe
-            # projection, not executable HTML, while leaving diff/spec/evidence
-            # as the authoritative source records.
-            document = dashboard_safe_review_story(document)
+        elif kind == "change-set":
+            if run_id is None or producer != f"run:{int(run_id)}":
+                raise ArtifactValidationError(
+                    "change-set producer must identify its exact durable run"
+                )
+            document = _validate_change_set_context(
+                document, instance_id, step_id, int(activation), run_id, worktree,
+            )
             data = json.dumps(
                 document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
             ).encode("utf-8")
-            if len(data) > int(max_bytes):
+            base_sha = document["base_sha"]
+            head_sha = document["head_sha"]
+            tree_sha = document["tree_sha"]
+        elif kind == "review-story":
+            _validate_review_story_context(
+                document, instance_id, worktree, step_id=step_id,
+                activation=int(activation),
+            )
+            with store._connect() as db:
+                story_bundle = db.execute(
+                    "SELECT base_sha,head_sha,tree_sha FROM evidence_bundles "
+                    "WHERE instance_id=? AND bundle_sha256=? AND state='done'",
+                    (instance_id, document["evidence_bundle_sha256"]),
+                ).fetchone()
+            if story_bundle is None:
                 raise ArtifactValidationError(
-                    f"escaped review-story size exceeds configured ceiling {int(max_bytes)}"
+                    "shipfactory.review-story/v1 evidence identity is unavailable"
                 )
+            base_sha = str(story_bundle["base_sha"])
+            head_sha = str(story_bundle["head_sha"])
+            tree_sha = str(story_bundle["tree_sha"])
+            # Canonical sealed bytes are the validated artifact, byte-for-byte.
+            # Dashboard escaping belongs exclusively to the API/UI projection.
         sealed_path = _storage_path(instance_id, step_id, activation, kind)
     except ArtifactSealError:
         # Operational failures keep the durable candidate row retryable.
@@ -1502,7 +2338,7 @@ def seal_declared_outputs_for_task(
     store.init_db()
     with store._connect() as db:
         row = db.execute(
-            "SELECT s.*,i.recipe_id,i.recipe_version,v.normalized_yaml "
+            "SELECT s.*,i.recipe_id,i.recipe_version,i.recipe_hash "
             "FROM recipe_steps s JOIN recipe_instances i ON i.id=s.instance_id "
             "JOIN recipe_versions v ON v.id=i.recipe_id AND v.version=i.recipe_version "
             "WHERE s.kanban_task_id=?",
@@ -1510,15 +2346,31 @@ def seal_declared_outputs_for_task(
         ).fetchone()
         if row is None:
             return []
-        recipe = json.loads(row["normalized_yaml"])
+        from shipfactory.recipes.instantiate import recipe_for_instance
+        recipe = recipe_for_instance(dict(row), db=db).document
         if recipe.get("schema") != "shipfactory.recipe/v2":
             return []
         definition = next(item for item in recipe["steps"] if item["id"] == row["step_id"])
         inputs = input_artifacts(db, row["instance_id"], definition)
+        run = db.execute("SELECT * FROM runs WHERE id=?", (int(run_id),)).fetchone()
+        if run is None or str(run["task_id"]) != str(task_id):
+            raise ArtifactValidationError("declared output run does not own the reaped task")
+        if (run["recipe_activation"] is None
+                or int(run["recipe_activation"]) != int(row["activation"])):
+            raise ArtifactValidationError("declared output run activation is stale")
+        if (not run["workspace_path"]
+                or Path(run["workspace_path"]).resolve() != Path(workspace).resolve()):
+            raise ArtifactValidationError("declared output workspace differs from its durable run")
     sealed: list[dict[str, Any]] = []
     failures: list[str] = []
     for output in definition["outputs"]:
         try:
+            if output["kind"] == "change-set":
+                finalize_change_set_for_task(
+                    instance_id=row["instance_id"], step_id=row["step_id"],
+                    activation=int(row["activation"]), run_id=int(run_id),
+                    workspace=workspace, output=output, inputs=inputs,
+                )
             child = seal_artifact(
                 instance_id=row["instance_id"], step_id=row["step_id"],
                 activation=int(row["activation"]), run_id=int(run_id), output=output,
@@ -1528,6 +2380,8 @@ def seal_declared_outputs_for_task(
             sealed.append(child)
             for parent in inputs:
                 record_artifact_edge(parent["id"], child["id"], "derived-from")
+        except ArtifactSealError:
+            raise
         except ArtifactValidationError as exc:
             failures.append(f"{output['kind']}: {exc}")
     if failures:
@@ -1539,6 +2393,7 @@ __all__ = [
     "ArtifactMissing", "ArtifactSealError", "ArtifactStale",
     "ArtifactValidationError", "DEFAULT_ARTIFACT_MAX_BYTES",
     "artifact_document", "artifact_id", "artifact_is_stale", "artifact_set_hash", "input_artifacts",
-    "output_artifacts", "read_artifact", "record_artifact_edge", "seal_artifact",
+    "finalize_change_set_for_task", "output_artifacts", "read_artifact",
+    "record_artifact_edge", "rederive_change_set", "seal_artifact",
     "seal_declared_outputs_for_task", "task_spec_has_clarifications",
 ]

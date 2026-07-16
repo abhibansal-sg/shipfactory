@@ -23,7 +23,7 @@ if sys.path[0] != _REPO_ROOT:
 
 from shipfactory import decisions, store, verification
 from shipfactory.recipes import advancer
-from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.instantiate import instantiate, recipe_for_instance
 from shipfactory.recipes.loader import load_library
 from shipfactory.spawn import _worker_environment
 
@@ -294,6 +294,106 @@ def test_valid_activation_one_decision_is_stale_when_two_waits_at_tick(tmp_path,
     assert persisted["consumed_at"] and persisted["reason"].startswith("stale:")
 
 
+def test_public_event_consumption_rechecks_recorded_policy_identity(tmp_path, kanban_conn):
+    binding = _gate(tmp_path, kanban_conn, "policy-drift")
+    row = decisions.record_decision(
+        instance_id="policy-drift", step_id="approve", activation=1,
+        revision_hash=binding["revision_hash"], evidence_bundle_hash=None,
+        nonce="policy-drift-nonce", decision="approve", actor_kind="operator",
+        actor_id="alice", channel="dashboard",
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE gate_decisions SET policy_hash=? WHERE id=?",
+            ("foreign-policy-authority", row["id"]),
+        )
+    advancer.apply_events(kanban_conn, profiles=PROFILES, board="test")
+    with store._connect() as db:
+        event = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?",
+            (row["advance_event_key"],),
+        ).fetchone()
+        decision = db.execute(
+            "SELECT consumed_at,reason FROM gate_decisions WHERE id=?", (row["id"],),
+        ).fetchone()
+        step = db.execute(
+            "SELECT state FROM recipe_steps WHERE instance_id='policy-drift' "
+            "AND step_id='approve' ORDER BY activation DESC LIMIT 1",
+        ).fetchone()
+    assert event["state"] == "discarded" and "policy hash changed" in event["outcome"]
+    assert decision["consumed_at"] and "policy hash changed" in decision["reason"]
+    assert step["state"] == "waiting"
+
+
+def test_policy_bytes_drift_after_queue_is_discarded_and_gate_waits(tmp_path, kanban_conn):
+    binding = _gate(tmp_path, kanban_conn, "policy-bytes-drift")
+    row = decisions.record_decision(
+        instance_id="policy-bytes-drift", step_id="approve", activation=1,
+        revision_hash=binding["revision_hash"], evidence_bundle_hash=None,
+        nonce="policy-bytes-drift-nonce", decision="approve", actor_kind="operator",
+        actor_id="alice", channel="dashboard",
+    )
+    with store._connect() as db:
+        recipe_row = db.execute(
+            "SELECT normalized_yaml FROM recipe_versions WHERE id=? AND version=?",
+            ("gate-policy-bytes-drift", 1),
+        ).fetchone()
+        document = json.loads(recipe_row["normalized_yaml"])
+        document["description"] = "mutated after the operator queued approval"
+        db.execute(
+            "UPDATE recipe_versions SET normalized_yaml=? WHERE id=? AND version=?",
+            (json.dumps(document, sort_keys=True, separators=(",", ":")),
+             "gate-policy-bytes-drift", 1),
+        )
+
+    advancer.apply_events(kanban_conn, profiles=PROFILES, board="test")
+    with store._connect() as db:
+        event = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?",
+            (row["advance_event_key"],),
+        ).fetchone()
+        decision = db.execute(
+            "SELECT consumed_at,reason FROM gate_decisions WHERE id=?", (row["id"],),
+        ).fetchone()
+        step = db.execute(
+            "SELECT state FROM recipe_steps WHERE instance_id=? AND step_id=?",
+            ("policy-bytes-drift", "approve"),
+        ).fetchone()
+    assert event["state"] == "discarded"
+    assert "policy bytes hash mismatch" in event["outcome"]
+    assert "recipe_versions.hash" in event["outcome"]
+    assert decision["consumed_at"] and "recipe_versions.hash" in decision["reason"]
+    assert step["state"] == "waiting"
+
+
+def test_recipe_loader_rejects_recipe_version_hash_drift(tmp_path, kanban_conn):
+    _gate(tmp_path, kanban_conn, "version-hash-drift")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_versions SET hash=? WHERE id=? AND version=?",
+            ("0" * 64, "gate-version-hash-drift", 1),
+        )
+        instance = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", ("version-hash-drift",),
+        ).fetchone())
+        with pytest.raises(RuntimeError, match=r"recipe_versions\.hash"):
+            recipe_for_instance(instance, db=db)
+
+
+def test_recipe_loader_rejects_instance_hash_drift(tmp_path, kanban_conn):
+    _gate(tmp_path, kanban_conn, "instance-hash-drift")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_instances SET recipe_hash=? WHERE id=?",
+            ("1" * 64, "instance-hash-drift"),
+        )
+        instance = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", ("instance-hash-drift",),
+        ).fetchone())
+        with pytest.raises(RuntimeError, match=r"recipe_instances\.recipe_hash"):
+            recipe_for_instance(instance, db=db)
+
+
 def test_phone_key_is_0600_expiring_and_excluded_from_worker_environment(
     tmp_path, kanban_conn, monkeypatch,
 ):
@@ -325,7 +425,7 @@ def test_gate_decision_migration_is_normative_sql():
         columns = [row["name"] for row in db.execute("PRAGMA table_info(gate_decisions)")]
         version = db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
         indexes = [row["name"] for row in db.execute("PRAGMA index_list(gate_decisions)")]
-    assert version == 13
+    assert version == 14
     assert columns == [
         "id", "instance_id", "step_id", "activation", "revision_hash",
         "evidence_bundle_id", "evidence_bundle_hash", "actor_kind", "actor_id",

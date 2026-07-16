@@ -412,6 +412,52 @@
     }, [resource.loadedAt, (boards || []).join("|")]);
   }
 
+  function ReviewStoryCard(props) {
+    var story = props.story;
+    if (!story) return null;
+    return h("section", { className: "factory-review-story border border-border bg-background/30 p-3", "aria-label": "Review story" },
+      h("div", { className: "flex flex-wrap items-start justify-between gap-2" },
+        h("div", null,
+          h("span", { className: "font-mondwest text-display text-xs tracking-[0.12em] text-text-tertiary" }, "Operator approval card"),
+          h("h4", { className: "mt-1 text-sm font-medium text-foreground" }, story.headline)
+        ),
+        h(MonoChip, { title: "Exact change-set SHA-256" }, story.change_set_sha256)
+      ),
+      h("div", { className: "mt-3 grid gap-3" }, (story.changes || []).map(function (change, index) {
+        return h("article", { key: index, className: "border-l-2 border-primary/40 pl-3" },
+          h("div", { className: "flex flex-wrap items-center gap-2" },
+            h(StatePill, { value: "running" }, "importance " + change.importance),
+            (change.requirement_ids || []).map(function (id) { return h(MonoChip, { key: id }, id); })
+          ),
+          h("p", { className: "mt-2 text-xs leading-relaxed text-text-secondary" }, change.why),
+          h("p", { className: "mt-1 text-xs leading-relaxed text-text-tertiary" }, "Risk: " + change.risk),
+          h("div", { className: "mt-2 flex flex-wrap gap-2" },
+            (change.files || []).map(function (path) { return h(MonoChip, { key: path, title: "Changed path" }, path); })
+          ),
+          h("div", { className: "mt-2 flex flex-wrap gap-2" },
+            (change.evidence_case_ids || []).map(function (id) { return h(MonoChip, { key: id, title: "Evidence case" }, id); })
+          )
+        );
+      })),
+      (story.generated_or_mechanical_files || []).length ? h("div", { className: "mt-3" },
+        h("strong", { className: "text-xs text-foreground" }, "Generated or mechanical files"),
+        h("div", { className: "mt-1 flex flex-wrap gap-2" }, story.generated_or_mechanical_files.map(function (path) { return h(MonoChip, { key: path }, path); }))
+      ) : null,
+      (story.not_changed || []).length ? h("div", { className: "mt-3" },
+        h("strong", { className: "text-xs text-foreground" }, "Explicitly not implemented"),
+        h("ul", { className: "mt-1 grid gap-1 text-xs text-text-secondary" }, story.not_changed.map(function (item, index) {
+          return h("li", { key: index }, ((item.requirement_ids || [item.requirement_id]).filter(Boolean)).join(", ") + ": " + (item.reason || item.why));
+        }))
+      ) : null,
+      h("div", { className: "mt-3" },
+        h("strong", { className: "text-xs text-foreground" }, "Residual risks"),
+        (story.residual_risks || []).length
+          ? h("ul", { className: "mt-1 grid gap-1 text-xs text-text-secondary" }, story.residual_risks.map(function (risk, index) { return h("li", { key: index }, risk); }))
+          : h("p", { className: "mt-1 text-xs text-text-tertiary" }, "No residual risks declared.")
+      )
+    );
+  }
+
   function GateCard(props) {
     var gate = props.gate;
     var key = gate.instance_id + ":" + gate.step_id;
@@ -449,7 +495,8 @@
               onClick: function () { props.onDecide(gate, "reject"); },
             }, props.busy === key + ":reject" ? h(Spinner, { label: "Rejecting" }) : "Reject")
           )
-        )
+        ),
+        h(ReviewStoryCard, { story: gate.review_story })
       )
     );
   }
@@ -647,6 +694,7 @@
           ),
           h(InstanceControls, { detail: detail, recipes: props.recipes, recipesError: props.recipesError, onChanged: props.onChanged }),
           h(BudgetProgress, { tokens: detail.tokens }),
+          h(ReviewStoryCard, { story: detail.review_story }),
           h("div", { className: "flex items-center justify-between border-l-2 border-primary bg-primary/10 p-3 text-sm" },
             h("span", { className: "text-text-secondary" }, "Activations"),
             h("strong", { className: "font-mono-ui" }, formatNumber(detail.activation_count) + " / " + (detail.budgets && detail.budgets.max_activations != null ? formatNumber(detail.budgets.max_activations) : "unbounded"))

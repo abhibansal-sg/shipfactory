@@ -15,7 +15,10 @@ class ClaudeExecutor(Executor):
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build Paperclip's noninteractive Claude argv."""
-        cmd = ["claude", "--print", "-", "--output-format", "stream-json", "--verbose"]
+        cmd = [
+            "claude", "--print", "-", "--output-format", "stream-json", "--verbose",
+            "--strict-mcp-config",
+        ]
         if seat.model:
             cmd += ["--model", seat.model]
         if getattr(seat, "reasoning", ""):

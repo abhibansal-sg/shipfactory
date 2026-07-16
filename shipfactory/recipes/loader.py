@@ -40,6 +40,7 @@ class Recipe:
     hash: str
     seats: frozenset[str] | None = None
     profiles: frozenset[str] | None = None
+    verification_profiles: frozenset[str] | None = None
 
     @property
     def key(self) -> str:
@@ -144,7 +145,10 @@ def _validate_v2_io(step: dict[str, Any]) -> None:
             _error(f"v2 output path must stay under .shipfactory-output/ in step {ident!r}")
 
 
-def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str] | None = None) -> dict[str, Any]:
+def validate(
+    document: Any, *, seats: set[str] | None = None, profiles: set[str] | None = None,
+    verification_profiles: set[str] | None = None,
+) -> dict[str, Any]:
     """Validate recipe v1 or v2 exactly; never repair or coerce input."""
     if not isinstance(document, dict) or set(document) != _TOP:
         _error("recipe top-level keys must exactly match schema")
@@ -251,6 +255,10 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
                         for field in ("manifest", "profile", "environment"))
                     or params["environment"] != "app"):
                 _error("verification requires manifest, profile, and environment: app")
+            if (verification_profiles is not None
+                    and not _templated(params["profile"])
+                    and params["profile"] not in verification_profiles):
+                _error(f"unknown verification profile {params['profile']!r}")
             if (len(step["outputs"]) != 1
                     or step["outputs"][0]["kind"] != "evidence-bundle"
                     or step["outputs"][0]["schema"] != "shipfactory.evidence/v1"):
@@ -294,13 +302,19 @@ def validate(document: Any, *, seats: set[str] | None = None, profiles: set[str]
     return document
 
 
-def load_library(path: str | Path, *, seats: set[str] | None = None, profiles: set[str] | None = None, persist: bool = True) -> RecipeLibrary:
+def load_library(
+    path: str | Path, *, seats: set[str] | None = None, profiles: set[str] | None = None,
+    verification_profiles: set[str] | None = None, persist: bool = True,
+) -> RecipeLibrary:
     """Load a directory of recipes and pin each normalized document immutably."""
     recipes: dict[str, Recipe] = {}
     for source in sorted(Path(path).glob("*.y*ml")):
         try: document = yaml.safe_load(source.read_text(encoding="utf-8"))
         except (OSError, yaml.YAMLError) as exc: raise RecipeError(f"cannot load {source}: {exc}") from exc
-        validate(document, seats=seats, profiles=profiles)
+        validate(
+            document, seats=seats, profiles=profiles,
+            verification_profiles=verification_profiles,
+        )
         normalized = _canonical(document); digest = hashlib.sha256(normalized.encode()).hexdigest(); key = f"{document['id']}@{document['version']}"
         if key in recipes: _error(f"duplicate recipe {key}")
         if persist:
@@ -314,6 +328,7 @@ def load_library(path: str | Path, *, seats: set[str] | None = None, profiles: s
             digest,
             frozenset(seats) if seats is not None else None,
             frozenset(profiles) if profiles is not None else None,
+            frozenset(verification_profiles) if verification_profiles is not None else None,
         )
     return RecipeLibrary(recipes)
 
