@@ -1,0 +1,139 @@
+/* Hermes Factory: only mechanics the host utility bundle cannot provide. */
+.hermes-factory code,
+.hermes-factory pre {
+  background: transparent !important;
+  color: inherit;
+}
+.factory-spinner > span:first-child {
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 0.125rem solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  border-radius: 999px;
+  animation: factory-spin 700ms linear infinite;
+}
+@keyframes factory-spin {
+  to { transform: rotate(360deg); }
+}
+
+.factory-skeleton-stack { display: grid; gap: 0.45rem; }
+.factory-skeleton-stack span {
+  display: block;
+  height: 0.55rem;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, currentColor 4%, transparent),
+    color-mix(in srgb, currentColor 9%, transparent),
+    color-mix(in srgb, currentColor 4%, transparent)
+  );
+  background-size: 200% 100%;
+  animation: factory-shimmer 1.4s ease-in-out infinite;
+}
+.factory-skeleton-stack span:nth-child(2) { width: 82%; }
+.factory-skeleton-stack span:nth-child(3) { width: 64%; }
+@keyframes factory-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+.factory-toast { animation: factory-toast-in 150ms ease-out; }
+@keyframes factory-toast-in {
+  from { opacity: 0; transform: translateY(-0.25rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.factory-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  gap: 0.75rem;
+}
+.factory-instance-table { min-width: 70rem; }
+.factory-step-table { min-width: 44rem; }
+.factory-instance-table tbody tr { cursor: pointer; }
+.factory-instance-table tbody tr:focus-visible { outline: 1px solid currentColor; }
+.factory-budget-cell { min-width: 11.5rem; }
+.factory-budget { min-width: 10rem; }
+.factory-budget progress {
+  appearance: none;
+  width: 100%;
+  height: 0.35rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.factory-budget progress::-webkit-progress-bar {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.factory-budget progress::-webkit-progress-value,
+.factory-budget progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--color-primary);
+}
+.factory-budget progress.is-unbounded::-webkit-progress-value,
+.factory-budget progress.is-unbounded::-moz-progress-bar {
+  background: var(--color-muted-foreground);
+}
+.factory-drawer-shade {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: flex-end;
+  background: color-mix(in srgb, var(--color-card) 62%, transparent);
+  backdrop-filter: blur(0.125rem);
+}
+.factory-drawer {
+  width: min(46rem, 94vw);
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--color-border);
+  box-shadow: -0.25rem 0 1.25rem color-mix(in srgb, currentColor 18%, transparent);
+  animation: factory-drawer-in 180ms ease-out;
+}
+@keyframes factory-drawer-in {
+  from { opacity: 0.4; transform: translateX(100%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.factory-drawer-head {
+  padding: 0.65rem 0.85rem;
+  padding-top: max(0.65rem, env(safe-area-inset-top));
+}
+.factory-drawer > [role="status"],
+.factory-drawer > [role="alert"] { margin: 1rem; }
+.factory-drawer-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  padding: 0.9rem;
+  padding-bottom: max(0.9rem, calc(0.9rem + env(safe-area-inset-bottom)));
+  overflow-y: auto;
+}
+.factory-meta-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem 0.75rem;
+}
+.factory-meta-panel > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+@media (max-width: 1023px) {
+  .factory-drawer-head { padding-top: calc(3.5rem + env(safe-area-inset-top)); }
+}
+@media (max-width: 720px) {
+  .factory-card-grid,
+  .factory-meta-panel { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .factory-spinner > span:first-child,
+  .factory-skeleton-stack span,
+  .factory-toast,
+  .factory-drawer { animation: none; }
+}

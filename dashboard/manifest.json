@@ -1,0 +1,14 @@
+{
+  "name": "shipfactory",
+  "label": "ShipFactory",
+  "description": "Governed software factory: recipe gates, instances, seats, and cost telemetry.",
+  "icon": "Factory",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/shipfactory",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

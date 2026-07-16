@@ -1,0 +1,13 @@
+name: shipfactory
+version: 1.0.0
+description: "ShipFactory — governed software factory on Hermes kanban: seats, hierarchy, review/approval gates, watchdogs, cost telemetry."
+author: Abhinav Bansal
+kind: general
+provides_tools:
+  - shipfactory_verdict
+  - shipfactory_costs
+  - shipfactory_monitor_add
+hooks:
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked

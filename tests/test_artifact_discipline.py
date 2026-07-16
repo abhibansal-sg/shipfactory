@@ -1,0 +1,388 @@
+"""Artifact-discipline recipe regressions."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from shipfactory import store
+from shipfactory.recipes.advancer import (
+    apply_events,
+    event,
+    gate_decision,
+    reconcile,
+    release_review_stall,
+)
+from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.loader import RecipeError, load_library
+from shipfactory.recipes.selector import (
+    RECIPE_SELECTOR_PROMPT,
+    validate_or_park_selection,
+    validate_selection,
+)
+
+
+PROFILES = {
+    "standard": {
+        "max_runtime_seconds": 1800,
+        "max_retries": 2,
+        "token_allowance": 50_000,
+    }
+}
+
+ROOT = Path(__file__).resolve().parents[1]
+DEV_PIPELINE_V1_SHA256 = "fff1275c003037ed84c35e97a38f8c07210b7143f871eb81dcc1b2c11455ab45"
+
+
+def _review_loop_recipe(tmp_path: Path):
+    library = tmp_path / "review-loop-library"
+    library.mkdir()
+    (library / "review-loop@1.yaml").write_text(
+        """schema: shipfactory.recipe/v1
+id: review-loop
+version: 1
+status: active
+description: bounded review-stall loop
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets: {max_activations: 10, max_step_activations: 3, max_tokens: 500000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}
+  - id: verify
+    primitive: review_gate
+    title: Verify
+    needs: [build]
+    optional: false
+    params: {seat: verifier, instructions: verify, execution_profile: standard, workspace: worktree}
+""",
+        encoding="utf-8",
+    )
+    return load_library(library).get("review-loop@1")
+
+
+def test_dev_pipeline_v2_loads_in_order_and_v1_bytes_are_immutable():
+    v1 = ROOT / "recipes" / "dev-pipeline@1.yaml"
+    assert hashlib.sha256(v1.read_bytes()).hexdigest() == DEV_PIPELINE_V1_SHA256
+
+    recipe = load_library(ROOT / "recipes", persist=False).get("dev-pipeline@2").document
+    assert recipe["budgets"] == {
+        "max_activations": 12,
+        "max_step_activations": 3,
+        "max_tokens": 300_000,
+    }
+    assert [step["id"] for step in recipe["steps"]] == [
+        "plan-check", "build", "verify", "approval", "notify",
+    ]
+    assert [step["needs"] for step in recipe["steps"]] == [
+        [], ["plan-check"], ["build"], ["verify"], ["approval"],
+    ]
+
+
+def _step(instance_id: str, step_id: str, activation: int | None = None) -> dict | None:
+    with store._connect() as db:
+        if activation is None:
+            row = db.execute(
+                "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
+                (instance_id, step_id),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+                (instance_id, step_id, activation),
+            ).fetchone()
+    return dict(row) if row else None
+
+
+def _instance(instance_id: str) -> dict:
+    with store._connect() as db:
+        row = db.execute("SELECT * FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()
+    assert row
+    return dict(row)
+
+
+def _reject_round(kanban_conn, instance_id: str, activation: int, count: int | None) -> None:
+    from hermes_cli import kanban_db
+
+    build = _step(instance_id, "build", activation)
+    assert build and build["state"] == "running"
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result=f"build {activation}")
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    review = _step(instance_id, "verify", activation)
+    assert review and review["state"] == "running"
+    if count is None:
+        body = "shipfactory/recipes/advancer.py:1 requires changes"
+    else:
+        body = f"finding_count: {count}\nfactory/recipes/advancer.py:1 requires changes"
+    verdict = {
+        "outcome": "request_changes",
+        "target_step": "build",
+        "body": body,
+    }
+    result = "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+    assert kanban_db.complete_task(kanban_conn, review["kanban_task_id"], result=result)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+
+
+def test_shrinking_rejection_counts_continue_until_activation_cap(tmp_path, kanban_conn):
+    recipe = _review_loop_recipe(tmp_path)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="shrinking")
+    reconcile(kanban_conn, "shrinking", profiles=PROFILES)
+
+    for activation, count in enumerate((3, 2, 1), start=1):
+        _reject_round(kanban_conn, "shrinking", activation, count)
+        assert _step("shrinking", "verify", activation)["finding_count"] == count
+
+    assert _step("shrinking", "build", 4)["blocked_reason"] == "activation_fuse"
+    assert _step("shrinking", "verify", 4)["state"] == "pending"
+    assert _instance("shrinking")["activation_count"] == 6
+
+
+def test_flat_rejection_counts_park_before_third_activation_and_release_is_audited(tmp_path, kanban_conn):
+    recipe = _review_loop_recipe(tmp_path)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="flat")
+    reconcile(kanban_conn, "flat", profiles=PROFILES)
+    _reject_round(kanban_conn, "flat", 1, 2)
+    _reject_round(kanban_conn, "flat", 2, 2)
+
+    parked = _instance("flat")
+    assert parked["status"] == "blocked" and parked["blocked_reason"] == "review_stall"
+    assert _step("flat", "verify", 2)["blocked_reason"] == "review_stall"
+    assert _step("flat", "build", 3) is None
+    assert parked["activation_count"] == 4
+    charged = parked["tokens_charged"]
+    reconcile(kanban_conn, "flat", profiles=PROFILES)
+    assert _instance("flat")["tokens_charged"] == charged
+
+    key = release_review_stall("flat", "verify", "operator accepts another bounded revision")
+    apply_events(kanban_conn, profiles=PROFILES)
+    assert _step("flat", "build", 3)["state"] == "running"
+    with store._connect() as db:
+        audit = db.execute("SELECT source,payload_json,state FROM advance_events WHERE key=?", (key,)).fetchone()
+    assert audit["source"] == "operator_release" and audit["state"] == "applied"
+    assert json.loads(audit["payload_json"])["reason"] == "operator accepts another bounded revision"
+
+
+def test_unparseable_rejection_counts_never_stall_and_existing_cap_wins(tmp_path, kanban_conn):
+    recipe = _review_loop_recipe(tmp_path)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="unknown-count")
+    reconcile(kanban_conn, "unknown-count", profiles=PROFILES)
+
+    for activation in (1, 2, 3):
+        _reject_round(kanban_conn, "unknown-count", activation, None)
+        assert _step("unknown-count", "verify", activation)["finding_count"] == -1
+        assert _step("unknown-count", "verify", activation)["blocked_reason"] == "changes_requested"
+
+    assert _step("unknown-count", "build", 4)["blocked_reason"] == "activation_fuse"
+    assert _instance("unknown-count")["blocked_reason"] == "activation_fuse"
+
+
+def _human_gate_recipe(tmp_path: Path, primitive: str):
+    recipe_id = "approval-note" if primitive == "approval_gate" else "event-note"
+    gate_params = (
+        "{approvers: [operator], instructions: Approve the verified artifact.}"
+        if primitive == "approval_gate"
+        else "{event: artifact_ready}"
+    )
+    library = tmp_path / f"{recipe_id}-library"
+    library.mkdir()
+    (library / f"{recipe_id}@1.yaml").write_text(
+        f"""schema: shipfactory.recipe/v1
+id: {recipe_id}
+version: 1
+status: active
+description: resume-note gate test
+intent_tags: [test]
+supersedes: null
+parameters: {{}}
+budgets: {{max_activations: 2, max_step_activations: 1, max_tokens: 100000}}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {{seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}}
+  - id: gate
+    primitive: {primitive}
+    title: Human gate
+    needs: [build]
+    optional: false
+    params: {gate_params}
+""",
+        encoding="utf-8",
+    )
+    return load_library(library).get(f"{recipe_id}@1")
+
+
+def _park_human_gate(tmp_path: Path, kanban_conn, primitive: str, instance_id: str) -> dict:
+    from hermes_cli import kanban_db
+
+    recipe = _human_gate_recipe(tmp_path, primitive)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id=instance_id)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    build = _step(instance_id, "build")
+    assert kanban_db.complete_task(
+        kanban_conn,
+        build["kanban_task_id"],
+        result="JWT auth with refresh rotation using jose",
+    )
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    gate = _step(instance_id, "gate")
+    assert gate and gate["state"] == "waiting"
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len(comments) == 1
+    note = comments[0].body
+    assert "CONTINUE-HERE" in note
+    assert f"Instance: {instance_id}" in note and "Step: gate" in note
+    assert "build: JWT auth with refresh rotation using jose" in note
+    assert "## Done" in note and "## Left" in note and "## Decisions and Why" in note
+    assert "## Blockers" in note and "## Next Action" in note
+    return gate
+
+
+def test_approval_gate_resume_note_is_written_and_consumed(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+
+    gate = _park_human_gate(tmp_path, kanban_conn, "approval_gate", "approval-resume")
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert "Approval required: Approve the verified artifact." in comments[0].body
+
+    gate_decision("approval-resume", "gate", "approve")
+    apply_events(kanban_conn, profiles=PROFILES)
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len([comment for comment in comments if comment.body.startswith("RESUMED ")]) == 1
+
+
+def test_wait_for_event_resume_note_is_written_and_consumed(tmp_path, kanban_conn):
+    from hermes_cli import kanban_db
+
+    gate = _park_human_gate(tmp_path, kanban_conn, "wait_for_event", "event-resume")
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert "Event required: artifact_ready." in comments[0].body
+
+    event("event-resume", "gate", {"id": "artifact-1", "type": "artifact_ready"})
+    apply_events(kanban_conn, profiles=PROFILES)
+    comments = kanban_db.list_comments(kanban_conn, gate["kanban_task_id"])
+    assert len([comment for comment in comments if comment.body.startswith("RESUMED ")]) == 1
+
+
+def _selector_node(*, clarifications: list[str]) -> dict:
+    return {
+        "id": "change",
+        "title": "Build the change",
+        "body": "Implement the selected request.",
+        "needs": [],
+        "ranked_candidates": [
+            {"id": "dev-pipeline@2", "score": 1.0, "reason": "software change"},
+        ],
+        "chosen": "dev-pipeline@2",
+        "parameters": {"request": "Implement the selected request."},
+        "skip_steps": [],
+        "assumptions": ["The change touches no more than three files."],
+        "needs_clarification": clarifications,
+    }
+
+
+def test_selector_rejects_four_clarification_markers():
+    library = load_library(ROOT / "recipes", persist=False)
+    selection = {"nodes": [_selector_node(clarifications=["one", "two", "three", "four"])]}
+    with pytest.raises(RecipeError, match="exceeds 3 clarification markers"):
+        validate_selection(
+            selection,
+            library,
+            seats={"verifier", "dev-backend", "operator"},
+            profiles={"standard"},
+        )
+    assert "0-3 files" in RECIPE_SELECTOR_PROMPT
+    assert "4-6 files" in RECIPE_SELECTOR_PROMPT
+    assert "7+ files" in RECIPE_SELECTOR_PROMPT
+
+
+def test_selector_clarification_parks_source_and_instantiates_nothing(kanban_conn):
+    from hermes_cli import kanban_db
+
+    library = load_library(ROOT / "recipes")
+    source = kanban_db.create_task(
+        kanban_conn,
+        title="Ambiguous request",
+        body="Needs an operator answer.",
+        triage=True,
+    )
+    selection = {"nodes": [_selector_node(clarifications=["Which tenant owns the data?"])]}
+    assert validate_or_park_selection(
+        kanban_conn,
+        source,
+        selection,
+        library,
+        seats={"verifier", "dev-backend", "operator"},
+        profiles={"standard"},
+    ) == []
+
+    task = kanban_db.get_task(kanban_conn, source)
+    assert (task.status, task.block_kind) == ("blocked", "needs_input")
+    blocked = [event for event in kanban_db.list_events(kanban_conn, source) if event.kind == "blocked"]
+    assert "Which tenant owns the data?" in blocked[-1].payload["reason"]
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM recipe_instances").fetchone()[0] == 0
+
+
+def test_dev_pipeline_v2_flat_findings_e2e_parks_review_stall(kanban_conn):
+    """Instantiate the published graph and drive its real build/review loop."""
+    from hermes_cli import kanban_db
+
+    recipe = load_library(ROOT / "recipes").get("dev-pipeline@2")
+    instantiate(
+        kanban_conn,
+        board="test",
+        recipe=recipe,
+        parameters={"request": "Build the hermetic smoke artifact."},
+        instance_id="pipeline-v2-e2e",
+    )
+    reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    plan_check = _step("pipeline-v2-e2e", "plan-check", 1)
+    approval = {
+        "outcome": "approve",
+        "body": "APPROVE: clean pass; no findings",
+    }
+    assert kanban_db.complete_task(
+        kanban_conn,
+        plan_check["kanban_task_id"],
+        result="SHIPFACTORY_VERDICT: " + json.dumps(approval, separators=(",", ":")),
+    )
+    reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    for activation in (1, 2):
+        build = _step("pipeline-v2-e2e", "build", activation)
+        assert build and build["state"] == "running"
+        assert kanban_db.complete_task(
+            kanban_conn,
+            build["kanban_task_id"],
+            result=f"Hermetic artifact revision {activation}",
+        )
+        reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+        verify = _step("pipeline-v2-e2e", "verify", activation)
+        rejection = {
+            "outcome": "request_changes",
+            "target_step": "build",
+            "body": "finding_count: 2\nBLOCKER tests/test_artifact_discipline.py:1 — stubbed flat finding\nWARNING recipes/dev-pipeline@2.yaml:1 — stubbed flat finding",
+        }
+        assert kanban_db.complete_task(
+            kanban_conn,
+            verify["kanban_task_id"],
+            result="SHIPFACTORY_VERDICT: " + json.dumps(rejection, separators=(",", ":")),
+        )
+        reconcile(kanban_conn, "pipeline-v2-e2e", profiles=PROFILES)
+
+    instance = _instance("pipeline-v2-e2e")
+    assert (instance["status"], instance["blocked_reason"]) == ("blocked", "review_stall")
+    assert _step("pipeline-v2-e2e", "verify", 2)["blocked_reason"] == "review_stall"
+    assert _step("pipeline-v2-e2e", "build", 3) is None
