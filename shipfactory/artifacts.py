@@ -419,6 +419,15 @@ def _candidate_parts(path: str) -> tuple[str, ...]:
     return parsed.parts
 
 
+# Test-only seam: a callable invoked exactly once, immediately after the
+# FIRST chunk of a candidate read, before any subsequent os.read() call on
+# the same fd. Production code never sets this; it exists so a test can
+# deterministically land a real, synchronized write in the middle of a
+# read — instead of an unsynchronized background thread that may or may
+# not overlap the read window by luck (finding #2).
+_CANDIDATE_READ_HOOK: Any = None
+
+
 def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> bytes:
     """Open every candidate component with O_NOFOLLOW semantics."""
     parts = _candidate_parts(candidate_path)
@@ -463,6 +472,7 @@ def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> byt
             )
         chunks: list[bytes] = []
         total = 0
+        first_chunk = True
         while True:
             chunk = os.read(fd, min(65536, int(max_bytes) + 1 - total))
             if not chunk:
@@ -473,6 +483,23 @@ def _read_candidate(workspace: Path, candidate_path: str, max_bytes: int) -> byt
                 raise ArtifactValidationError(
                     f"artifact size exceeds configured ceiling {int(max_bytes)}"
                 )
+            if first_chunk and _CANDIDATE_READ_HOOK is not None:
+                _CANDIDATE_READ_HOOK()
+            first_chunk = False
+        # TOCTOU guard: this fd stays open on the same inode for the whole
+        # read, so a concurrent in-place write to the candidate (the real
+        # attack this seam and finding #2 are about) changes this inode's
+        # mtime/ctime even when the byte length happens to match. A read
+        # that spanned such a write must never be sealed as if it were one
+        # coherent snapshot — reject it explicitly rather than silently
+        # accepting whatever bytes landed in the buffer.
+        after = os.fstat(fd)
+        if (after.st_mtime_ns, after.st_ctime_ns, after.st_size) != (
+            info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+        ):
+            raise ArtifactValidationError(
+                f"candidate path was modified while being read (torn read): {candidate_path}"
+            )
         return b"".join(chunks)
     except ArtifactValidationError:
         raise
@@ -534,6 +561,26 @@ def _validate_exploration_repository(document: dict[str, Any], workspace: Path) 
         path = _repository_path(
             reference.get("path"), label=f"exploration reference {index} path",
         )
+        if status == "generated":
+            # "generated" must not be usable to relabel a real, already
+            # tracked file (e.g. quietly excusing a hand-authored test's
+            # removal) with no corroboration. If the path resolves at
+            # base_sha, its declared git_blob_sha must honestly match that
+            # blob; a path absent at base_sha is a legitimate not-yet-built
+            # output and needs no further check (finding #33).
+            try:
+                tracked_blob_sha = _git(workspace, "rev-parse", f"{base_sha}:{path}")
+            except ArtifactValidationError:
+                continue
+            declared_blob_sha = reference.get("git_blob_sha")
+            if (not isinstance(declared_blob_sha, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", declared_blob_sha)
+                    or declared_blob_sha.lower() != tracked_blob_sha.lower()):
+                raise ArtifactValidationError(
+                    f"exploration reference {index} classifies tracked path {path!r} "
+                    "as generated without a matching git_blob_sha"
+                )
+            continue
         if status != "existing":
             continue
         try:
@@ -565,6 +612,24 @@ def _validate_exploration_repository(document: dict[str, Any], workspace: Path) 
             raise ArtifactValidationError(
                 f"exploration reference {index} text_sha256 mismatch"
             )
+        if reference["kind"] == "symbol":
+            # A byte-perfect hash only proves the citation names SOME real
+            # span of text — it says nothing about which symbol that span
+            # actually defines or calls. Without this, a correct hash for
+            # `login` could be dishonestly labeled `revoke_all_sessions`
+            # (a hallucinated symbol) or `lοgin` (a Unicode homoglyph of the
+            # real name, byte-distinct from it) and would seal. §2.2.5
+            # requires a symbol claim to resolve to a definition or call
+            # site in what it cites; require the claimed name to appear,
+            # verbatim, as its own token in the cited text (finding #3).
+            claimed_symbol = reference["id"]
+            cited_text = cited.decode("utf-8", errors="replace")
+            if not re.search(r"\b" + re.escape(claimed_symbol) + r"\b", cited_text):
+                raise ArtifactValidationError(
+                    f"exploration reference {index} claims symbol {claimed_symbol!r} "
+                    "which does not resolve to a definition or call site in the "
+                    "cited text"
+                )
 
 
 def _repository_identity(workspace: Path, document: dict[str, Any] | None = None) -> tuple[str, str, str]:

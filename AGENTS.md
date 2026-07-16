@@ -157,12 +157,73 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   with its original (still-matching) start token. Tests simulating this
   must opportunistically `os.waitpid(-1, os.WNOHANG)` in their poll loop,
   or they'll see a supposedly-dead process reported as still alive.
+- An exploration reference's `generated` classification was unverified —
+  it could relabel any real, hand-authored tracked file (e.g. a test about
+  to be deleted) with zero corroboration, since only `existing`/`proposed`
+  statuses had required-field or hash checks. `generated` now requires an
+  honest `git_blob_sha` whenever its declared path resolves at `base_sha`;
+  a path genuinely absent at `base_sha` (a not-yet-built output) still needs
+  no corroboration (finding #33, SF-7 adversarial lane).
+- `access_mode: readonly` on a v2 recipe step (`explore`, `spec-attack`,
+  `plan-attack` in dev-pipeline@5) was validated for shape by the loader but
+  never enforced anywhere — every executor (codex, claude, hermes) ran with
+  full workspace-write regardless. Prompt wording is not a security
+  boundary; the OS is. `shipfactory_spawn` now chmods a readonly step's
+  workspace non-writable (dirs `0o550`, files `0o440`) before exec, leaving
+  only `.shipfactory-output/` writable so the step can still seal its
+  result or emit a verdict (finding #34, SF-7 adversarial lane).
+- Finding #34's first cut was itself fail-open and incomplete: a DB/JSON
+  error resolving `access_mode` silently returned "no enforcement needed"
+  instead of blocking the spawn, and the Hermes executor branch never
+  called the enforcement function at all. `_step_access_mode` now raises
+  `AccessModeResolutionError` on any ambiguous lookup — `shipfactory_spawn`
+  lets that abort the spawn rather than run unprotected — and the
+  enforcement call moved above the executor branch so codex/claude/hermes
+  are covered identically. The chmod mechanism itself is still same-UID
+  bypassable (`chmod u+w` before writing restores the worker's own access);
+  this is now recorded honestly as `access_enforcement_level="advisory"` on
+  the run row (never `"enforced"`) — the SF-8 truthful-labeling pattern
+  (see `_apply_network_policy`, finding #7) applied to the filesystem
+  boundary (finding #1, cross-lab review of the SF-7 adversarial lane).
+- `_read_candidate` read a candidate artifact's bytes with no protection
+  against the file changing mid-read — a torn read spanning two writes
+  could produce a hybrid document that still parses as valid JSON and
+  passes schema validation (nothing hash-binds unrelated fields like
+  `unknowns` to `intent_sha256`), sealing as if it were one coherent
+  snapshot. It now re-`fstat`s the open fd after the read loop and rejects
+  with `"modified while being read"` if mtime/ctime/size differ from the
+  pre-read `fstat` — a real, deterministic TOCTOU guard, not a hope that a
+  racing writer never lands in the window (finding #2, cross-lab review of
+  the SF-7 adversarial lane).
+- `_validate_exploration_repository` hash-verified an `existing` reference's
+  cited bytes but never checked a `kind: symbol` reference's claimed
+  identity against them — a byte-perfect hash of `login`'s real text could
+  be dishonestly labeled `revoke_all_sessions` (hallucinated) or `lοgin`
+  (Greek omicron homoglyph, byte-distinct from the real name) and would
+  seal. §2.2.5 requires a symbol claim to resolve to a definition or call
+  site, not merely name SOME real span; a `kind: symbol` reference's `id`
+  must now appear, verbatim, as its own token in the cited text (finding
+  #3, cross-lab review of the SF-7 adversarial lane).
+- Four SF-7 adversarial tests exercised their named attack only in name:
+  the backticked-command test never ran a worker (checking the rendered
+  task body alone proves nothing about what executes); the repository-
+  directive test typed the injection phrase into the test's own document
+  instead of a real committed file; the decoy-plan test wrote fake plan
+  JSON to a stray file the pipeline never reads instead of the actual
+  request/issue-body channel; the hidden-test-removal test asserted only
+  an exploration reference, never a plan. All four now construct the real
+  attack: a genuine spawned subprocess receiving the backticks only via
+  stdin, a real git-committed file cited with a normal hash-verified
+  reference, the decoy embedded in the `request` parameter that flows
+  into `${request}` substitution, and a real plan node targeting the
+  hidden file alongside the exploration deception (finding #4, cross-lab
+  review of the SF-7 adversarial lane).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#31 so far). When you fix one: commit message
+- Findings get numbers (#22–#34 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

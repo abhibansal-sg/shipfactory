@@ -138,13 +138,14 @@ def _complete_review(conn, task_id: str, outcome: str, target: str | None = None
 
 
 def _advance_to_spec_attack(
-    tmp_path: Path, conn, instance_id: str, *, clarifications: list[str] | None = None,
+    tmp_path: Path, conn, instance_id: str, *,
+    clarifications: list[str] | None = None, request: str = "change README",
 ) -> tuple[Path, str]:
     from hermes_cli import kanban_db
     recipe = load_library(ROOT / "recipes").get("dev-pipeline@5")
     repo, base_sha, tree_sha = _repo(tmp_path)
     instantiate(
-        conn, board="test", recipe=recipe, parameters={"request": "change README"},
+        conn, board="test", recipe=recipe, parameters={"request": request},
         instance_id=instance_id, base_sha=base_sha,
     )
     reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
@@ -175,9 +176,9 @@ def _advance_to_spec_attack(
 
 
 def _advance_to_plan_draft(
-    tmp_path: Path, conn, instance_id: str,
+    tmp_path: Path, conn, instance_id: str, *, request: str = "change README",
 ) -> tuple[Path, str, dict, dict]:
-    repo, base_sha = _advance_to_spec_attack(tmp_path, conn, instance_id)
+    repo, base_sha = _advance_to_spec_attack(tmp_path, conn, instance_id, request=request)
     spec_attack = _step(instance_id, "spec-attack")
     _complete_review(conn, spec_attack["kanban_task_id"], "approve")
     reconcile(conn, instance_id, profiles=PIPELINE_PROFILES)
