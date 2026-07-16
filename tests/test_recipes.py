@@ -157,6 +157,176 @@ steps:
         load_library(tmp_path)
 
 
+def _legacy_recipe_source() -> dict:
+    from shipfactory.recipes.loader import validate
+
+    source = {
+        "schema": "shipfactory.recipe/v1",
+        "id": "legacy-compatible",
+        "version": 1,
+        "status": "active",
+        "description": "unchanged policy",
+        "intent_tags": ["test"],
+        "supersedes": None,
+        "parameters": {},
+        "budgets": {"max_activations": 1, "max_step_activations": 1, "max_tokens": 1},
+        "steps": [{
+            "id": "build",
+            "primitive": "agent_task",
+            "title": "build",
+            "needs": [],
+            "optional": False,
+            "params": {
+                "seat": "builder",
+                "instructions": "Build the change.",
+                "execution_profile": "standard",
+                "workspace": "worktree",
+            },
+        }, {
+            "id": "review",
+            "primitive": "review_gate",
+            "title": "review",
+            "needs": ["build"],
+            "optional": False,
+            "params": {
+                "seat": "verifier",
+                "instructions": "Finish with SHIPFACTORY_VERDICT JSON.",
+                "execution_profile": "standard",
+                "workspace": "worktree",
+            },
+        }],
+    }
+    resolved = validate(json.loads(json.dumps(source)))
+    persisted = json.loads(json.dumps(resolved))
+    persisted["schema"] = "factory.recipe/v1"
+    persisted["steps"][1]["params"]["instructions"] = (
+        "Finish with FACTORY_VERDICT JSON."
+    )
+    return {"source": source, "persisted": persisted}
+
+
+def _seed_legacy_publication(tmp_path, monkeypatch, source, persisted):
+    from shipfactory.recipes.loader import _canonical
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    library_path = tmp_path / "library"
+    library_path.mkdir()
+    normalized = _canonical(persisted)
+    digest = hashlib.sha256(normalized.encode()).hexdigest()
+    store.init_db()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            ("legacy-compatible", 1, digest, "active", normalized, store._now()),
+        )
+    (library_path / "legacy-compatible@1.yaml").write_text(
+        json.dumps(source), encoding="utf-8",
+    )
+    return library_path, digest, normalized
+
+
+def test_loader_accepts_only_known_namespace_migrations_without_republishing(
+    tmp_path, monkeypatch,
+):
+    fixture = _legacy_recipe_source()
+    source, persisted = fixture["source"], fixture["persisted"]
+    library_path, digest, normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, source, persisted,
+    )
+
+    recipe = load_library(library_path).get("legacy-compatible@1")
+
+    assert recipe.hash == digest
+    assert recipe.document == persisted
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT hash,normalized_yaml FROM recipe_versions "
+            "WHERE id='legacy-compatible' AND version=1",
+        ).fetchone()
+    assert row["hash"] == digest
+    assert row["normalized_yaml"] == normalized
+
+
+def test_loader_rejects_legacy_row_when_stored_hash_does_not_match_bytes(
+    tmp_path, monkeypatch,
+):
+    fixture = _legacy_recipe_source()
+    library_path, _digest, _normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, fixture["source"], fixture["persisted"],
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_versions SET hash=? WHERE id='legacy-compatible' AND version=1",
+            ("0" * 64,),
+        )
+    with pytest.raises(RecipeError, match="stored hash"):
+        load_library(library_path)
+
+
+@pytest.mark.parametrize("persisted", [
+    ["not", "a", "recipe"],
+    {"schema": "factory.recipe/v1", "steps": None},
+    {"schema": "factory.recipe/v1", "steps": [None]},
+])
+def test_loader_rejects_hash_consistent_non_document_legacy_row_cleanly(
+    tmp_path, monkeypatch, persisted,
+):
+    source = _legacy_recipe_source()["source"]
+    library_path, _digest, _normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, source, persisted,
+    )
+    with pytest.raises(RecipeError, match="policy bytes are invalid"):
+        load_library(library_path)
+
+
+def test_loader_rejects_partial_namespace_migration(
+    tmp_path, monkeypatch,
+):
+    fixture = _legacy_recipe_source()
+    source, persisted = fixture["source"], fixture["persisted"]
+    source["steps"][1]["params"]["instructions"] = (
+        "Finish with FACTORY_VERDICT JSON."
+    )
+    library_path, _digest, _normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, source, persisted,
+    )
+    with pytest.raises(RecipeError, match="immutable"):
+        load_library(library_path)
+
+
+def test_loader_does_not_alias_factory_verdict_inside_larger_token(
+    tmp_path, monkeypatch,
+):
+    fixture = _legacy_recipe_source()
+    source, persisted = fixture["source"], fixture["persisted"]
+    source["steps"][1]["params"]["instructions"] = (
+        "Finish with mySHIPFACTORY_VERDICT JSON."
+    )
+    persisted["steps"][1]["params"]["instructions"] = (
+        "Finish with myFACTORY_VERDICT JSON."
+    )
+    library_path, _digest, _normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, source, persisted,
+    )
+    with pytest.raises(RecipeError, match="immutable"):
+        load_library(library_path)
+
+
+def test_loader_rejects_legacy_schema_in_current_source(
+    tmp_path, monkeypatch,
+):
+    fixture = _legacy_recipe_source()
+    source, persisted = fixture["source"], fixture["persisted"]
+    source["schema"] = "factory.recipe/v1"
+    library_path, _digest, _normalized = _seed_legacy_publication(
+        tmp_path, monkeypatch, source, persisted,
+    )
+    with pytest.raises(RecipeError, match="unsupported recipe schema"):
+        load_library(library_path)
+
+
 def test_restart_reconciliation_activates_review_once_after_swallowed_hook(tmp_path, kanban_conn):
     """§17.7: reconciliation reproduces the missing transition after restart."""
     from hermes_cli import kanban_db

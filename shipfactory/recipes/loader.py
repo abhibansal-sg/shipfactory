@@ -302,6 +302,59 @@ def validate(
     return document
 
 
+def _compatible_published_document(
+    row: Any, current: dict[str, Any], *, key: str,
+    seats: set[str] | None, profiles: set[str] | None,
+    verification_profiles: set[str] | None,
+) -> dict[str, Any] | None:
+    """Prove a pre-namespace publication is semantically the current source.
+
+    Early Factory releases persisted v1 policies before the public schema and
+    verdict sentinels acquired their ``shipfactory`` namespace.  The row stays
+    authoritative and byte-immutable; these aliases exist only in a temporary
+    comparison copy.  Any other difference remains an immutable-version error.
+    """
+    normalized = row["normalized_yaml"]
+    try:
+        persisted = json.loads(normalized)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RecipeError(f"published recipe {key} policy bytes are invalid") from exc
+    if hashlib.sha256(_canonical(persisted).encode()).hexdigest() != row["hash"]:
+        _error(f"published recipe {key} policy bytes fail their stored hash")
+
+    migrated = json.loads(_canonical(persisted))
+    if not isinstance(migrated, dict) or not isinstance(migrated.get("steps"), list):
+        _error(f"published recipe {key} policy bytes are invalid")
+    changed = False
+    if migrated.get("schema") == "factory.recipe/v1":
+        migrated["schema"] = "shipfactory.recipe/v1"
+        changed = True
+    for step in migrated["steps"]:
+        if not isinstance(step, dict) or not isinstance(step.get("params"), dict):
+            _error(f"published recipe {key} policy bytes are invalid")
+        params = step["params"]
+        instructions = params.get("instructions")
+        if isinstance(instructions, str):
+            updated = re.sub(
+                r"(?<![A-Za-z0-9_])FACTORY_VERDICT\b",
+                "SHIPFACTORY_VERDICT",
+                instructions,
+            )
+            if updated != instructions:
+                params["instructions"] = updated
+                changed = True
+    if not changed:
+        return None
+    try:
+        migrated = validate(
+            migrated, seats=seats, profiles=profiles,
+            verification_profiles=verification_profiles,
+        )
+    except RecipeError:
+        return None
+    return persisted if _canonical(migrated) == _canonical(current) else None
+
+
 def load_library(
     path: str | Path, *, seats: set[str] | None = None, profiles: set[str] | None = None,
     verification_profiles: set[str] | None = None, persist: bool = True,
@@ -320,8 +373,27 @@ def load_library(
         if persist:
             store.init_db()
             with store._connect() as conn:  # atomic immutable publication check
-                row = conn.execute("SELECT hash FROM recipe_versions WHERE id=? AND version=?", (document["id"], document["version"])).fetchone()
-                if row and row["hash"] != digest: _error(f"published recipe {key} is immutable")
+                row = conn.execute(
+                    "SELECT hash,normalized_yaml FROM recipe_versions WHERE id=? AND version=?",
+                    (document["id"], document["version"]),
+                ).fetchone()
+                if row and row["hash"] != digest:
+                    persisted = _compatible_published_document(
+                        row, document, key=key, seats=seats, profiles=profiles,
+                        verification_profiles=verification_profiles,
+                    )
+                    if persisted is None:
+                        _error(f"published recipe {key} is immutable")
+                    assert persisted is not None
+                    recipes[key] = Recipe(
+                        persisted,
+                        row["hash"],
+                        frozenset(seats) if seats is not None else None,
+                        frozenset(profiles) if profiles is not None else None,
+                        frozenset(verification_profiles)
+                        if verification_profiles is not None else None,
+                    )
+                    continue
                 conn.execute("INSERT OR IGNORE INTO recipe_versions(id,version,hash,status,normalized_yaml,created_at) VALUES(?,?,?,?,?,?)", (document["id"], document["version"], digest, document["status"], normalized, store._now()))
         recipes[key] = Recipe(
             document,
