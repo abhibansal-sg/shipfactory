@@ -181,6 +181,16 @@ def _migration_tool_identity(argv: list[str]) -> tuple[str, ...]:
     return (executable,)
 
 
+def _migration_primary_subcommand(argv: list[str]) -> str:
+    executable = PurePosixPath(argv[0]).name.casefold()
+    index = 2 if executable.startswith("python") else 1
+    if len(argv) <= index:
+        raise VerificationManifestError(
+            "migration behavior requires a primary migration subcommand"
+        )
+    return argv[index].casefold().lstrip("-")
+
+
 def validate_verification_manifest(
     document: Any, *, required_requirement_ids: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -232,13 +242,11 @@ def validate_verification_manifest(
                         f"{label} migration behavior must require exit code zero"
                     )
                 _migration_tool_identity(argv)
-                argument_tokens = {
-                    token for argument in argv[1:]
-                    for token in re.split(r"[^a-z0-9]+", argument.casefold()) if token
-                }
-                if not argument_tokens & _MIGRATION_BEHAVIOR_TOKENS[behavior]:
+                primary_subcommand = _migration_primary_subcommand(argv)
+                if primary_subcommand not in _MIGRATION_BEHAVIOR_TOKENS[behavior]:
                     raise VerificationManifestError(
-                        f"{label} argv does not execute declared {behavior} behavior"
+                        f"{label} primary migration subcommand does not execute "
+                        f"declared {behavior} behavior"
                     )
         elif driver == "playwright":
             _exact(case, _PLAYWRIGHT_CASE, label)

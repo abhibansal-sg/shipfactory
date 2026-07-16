@@ -1828,6 +1828,32 @@ def test_migration_surface_rejects_a_passing_command_with_only_a_rollback_label(
     assert "required surface behaviors are missing: rollback" in bundle["invalid_reason"]
 
 
+def test_migration_behavior_rejects_direction_word_only_inside_an_inert_flag():
+    document = {
+        "schema": verify.VERIFICATION_SCHEMA,
+        "cases": [
+            {
+                "id": "migration-down", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_down",
+                "argv": ["do_stuff.sh", "--reason=rollback-please"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+            {
+                "id": "migration-up", "requirement_ids": ["REQ-1"],
+                "driver": "command", "surface_behavior": "migration_up",
+                "argv": ["do_stuff.sh", "--reason=upgrade-please"],
+                "oracle": {"type": "exit_code", "equals": 0},
+            },
+        ],
+        "capture": {"video": False, "trace": False, "screenshots": "never"},
+    }
+
+    with pytest.raises(
+        verify.VerificationManifestError, match="primary migration subcommand",
+    ):
+        verify.validate_verification_manifest(document)
+
+
 def test_migration_surface_executes_protected_down_and_up_behavior_pair(tmp_path):
     document = {
         "schema": verify.VERIFICATION_SCHEMA,
