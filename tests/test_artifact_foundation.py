@@ -131,7 +131,7 @@ def test_artifact_schema_migration_is_exact_and_numbered():
         instance_columns = {row["name"] for row in db.execute(
             "PRAGMA table_info(recipe_instances)"
         )}
-    assert versions[-1] == 14
+    assert versions[-1] == 15
     assert artifact_columns == [
         "id", "instance_id", "step_id", "activation", "run_id", "kind",
         "schema_version", "state", "candidate_path", "sealed_path", "sha256",

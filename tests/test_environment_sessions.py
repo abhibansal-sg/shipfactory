@@ -448,7 +448,7 @@ def test_two_sessions_race_for_the_same_port(tmp_path):
 def test_app_identity_migration_is_durable_and_numbered():
     store.init_db()
     with store._connect() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 14
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 15
         columns = [row["name"] for row in db.execute("PRAGMA table_info(app_sessions)")]
     assert columns[-2:] == ["expected_instance_id", "expected_head_sha"]
 

@@ -261,3 +261,157 @@ def test_bundle_registers_under_the_manifest_name() -> None:
     assert "manifest.name" in harness or f'"{manifest["name"]}"' in harness, (
         "conformance harness must gate registration on the manifest name"
     )
+
+
+def _seed_receipts_instance(home: Path) -> dict[str, int]:
+    """Seed one instance with a rework attempt, run rows, and real run files."""
+    store.init_db()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    recipe = {
+        "id": "receipt-recipe",
+        "version": 1,
+        # Recipe order intentionally differs from alphabetical order.
+        "steps": [{"id": "build"}, {"id": "audit"}],
+    }
+    normalized = json.dumps(recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    recipe_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_versions VALUES(?,?,?,?,?,?)",
+            ("receipt-recipe", 1, recipe_hash, "active", normalized, now),
+        )
+        db.execute(
+            """INSERT INTO recipe_instances
+            (id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,
+             activation_count,tokens_charged,parent_tasks_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("receipts-instance", "test", "collector-r", "receipt-recipe", 1,
+             recipe_hash, "running", "{}", 2, 0, '["t_parent_collector"]', now, now),
+        )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,kanban_task_id,verdict_json,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("receipts-instance", "audit", 1, "review_gate", "blocked", "t_a1",
+             json.dumps({"outcome": "request_changes", "target_step": "build"}), now, now),
+        )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,kanban_task_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            ("receipts-instance", "build", 1, "agent_task", "done", "t_b1", now, now),
+        )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,kanban_task_id,"
+            "rejected_by_step_id,rejected_by_activation,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("receipts-instance", "build", 2, "agent_task", "running", "t_b2", "audit", 1, now, now),
+        )
+    runs_dir = home / "shipfactory" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    log_b1 = runs_dir / "t_b1-stamp.log"
+    log_b1.write_text("build attempt one log\n", encoding="utf-8")
+    prompt_b1 = runs_dir / "t_b1-stamp.prompt"
+    prompt_b1.write_text("build attempt one prompt\n", encoding="utf-8")
+    log_b2 = runs_dir / "t_b2-stamp.log"
+    log_b2.write_bytes(b"x" * (300 * 1024) + b"TAIL-MARKER")
+    alien_log = runs_dir / "task-x-stamp.log"
+    alien_log.write_text("not a recipe run\n", encoding="utf-8")
+    run_b1 = store.record_run_start(
+        "t_b1", "builder", "codex", "gpt", board="test", workspace_path="/tmp/w1",
+        log_path=log_b1, prompt_path=prompt_b1, provider="openai",
+        resolved_model="gpt-5", access_enforcement_level="full", recipe_activation=1,
+    )
+    store.record_run_end(run_b1, 0, 10, 5, 1.5, "done")
+    run_b2 = store.record_run_start(
+        "t_b2", "builder", "codex", "gpt", board="test", workspace_path="/tmp/w2",
+        log_path=log_b2, provider="openai", resolved_model="gpt-5",
+        recipe_activation=2,
+    )
+    # Legacy pre-migration row: no paths, no recipe_activation.
+    run_a1 = store.record_run_start("t_a1", "verifier", "codex", "gpt")
+    run_alien = store.record_run_start(
+        "task-x", "builder", "codex", "gpt", log_path=alien_log,
+    )
+    return {"b1": run_b1, "b2": run_b2, "a1": run_a1, "alien": run_alien}
+
+
+def test_receipts_join_runs_per_attempt_and_strip_paths(hermetic_hermes_home: Path):
+    runs = _seed_receipts_instance(hermetic_hermes_home)
+    client = _client()
+
+    assert client.get("/api/plugins/shipfactory/instances/nope/receipts").status_code == 404
+    receipts = client.get("/api/plugins/shipfactory/instances/receipts-instance/receipts")
+    assert receipts.status_code == 200
+    rows = receipts.json()
+    assert [(row["step_id"], row["activation"], row["run_id"]) for row in rows] == [
+        ("audit", 1, runs["a1"]), ("build", 1, runs["b1"]), ("build", 2, runs["b2"]),
+    ]
+    b1 = rows[1]
+    assert b1["kanban_task_id"] == "t_b1"
+    assert (b1["seat"], b1["executor"], b1["provider"], b1["resolved_model"]) == (
+        "builder", "codex", "openai", "gpt-5",
+    )
+    assert (b1["tokens_in"], b1["tokens_out"], b1["tokens_total"]) == (10, 5, 15)
+    assert b1["exit_code"] == 0 and b1["result"] == "done"
+    assert b1["access_enforcement_level"] == "full"
+    assert b1["has_log"] is True and b1["has_prompt"] is True
+    assert rows[2]["has_log"] is True and rows[2]["has_prompt"] is False
+    assert rows[0]["has_log"] is False and rows[0]["has_prompt"] is False
+    for row in rows:
+        assert "log_path" not in row and "prompt_path" not in row
+        assert "workspace_path" not in row
+
+
+def test_run_log_and_prompt_endpoints_serve_capped_db_resolved_paths(hermetic_hermes_home: Path):
+    runs = _seed_receipts_instance(hermetic_hermes_home)
+    client = _client()
+
+    log = client.get(f"/api/plugins/shipfactory/runs/{runs['b1']}/log")
+    assert log.status_code == 200
+    assert log.json() == {
+        "run_id": runs["b1"], "kind": "log",
+        "content": "build attempt one log\n", "truncated": False,
+    }
+    prompt = client.get(f"/api/plugins/shipfactory/runs/{runs['b1']}/prompt")
+    assert prompt.status_code == 200
+    assert prompt.json()["kind"] == "prompt"
+    assert prompt.json()["content"] == "build attempt one prompt\n"
+
+    tail = client.get(f"/api/plugins/shipfactory/runs/{runs['b2']}/log").json()
+    assert tail["truncated"] is True
+    assert tail["content"].endswith("TAIL-MARKER")
+    assert len(tail["content"]) == 256 * 1024
+
+    # 404s: unknown run, legacy NULL path, and a run outside any recipe step.
+    assert client.get("/api/plugins/shipfactory/runs/999999/log").status_code == 404
+    assert client.get(f"/api/plugins/shipfactory/runs/{runs['a1']}/log").status_code == 404
+    assert client.get(f"/api/plugins/shipfactory/runs/{runs['alien']}/log").status_code == 404
+    # A recorded path whose file is gone is also a 404, not a 500.
+    missing = hermetic_hermes_home / "shipfactory" / "runs" / "t_b1-stamp.log"
+    missing.unlink()
+    assert client.get(f"/api/plugins/shipfactory/runs/{runs['b1']}/log").status_code == 404
+
+
+def test_instances_fold_latest_steps_in_recipe_order_with_overlay_columns(hermetic_hermes_home: Path):
+    _seed_receipts_instance(hermetic_hermes_home)
+    client = _client()
+
+    items = client.get("/api/plugins/shipfactory/instances").json()
+    item = next(row for row in items if row["id"] == "receipts-instance")
+    assert item["parent_tasks_json"] == '["t_parent_collector"]'
+    # Recipe order (build before audit), not the alphabetical fallback.
+    assert [(step["step_id"], step["step_position"]) for step in item["latest_steps"]] == [
+        ("build", 1), ("audit", 2),
+    ]
+    build_latest = item["latest_steps"][0]
+    assert build_latest["activation"] == 2
+    assert build_latest["rejected_by_step_id"] == "audit"
+    assert build_latest["rejected_by_activation"] == 1
+    assert build_latest["verdict_json"] is None
+
+    detail = client.get("/api/plugins/shipfactory/instances/receipts-instance").json()
+    assert detail["parent_tasks_json"] == '["t_parent_collector"]'
+    audit = detail["activations"]["audit"][0]
+    assert json.loads(audit["verdict_json"])["outcome"] == "request_changes"
+    assert audit["rejected_by_step_id"] is None
+    assert [step["step_id"] for step in detail["steps"]] == ["build", "build", "audit"]

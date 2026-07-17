@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from shipfactory import store
 
 
@@ -54,3 +56,26 @@ def test_init_db_migrates_legacy_monitor_table(tmp_path, monkeypatch):
     with sqlite3.connect(path) as conn:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(monitors)")}
     assert columns["interval_seconds"][4] == "300"
+
+
+def test_init_db_applies_containment_overlay_migration_idempotently(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.init_db()
+    store.init_db()
+    with sqlite3.connect(tmp_path / "shipfactory" / "shipfactory.db") as conn:
+        version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        instance_columns = {row[1] for row in conn.execute("PRAGMA table_info(recipe_instances)")}
+        step_columns = {row[1] for row in conn.execute("PRAGMA table_info(recipe_steps)")}
+    assert version == 15
+    assert "parent_tasks_json" in instance_columns
+    assert {"rejected_by_step_id", "rejected_by_activation", "verdict_json"} <= step_columns
+
+
+def test_partially_applied_containment_overlay_migration_raises(tmp_path, monkeypatch):
+    """Migration-15 artifacts without the schema_migrations row must fail closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.init_db()
+    with store._connect() as db:
+        db.execute("DELETE FROM schema_migrations WHERE version=15")
+    with pytest.raises(RuntimeError, match="schema migration 15 is partially applied"):
+        store.init_db()

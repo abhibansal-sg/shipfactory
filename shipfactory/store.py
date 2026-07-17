@@ -362,6 +362,15 @@ _APP_SESSION_IDENTITY_MIGRATION_STATEMENTS = (
 _APP_SESSION_IDENTITY_MIGRATION_TEXT = (
     ";\n".join(_APP_SESSION_IDENTITY_MIGRATION_STATEMENTS) + ";\n"
 )
+_CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS = (
+    "ALTER TABLE recipe_instances ADD COLUMN parent_tasks_json TEXT",
+    "ALTER TABLE recipe_steps ADD COLUMN rejected_by_step_id TEXT",
+    "ALTER TABLE recipe_steps ADD COLUMN rejected_by_activation INTEGER",
+    "ALTER TABLE recipe_steps ADD COLUMN verdict_json TEXT",
+)
+_CONTAINMENT_OVERLAY_MIGRATION_TEXT = (
+    ";\n".join(_CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -377,6 +386,7 @@ _MIGRATIONS = (
     (12, "verification_adversarial_hardening", _VERIFICATION_HARDENING_MIGRATION_TEXT),
     (13, "verification_production_identity_binding", _VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT),
     (14, "app_session_expected_candidate_identity", _APP_SESSION_IDENTITY_MIGRATION_TEXT),
+    (15, "sf17_containment_overlay", _CONTAINMENT_OVERLAY_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -393,6 +403,7 @@ _MIGRATION_STATEMENTS = {
     12: _VERIFICATION_HARDENING_MIGRATION_STATEMENTS,
     13: _VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS,
     14: _APP_SESSION_IDENTITY_MIGRATION_STATEMENTS,
+    15: _CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS,
 }
 
 
@@ -612,12 +623,24 @@ def init_db() -> None:
                         or {"workspace_path", "environment_identity_json"} & bundle_columns
                         or "attempt" in item_columns
                     )
-                else:
+                elif version == 14:
                     app_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(app_sessions)"
                     )}
                     migration_artifacts = bool(
                         {"expected_instance_id", "expected_head_sha"} & app_columns
+                    )
+                else:
+                    instance_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_instances)"
+                    )}
+                    step_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_steps)"
+                    )}
+                    migration_artifacts = bool(
+                        "parent_tasks_json" in instance_columns
+                        or {"rejected_by_step_id", "rejected_by_activation", "verdict_json"}
+                        & step_columns
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
