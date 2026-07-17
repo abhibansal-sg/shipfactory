@@ -1127,9 +1127,15 @@ def finalize_change_set_for_task(
             "-c", f"core.hooksPath={os.devnull}", "-c", "commit.gpgsign=false",
         ]
         try:
+            # Stage only the source paths whose exact set was validated above.
+            # Passing the repository root plus an exclude pathspec makes Git
+            # treat an ignored `.shipfactory-output` directory as an explicit
+            # path and fail before writing the Factory commit.  Literal
+            # pathspecs also prevent a repository filename beginning with
+            # pathspec magic from changing the staging scope.
+            stage_paths = [f":(literal){path}" for path in dirty_paths]
             subprocess.run(
-                ["git", *git_config, "add", "--all", "--", ".",
-                 ":(exclude).shipfactory-output"],
+                ["git", *git_config, "add", "--all", "--", *stage_paths],
                 cwd=worktree, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=20,
             )
