@@ -457,12 +457,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   ratified per-profile allowance map plus prove v7 fails under it. Read live
   allowance values before cutting the immutable successor; do not extrapolate
   from charges observed in other pools (finding #65, v7 publication preflight).
+- A review's rework destination is Factory policy, not model judgment, when the
+  immutable recipe exposes exactly one legal agent-task producer. A reviewer
+  may omit `target_step` even after receiving a parser-valid example; Factory
+  now derives only that sole target while keeping outcome, body, citation, and
+  unknown-field validation strict. Ambiguous targets still fail closed. The
+  audited non-approval release path accepts historical
+  `invalid request_changes verdict` blocks only through the same derivation,
+  so it cannot redirect the rework cone or synthesize review substance
+  (finding #66, v8 live shakedown).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#65 so far). When you fix one: commit message
+- Findings get numbers (#22–#66 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

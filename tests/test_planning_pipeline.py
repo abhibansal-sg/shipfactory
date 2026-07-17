@@ -137,6 +137,16 @@ def _complete_review(conn, task_id: str, outcome: str, target: str | None = None
     assert kanban_db.complete_task(conn, task_id, result=result, summary="reviewed")
 
 
+def _complete_review_without_target(conn, task_id: str) -> None:
+    from hermes_cli import kanban_db  # type: ignore[import-not-found]
+
+    result = (
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes",'
+        '"body":"README.md:1 requires changes"}'
+    )
+    assert kanban_db.complete_task(conn, task_id, result=result, summary="reviewed")
+
+
 def _advance_to_spec_attack(
     tmp_path: Path, conn, instance_id: str, *,
     clarifications: list[str] | None = None, request: str = "change README",
@@ -314,6 +324,51 @@ def test_operator_release_recovers_clarifications_with_fresh_spec_activation(
         ).fetchone()
     assert tuple(applied) == ("applied", "clarifications_nonempty_released")
     assert tuple(instance) == ("running", None)
+
+
+def test_reconcile_derives_missing_unambiguous_review_target(tmp_path, kanban_conn):
+    _advance_to_spec_attack(tmp_path, kanban_conn, "derived-target")
+    gate = _step("derived-target", "spec-attack")
+    _complete_review_without_target(kanban_conn, gate["kanban_task_id"])
+
+    reconcile(kanban_conn, "derived-target", profiles=PIPELINE_PROFILES)
+
+    assert _step("derived-target", "spec-attack", 1)["blocked_reason"] == "changes_requested"
+    assert _step("derived-target", "spec-draft")["activation"] == 2
+    assert _step("derived-target", "spec-draft")["state"] == "running"
+
+
+def test_operator_release_recovers_historical_missing_target_block(
+    tmp_path, kanban_conn,
+):
+    _advance_to_spec_attack(tmp_path, kanban_conn, "derived-target-release")
+    gate = _step("derived-target-release", "spec-attack")
+    _complete_review_without_target(kanban_conn, gate["kanban_task_id"])
+    with store._connect() as db:
+        now = store._now()
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=?,updated_at=? "
+            "WHERE instance_id=? AND step_id='spec-attack' AND activation=1",
+            ("invalid request_changes verdict", now, "derived-target-release"),
+        )
+        db.execute(
+            "UPDATE recipe_instances SET status='blocked',blocked_reason=?,updated_at=? WHERE id=?",
+            ("invalid request_changes verdict", now, "derived-target-release"),
+        )
+
+    key = release_review_stall(
+        "derived-target-release", "spec-attack",
+        "derive the sole Factory-owned review target",
+    )
+    apply_events(kanban_conn, profiles=PIPELINE_PROFILES)
+
+    assert _step("derived-target-release", "spec-draft")["activation"] == 2
+    assert _step("derived-target-release", "spec-draft")["state"] == "running"
+    with store._connect() as db:
+        event = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?", (key,),
+        ).fetchone()
+    assert tuple(event) == ("applied", "invalid request_changes verdict_released")
 
 
 def test_plan_rejects_undeclared_shared_write_overlap(tmp_path, kanban_conn):

@@ -594,6 +594,69 @@ def test_review_verdict_examples_match_the_authoritative_parser():
     assert request["target_step"] == "draft"
 
 
+def _derived_target_recipe(inputs=None):
+    step = {
+        "id": "review", "title": "Review", "primitive": "review_gate",
+        "needs": ["draft"], "inputs": inputs or [
+            {"from": "draft", "kind": "task-spec", "required": True},
+        ],
+        "params": {"seat": "reviewer", "workspace": "worktree"},
+    }
+    return {
+        "schema": "shipfactory.recipe/v2",
+        "steps": [
+            {"id": "draft", "primitive": "agent_task", "needs": [],
+             "params": {"seat": "writer", "workspace": "worktree"}},
+            step,
+        ],
+    }, step
+
+
+def test_review_verdict_derives_only_one_missing_factory_owned_target():
+    from shipfactory.recipes.primitives import parse_verdict, parse_verdict_for_review
+
+    recipe, step = _derived_target_recipe()
+    result = (
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes",'
+        '"body":"README.md:1 requires changes"}'
+    )
+    with pytest.raises(ValueError, match="invalid request_changes verdict"):
+        parse_verdict(result)
+    assert parse_verdict_for_review(result, recipe, step) == {
+        "outcome": "request_changes",
+        "body": "README.md:1 requires changes",
+        "target_step": "draft",
+    }
+
+
+def test_review_verdict_never_derives_ambiguous_or_extra_field_targets():
+    from shipfactory.recipes.primitives import parse_verdict_for_review
+
+    recipe, step = _derived_target_recipe(inputs=[
+        {"from": "draft", "kind": "task-spec", "required": True},
+        {"from": "build", "kind": "plan", "required": True},
+    ])
+    recipe["steps"].insert(1, {
+        "id": "build", "primitive": "agent_task", "needs": ["draft"],
+        "params": {"seat": "builder", "workspace": "worktree"},
+    })
+    step["needs"] = ["build"]
+    missing = (
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes",'
+        '"body":"README.md:1 requires changes"}'
+    )
+    with pytest.raises(ValueError, match="invalid request_changes verdict"):
+        parse_verdict_for_review(missing, recipe, step)
+
+    recipe, step = _derived_target_recipe()
+    extra = (
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes",'
+        '"body":"README.md:1 requires changes","note":"untrusted"}'
+    )
+    with pytest.raises(ValueError, match="invalid request_changes verdict"):
+        parse_verdict_for_review(extra, recipe, step)
+
+
 def test_restart_reconciliation_activates_review_once_after_swallowed_hook(tmp_path, kanban_conn):
     """§17.7: reconciliation reproduces the missing transition after restart."""
     from hermes_cli import kanban_db

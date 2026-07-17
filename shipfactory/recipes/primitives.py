@@ -164,20 +164,27 @@ def build_review_input_context(
     )
     return body, digest
 
-def parse_verdict(text: str) -> dict[str, Any]:
+def _verdict_payload(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     match = _VERDICT.fullmatch(lines[-1]) if lines else None
     if not match: raise ValueError("review final line must be SHIPFACTORY_VERDICT JSON")
     try: verdict = json.loads(match.group(1))
     except json.JSONDecodeError as exc: raise ValueError("invalid SHIPFACTORY_VERDICT JSON") from exc
     if not isinstance(verdict, dict) or verdict.get("outcome") not in {"approve", "request_changes"} or not isinstance(verdict.get("body"), str) or not citation_ok(verdict["body"]): raise ValueError("invalid review verdict")
+    return verdict
+
+
+def parse_verdict(text: str) -> dict[str, Any]:
+    verdict = _verdict_payload(text)
     if verdict["outcome"] == "approve" and set(verdict) != {"outcome", "body"}: raise ValueError("approve verdict has unknown fields")
     if verdict["outcome"] == "request_changes" and (set(verdict) != {"outcome", "target_step", "body"} or not isinstance(verdict.get("target_step"), str)): raise ValueError("invalid request_changes verdict")
     return verdict
 
 
-def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -> str:
-    """Render the exact parser contract and valid rework targets for one v2 review."""
+def review_verdict_targets(
+    recipe: dict[str, Any], step_def: dict[str, Any],
+) -> list[str]:
+    """Return Factory-owned legal rework targets for one v2 review."""
     defs = {item["id"]: item for item in recipe["steps"]}
     change_set_targets = list(dict.fromkeys(
         item["from"] for item in step_def.get("inputs", [])
@@ -193,6 +200,29 @@ def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -
     ]
     if not allowed:
         raise ValueError(f"review gate {step_def['id']} has no valid request_changes target")
+    return allowed
+
+
+def parse_verdict_for_review(
+    text: str, recipe: dict[str, Any], step_def: dict[str, Any],
+) -> dict[str, Any]:
+    """Parse a verdict, deriving only an omitted, unambiguous Factory target."""
+    try:
+        return parse_verdict(text)
+    except ValueError as exc:
+        if str(exc) != "invalid request_changes verdict":
+            raise
+        verdict = _verdict_payload(text)
+        allowed = review_verdict_targets(recipe, step_def)
+        if (verdict.get("outcome") != "request_changes"
+                or set(verdict) != {"outcome", "body"} or len(allowed) != 1):
+            raise exc
+        return {**verdict, "target_step": allowed[0]}
+
+
+def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -> str:
+    """Render the exact parser contract and valid rework targets for one v2 review."""
+    allowed = review_verdict_targets(recipe, step_def)
     approve = json.dumps({
         "outcome": "approve",
         "body": "APPROVE - clean pass; no findings.",
