@@ -14,9 +14,12 @@ from typing import Any
 
 
 _CITATION_SUFFIX = re.compile(r"\.(?:py|swift|ts|tsx|js|mjs|cjs|md|yaml|yml|sh|json|m|h|c|cpp|rs|go):\d+")
-_CLEAN_APPROVE = re.compile(
-    r"\bAPPROVE\b.*(?:no (?:findings|issues|regressions|violations)|nothing to cite|clean pass)",
-    re.IGNORECASE | re.DOTALL,
+_CLEAN_APPROVE = re.compile(r"\bAPPROVE\b", re.IGNORECASE)
+_NO_UNADDRESSED_FINDINGS = re.compile(
+    r"(?:no (?:unaddressed )?(?:findings?|issues?|regressions?|violations?|"
+    r"ambiguity|ambiguities|blockers?|gaps?)(?: (?:found|remaining?))?"
+    r"|nothing to cite|clean pass)",
+    re.IGNORECASE,
 )
 
 
@@ -38,13 +41,11 @@ def citation_ok(body: str) -> bool:
             start -= 1
         if start < match.start():
             return True
-    # governor.mjs treats the two clauses independently: APPROVE may occur
-    # anywhere, as may the explicit no-findings explanation.
-    return bool(re.search(r"\bAPPROVE\b", text) and re.search(
-        r"no (?:findings|issues|regressions|violations)|nothing to cite|clean pass",
-        text,
-        re.IGNORECASE,
-    ))
+    # Treat the two clauses independently: APPROVE may occur anywhere, as may
+    # an explicit statement that no unaddressed finding remains.  The second
+    # clause stays bounded to review/blocker vocabulary; generic "nothing bad"
+    # prose is not a clean-pass exemption.
+    return bool(_CLEAN_APPROVE.search(text) and _NO_UNADDRESSED_FINDINGS.search(text))
 
 
 def _participant_names(stage: dict[str, Any]) -> list[str]:

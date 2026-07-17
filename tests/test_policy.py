@@ -36,8 +36,12 @@ def install_fakes(monkeypatch, *, stored_policy=None):
 def test_citation_gate_matches_governor_and_clean_exemption():
     assert policy.citation_ok("Finding: factory/policy.py:18 is unsafe")
     assert policy.citation_ok("APPROVE: clean pass; no findings")
+    assert policy.citation_ok(
+        "APPROVE - every requirement is oracle-backed. No unaddressed ambiguity found."
+    )
     assert not policy.citation_ok("APPROVE")
     assert not policy.citation_ok("Looks good, but no proof")
+    assert not policy.citation_ok("APPROVE - nothing bad happened")
 
 
 def test_completion_without_stored_policy_is_noop(monkeypatch):

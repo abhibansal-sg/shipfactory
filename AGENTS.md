@@ -466,12 +466,23 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   `invalid request_changes verdict` blocks only through the same derivation,
   so it cannot redirect the rework cone or synthesize review substance
   (finding #66, v8 live shakedown).
+- Operator CLI wrappers do not duplicate recoverability policy from the
+  advancer. `recipe release` delegates validation to the same enqueue-only
+  function used by every caller; otherwise a new recoverable engine reason can
+  pass unit tests yet remain impossible to invoke through the live operator
+  surface (finding #67, v8 cutover recovery).
+- Clean review approval is semantic but bounded: an explicit `approve` verdict
+  plus `APPROVE` may state that no unaddressed findings, issues, ambiguities,
+  blockers, or gaps remain. Requiring only the literal phrases `clean pass` or
+  `no findings` turns a substantively clean durable review into an invalid
+  protocol result; generic positive prose still does not satisfy the exemption
+  (finding #68, v8 live spec review).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#66 so far). When you fix one: commit message
+- Findings get numbers (#22–#68 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
