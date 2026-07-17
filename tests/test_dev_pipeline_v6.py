@@ -407,6 +407,33 @@ def test_public_reap_commits_dirty_build_and_seals_factory_manifest(
     assert json.loads(output.read_text()) == document
 
 
+def test_factory_commit_stages_validated_paths_without_touching_ignored_output_root(
+    tmp_path, kanban_conn,
+):
+    instance_id = "factory-ignored-output"
+    repo, base, run_id, output, inputs = _dirty_finalizer_case(
+        tmp_path, kanban_conn, instance_id,
+    )
+    excludes = tmp_path / "factory-global-excludes"
+    excludes.write_text(".shipfactory-output/\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "core.excludesFile", str(excludes)],
+        cwd=repo, check=True, capture_output=True,
+    )
+    ignored = repo / ".shipfactory-output" / "worker-state" / "ignored.txt"
+    ignored.parent.mkdir(parents=True)
+    ignored.write_text("not source\n", encoding="utf-8")
+
+    document = _finalize_dirty_case(repo, instance_id, run_id, output, inputs)
+
+    assert document["head_sha"] == _git(repo, "rev-parse", "HEAD")
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "show", "--format=", "--name-only", "HEAD").splitlines() == [
+        "src/app.py",
+    ]
+    assert ignored.read_text(encoding="utf-8") == "not source\n"
+
+
 def test_factory_change_set_finalize_is_idempotent_after_commit_before_manifest(
     tmp_path, kanban_conn,
 ):
