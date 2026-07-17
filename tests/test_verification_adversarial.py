@@ -746,11 +746,13 @@ def _seed_review_instance(
     conn, tmp_path, repo, head, tree, *, instance_id, bind_review_inputs=True,
     reviewer_executor="claude", reviewer_provider=None, reviewer_activation=1,
     create_reviewer_run=True, reviewer_result="done", reviewer_exit_code=0,
+    review_input_kind="change-set", include_verification=True, verdict_contract=None,
 ):
     """Activate a real v2 review task with Factory-opened transitive evidence."""
     from hermes_cli import kanban_db
     from shipfactory.recipes import primitives
 
+    store.init_db()
     seats = Path(os.environ["HERMES_HOME"]) / "shipfactory" / "seats.yaml"
     seats.parent.mkdir(parents=True, exist_ok=True)
     seats.write_text(
@@ -760,18 +762,21 @@ def _seed_review_instance(
         encoding="utf-8",
     )
     definition = {
-        "id": "review", "title": "review", "primitive": "review_gate", "needs": ["verify"],
-        "inputs": [{"from": "build", "kind": "change-set", "required": False}],
+        "id": "review", "title": "review", "primitive": "review_gate",
+        "needs": ["verify"] if include_verification else ["build"],
+        "inputs": [{"from": "build", "kind": review_input_kind, "required": False}],
         "params": {"seat": "qa", "workspace": "dir", "instructions": "review exact inputs"},
     }
     steps = [
         {"id": "build", "title": "build", "primitive": "agent_task", "needs": [],
          "inputs": [], "params": {"seat": "dev-backend", "workspace": "worktree"}},
-        {"id": "verify", "title": "verify", "primitive": "verification", "needs": ["build"],
-         "inputs": [], "params": {}},
+        *([{"id": "verify", "title": "verify", "primitive": "verification", "needs": ["build"],
+            "inputs": [], "params": {}}] if include_verification else []),
         definition,
     ]
     recipe = {"schema": "shipfactory.recipe/v2", "id": "fake", "version": 1, "steps": steps}
+    if verdict_contract is not None:
+        recipe["verdict_contract"] = verdict_contract
     normalized_recipe = json.dumps(
         recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     )
@@ -803,7 +808,8 @@ def _seed_review_instance(
     now = store._now()
     with store._connect() as db:
         for step_id, primitive, task_id in (
-            ("build", "agent_task", build_task_id), ("verify", "verification", None),
+            ("build", "agent_task", build_task_id),
+            *([("verify", "verification", None)] if include_verification else []),
             ("review", "review_gate", None),
         ):
             db.execute(
@@ -839,7 +845,8 @@ def _seed_review_instance(
         )
     latest = {
         "build": {"step_id": "build", "kanban_task_id": build_task_id},
-        "verify": {"step_id": "verify", "kanban_task_id": None},
+        **({"verify": {"step_id": "verify", "kanban_task_id": None}}
+           if include_verification else {}),
         "review": {"step_id": "review", "kanban_task_id": review_task_id},
     }
     return definition, defs, latest, recipe
@@ -1177,6 +1184,54 @@ def test_review_approval_blocked_when_reviewer_and_builder_collude_on_provider(
             recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
         )
     assert blocker == "reviewer_shares_builder_provider"
+
+
+@pytest.mark.parametrize(("reviewer_executor", "expected"), [
+    ("codex", "reviewer_shares_builder_provider"),
+    ("claude", None),
+])
+def test_plan_spec_gate_provider_independence_under_the_v2_verdict_contract(
+    tmp_path, kanban_conn, reviewer_executor, expected,
+):
+    """Amendment F judgment call: plan/spec attacks have no change-set
+    ancestry, so under the verdict_contract marker the producer derives from
+    the gate's single declared agent_task input and the same exact-run
+    provider comparison applies (with no worktree binding — the reviewed
+    artifacts are sealed files)."""
+    repo, head, tree = _repo(tmp_path)
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id=f"rvw-spec-{reviewer_executor}",
+        review_input_kind="task-spec", include_verification=False,
+        verdict_contract="shipfactory.verdict/v2", reviewer_executor=reviewer_executor,
+    )
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, f"rvw-spec-{reviewer_executor}", definition,
+            verdict_body="Clean pass; no findings.",
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker == expected
+
+
+def test_plan_spec_gate_without_the_marker_keeps_the_pinned_v8_behavior(
+    tmp_path, kanban_conn,
+):
+    """Pinned in-flight recipes carry no verdict_contract key, so a same-family
+    plan/spec approval stays unenforced there — the extension must not
+    retro-block instances published before dev-pipeline@9."""
+    repo, head, tree = _repo(tmp_path)
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-spec-unmarked",
+        review_input_kind="task-spec", include_verification=False,
+        reviewer_executor="codex",
+    )
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-spec-unmarked", definition,
+            verdict_body="APPROVE clean pass",
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker is None
 
 
 def test_review_provider_identity_does_not_read_mutable_seats(tmp_path, kanban_conn):

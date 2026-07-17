@@ -103,6 +103,45 @@ def test_reap_codex_jsonl_sentinel_completes(monkeypatch, tmp_path):
     assert any(item[0] == "complete" for item in calls)
 
 
+def test_spawn_inlines_full_task_body_when_host_context_caps_it(monkeypatch, tmp_path):
+    """Amendment H: deployed Hermes truncates task bodies to 8 KB inside
+    build_worker_context, silently clipping Factory-inlined sealed review
+    inputs. Any over-cap body must be re-delivered untruncated in the prompt."""
+    calls = []
+    seat = SimpleNamespace(name="dev", profile="dev", executor="codex", model="gpt", reasoning="medium")
+    _install_stubs(monkeypatch, seat, calls)
+    kanban = sys.modules["hermes_cli.kanban_db"]
+    cap = 8 * 1024
+    body = ("x" * (cap + 500)) + "\nSHIPFACTORY_REVIEW_INPUT_SHA256: tail-marker-beyond-cap"
+    kanban._CTX_MAX_BODY_BYTES = cap
+    kanban.get_task = lambda conn, task_id: SimpleNamespace(id=task_id, body=body)
+    kanban.build_worker_context = (
+        lambda conn, task_id: "## Body\n" + body[:cap] + "… [truncated]"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
+    spawn._RUNNING.clear()
+    spawn.shipfactory_spawn(SimpleNamespace(id="t9", assignee="dev"), str(tmp_path / "work"), board="b")
+    prompt = Path(spawn._RUNNING[1234]["prompt_path"]).read_text()
+    assert "SHIPFACTORY_REVIEW_INPUT_SHA256: tail-marker-beyond-cap" in prompt
+    assert "## Factory full task body (host context truncated it above)" in prompt
+
+
+def test_spawn_leaves_under_cap_bodies_alone(monkeypatch, tmp_path):
+    calls = []
+    seat = SimpleNamespace(name="dev", profile="dev", executor="codex", model="gpt", reasoning="medium")
+    _install_stubs(monkeypatch, seat, calls)
+    kanban = sys.modules["hermes_cli.kanban_db"]
+    kanban._CTX_MAX_BODY_BYTES = 8 * 1024
+    kanban.get_task = lambda conn, task_id: SimpleNamespace(id=task_id, body="short body")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(spawn.subprocess, "Popen", _Proc)
+    spawn._RUNNING.clear()
+    spawn.shipfactory_spawn(SimpleNamespace(id="t10", assignee="dev"), str(tmp_path / "work"), board="b")
+    prompt = Path(spawn._RUNNING[1234]["prompt_path"]).read_text()
+    assert "Factory full task body" not in prompt
+
+
 def test_parse_result_prefers_verdict_over_trailing_result():
     """Finding #25: disciplined review workers emit SHIPFACTORY_VERDICT then
     SHIPFACTORY_RESULT (both contracts demand 'last line'). The verdict JSON is

@@ -198,11 +198,14 @@ def validate(
     verification_profiles: set[str] | None = None,
 ) -> dict[str, Any]:
     """Validate recipe v1 or v2 exactly; never repair or coerce input."""
-    if not isinstance(document, dict) or set(document) != _TOP:
+    if not isinstance(document, dict) or not (_TOP <= set(document) <= _TOP | {"verdict_contract"}):
         _error("recipe top-level keys must exactly match schema")
     schema = document["schema"]
     if schema not in {"shipfactory.recipe/v1", "shipfactory.recipe/v2"}: _error("unsupported recipe schema")
     v2 = schema == "shipfactory.recipe/v2"
+    if "verdict_contract" in document and (
+            not v2 or document["verdict_contract"] != "shipfactory.verdict/v2"):
+        _error("verdict_contract must be exactly shipfactory.verdict/v2 on a v2 recipe")
     if not isinstance(document["id"], str) or not _ID.fullmatch(document["id"]): _error("invalid recipe id")
     if not isinstance(document["version"], int) or isinstance(document["version"], bool) or document["version"] < 1: _error("version must be positive integer")
     if document["status"] not in {"active", "deprecated"}: _error("invalid recipe status")

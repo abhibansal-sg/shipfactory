@@ -97,6 +97,33 @@ def _worker_prompt(context: str) -> str:
     )
 
 
+def _untruncated_body_section(kanban_db: Any, conn: Any, task_id: Any) -> str:
+    """Return the full task body when the host context builder truncated it.
+
+    Deployed Hermes caps ``task.body`` at ``_CTX_MAX_BODY_BYTES`` (8 KB)
+    inside ``build_worker_context``, silently truncating Factory-inlined
+    sealed review inputs while the SHIPFACTORY_REVIEW_INPUT_SHA256 marker
+    survives (Amendment 1 item H).  Any capped body is a correctness hazard
+    regardless of task type, so every over-cap body is re-delivered in full
+    here; the durable ``.prompt`` file keeps the evidence trail.
+    """
+    get_task = getattr(kanban_db, "get_task", None)
+    if not callable(get_task):
+        return ""
+    task = get_task(conn, task_id)
+    body = str(_value(task, "body") or "").strip()
+    cap = int(getattr(kanban_db, "_CTX_MAX_BODY_BYTES", 8192))
+    if len(body) <= cap:
+        return ""
+    return (
+        "\n\n## Factory full task body (host context truncated it above)\n"
+        f"The host worker-context builder caps task bodies at {cap} characters, so the "
+        "opening post above is truncated. The complete untruncated task body follows; "
+        "treat it as authoritative over the truncated copy.\n\n"
+        + body
+    )
+
+
 def _process_start_token(pid: int) -> str | None:
     """Return an OS start identity so PID reuse cannot adopt the wrong process."""
     try:
@@ -468,6 +495,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         conn = kanban_db.connect(board=board)
         try:
             context = kanban_db.build_worker_context(conn, task_id)
+            context += _untruncated_body_section(kanban_db, conn, task_id)
         finally:
             conn.close()
         executor.identity_files(seat, str(root))

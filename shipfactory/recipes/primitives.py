@@ -10,10 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from shipfactory import store
-from shipfactory.policy import citation_ok
+from shipfactory.policy import _CITATION_SUFFIX, citation_ok
 from .instantiate import task_key
 
 _VERDICT = re.compile(r"^SHIPFACTORY_VERDICT:\s*(\{.*\})\s*$")
+VERDICT_CONTRACT_V2 = "shipfactory.verdict/v2"
+# A v2 finding location is one strict file.ext:line(-line) citation; the
+# accepted extensions derive from the policy citation suffix so the two
+# vocabularies cannot drift apart.
+_FINDING_LOCATION = re.compile(
+    r"[A-Za-z0-9._/-]+" + _CITATION_SUFFIX.pattern + r"(?:-\d+)?"
+)
 
 
 def _upstream_ids(recipe: dict[str, Any], step_id: str) -> list[str]:
@@ -181,6 +188,59 @@ def parse_verdict(text: str) -> dict[str, Any]:
     return verdict
 
 
+def _v2_error(detail: str) -> ValueError:
+    """Return a v2 contract error under one stable machine-matchable prefix."""
+    return ValueError(f"verdict_contract: {detail}")
+
+
+def parse_verdict_v2(
+    text: str, recipe: dict[str, Any], step_def: dict[str, Any],
+) -> dict[str, Any]:
+    """Parse the structured fail-closed shipfactory.verdict/v2 sentinel."""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    match = _VERDICT.fullmatch(lines[-1]) if lines else None
+    if not match: raise _v2_error("review final line must be SHIPFACTORY_VERDICT JSON")
+    try: verdict = json.loads(match.group(1))
+    except json.JSONDecodeError as exc: raise _v2_error("invalid SHIPFACTORY_VERDICT JSON") from exc
+    if not isinstance(verdict, dict): raise _v2_error("verdict must be a JSON object")
+    outcome = verdict.get("outcome")
+    if outcome not in {"approve", "request_changes"}: raise _v2_error("outcome must be approve or request_changes")
+    expected = {"schema", "outcome", "clean", "findings", "summary"}
+    if outcome == "request_changes":
+        expected = expected | {"target_step"}
+    if set(verdict) != expected: raise _v2_error("verdict keys must exactly match the v2 schema")
+    if verdict["schema"] != VERDICT_CONTRACT_V2: raise _v2_error(f"schema must be {VERDICT_CONTRACT_V2}")
+    if not isinstance(verdict["clean"], bool) or verdict["clean"] != (outcome == "approve"): raise _v2_error("clean must be a bool equal to outcome==approve")
+    summary = verdict["summary"]
+    if not isinstance(summary, str) or not summary.strip(): raise _v2_error("summary must be a nonempty string")
+    findings = verdict["findings"]
+    if not isinstance(findings, list): raise _v2_error("findings must be a list")
+    if outcome == "approve" and findings: raise _v2_error("approve requires an empty findings list")
+    if outcome == "request_changes" and not findings: raise _v2_error("request_changes requires at least one finding")
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {"severity", "location", "summary"}: raise _v2_error("finding keys must be exactly severity, location, summary")
+        if finding["severity"] not in {"blocker", "warning"}: raise _v2_error("finding severity must be blocker or warning")
+        if not isinstance(finding["summary"], str) or not finding["summary"].strip(): raise _v2_error("finding summary must be a nonempty string")
+        if not isinstance(finding["location"], str) or not _FINDING_LOCATION.fullmatch(finding["location"]): raise _v2_error("finding location must cite one file.ext:line repository location")
+    if outcome == "request_changes":
+        target = verdict["target_step"]
+        if not isinstance(target, str) or not target.strip(): raise _v2_error("target_step must be a nonempty string")
+        # Kanban task ids (t_...) stay accepted: the advancer maps them to a
+        # step id via _resolve_target_step, and an unknown id still fails
+        # closed in _invalidate_cone (finding #25b).  Only a named recipe
+        # step outside the Factory-owned target set is rejected here.
+        allowed = review_verdict_targets(recipe, step_def)
+        if any(step["id"] == target for step in recipe["steps"]) and target not in allowed:
+            raise _v2_error("target_step is not a legal rework target")
+    # Downstream consumers (resume notes, finding-count fallback) read
+    # verdict["body"]; synthesize it from the structured fields.
+    body_lines = [summary.strip()] + [
+        f"{finding['severity'].upper()} {finding['location']} — {finding['summary'].strip()}"
+        for finding in findings
+    ]
+    return {**verdict, "body": "\n".join(body_lines)}
+
+
 def review_verdict_targets(
     recipe: dict[str, Any], step_def: dict[str, Any],
 ) -> list[str]:
@@ -207,6 +267,8 @@ def parse_verdict_for_review(
     text: str, recipe: dict[str, Any], step_def: dict[str, Any],
 ) -> dict[str, Any]:
     """Parse a verdict, deriving only an omitted, unambiguous Factory target."""
+    if recipe.get("verdict_contract") == VERDICT_CONTRACT_V2:
+        return parse_verdict_v2(text, recipe, step_def)
     try:
         return parse_verdict(text)
     except ValueError as exc:
@@ -223,6 +285,36 @@ def parse_verdict_for_review(
 def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -> str:
     """Render the exact parser contract and valid rework targets for one v2 review."""
     allowed = review_verdict_targets(recipe, step_def)
+    if recipe.get("verdict_contract") == VERDICT_CONTRACT_V2:
+        approve = json.dumps({
+            "schema": VERDICT_CONTRACT_V2, "outcome": "approve", "clean": True,
+            "findings": [], "summary": "Clean pass; no findings.",
+        }, separators=(",", ":"))
+        request_changes = json.dumps({
+            "schema": VERDICT_CONTRACT_V2, "outcome": "request_changes", "clean": False,
+            "target_step": allowed[0],
+            "findings": [{
+                "severity": "blocker", "location": "path/to/file.py:1",
+                "summary": "describe the concrete finding",
+            }],
+            "summary": "One blocker must be fixed before approval.",
+        }, separators=(",", ":"))
+        return (
+            "\n\n## Factory review verdict contract (shipfactory.verdict/v2)\n"
+            "Emit exactly one of these parser-valid forms as a single line before the mandatory "
+            "SHIPFACTORY_RESULT line. Do not wrap it in a Markdown fence. Do not emit prose instead "
+            "of this JSON.\n"
+            f"- Approve: `SHIPFACTORY_VERDICT: {approve}`\n"
+            f"- Request changes: `SHIPFACTORY_VERDICT: {request_changes}`\n"
+            f"Allowed request_changes target_step values: {', '.join(allowed)}. "
+            "Use the exact recipe step id, not a title or invented name.\n"
+            "Rules: schema must be shipfactory.verdict/v2; clean is true exactly when the outcome "
+            "is approve; approve requires findings to be []; request_changes requires target_step "
+            "plus at least one finding. Every finding carries exactly severity (blocker or "
+            "warning), location (one concrete `path/to/file.py:1` or `path/to/file.py:1-9` "
+            "repository citation), and a nonempty summary. Keep the verdict JSON on one physical "
+            "line."
+        )
     approve = json.dumps({
         "outcome": "approve",
         "body": "APPROVE - clean pass; no findings.",
