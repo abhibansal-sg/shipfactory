@@ -360,18 +360,29 @@ def test_operator_release_recovers_historical_missing_target_block(
 
     queued = shipfactory_cli._recipe_release(
         None, "derived-target-release", "spec-attack",
-        "derive the sole Factory-owned review target",
+        "give the reviewer a fresh activation",
     )
     key = queued["key"]
     apply_events(kanban_conn, profiles=PIPELINE_PROFILES)
 
-    assert _step("derived-target-release", "spec-draft")["activation"] == 2
-    assert _step("derived-target-release", "spec-draft")["state"] == "running"
+    # A malformed verdict means the REVIEWER failed: release produces one
+    # fresh review activation against the same sealed spec, never a
+    # producer rework (the old re-parse/derive path failed the event
+    # whenever the parked verdict was genuinely unparseable).
+    assert _step("derived-target-release", "spec-draft")["activation"] == 1
+    fresh = _step("derived-target-release", "spec-attack")
+    assert fresh["activation"] == 2 and fresh["state"] == "running"
+    assert fresh["kanban_task_id"] != gate["kanban_task_id"]
     with store._connect() as db:
         event = db.execute(
             "SELECT state,outcome FROM advance_events WHERE key=?", (key,),
         ).fetchone()
-    assert tuple(event) == ("applied", "invalid request_changes verdict_released")
+        instance = db.execute(
+            "SELECT status,blocked_reason FROM recipe_instances "
+            "WHERE id='derived-target-release'",
+        ).fetchone()
+    assert tuple(event) == ("applied", "malformed_verdict_released")
+    assert tuple(instance) == ("running", None)
 
 
 def test_plan_rejects_undeclared_shared_write_overlap(tmp_path, kanban_conn):

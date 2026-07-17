@@ -657,6 +657,220 @@ def test_review_verdict_never_derives_ambiguous_or_extra_field_targets():
         parse_verdict_for_review(extra, recipe, step)
 
 
+def _v2_marker_recipe(inputs=None):
+    recipe, step = _derived_target_recipe(inputs=inputs)
+    recipe["verdict_contract"] = "shipfactory.verdict/v2"
+    return recipe, step
+
+
+def _v2_verdict_line(**overrides):
+    verdict = {
+        "schema": "shipfactory.verdict/v2", "outcome": "request_changes",
+        "clean": False, "target_step": "draft",
+        "findings": [{
+            "severity": "blocker", "location": "shipfactory/policy.py:16",
+            "summary": "the citation vocabulary drifted",
+        }],
+        "summary": "one blocker remains",
+    }
+    verdict.update(overrides)
+    for key in [key for key, value in overrides.items() if value is None]:
+        del verdict[key]
+    return "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+
+
+def test_parse_verdict_v2_accepts_both_exact_shapes_and_synthesizes_body():
+    from shipfactory.recipes.primitives import parse_verdict_v2
+
+    recipe, step = _v2_marker_recipe()
+    approve = parse_verdict_v2(_v2_verdict_line(
+        outcome="approve", clean=True, findings=[], target_step=None,
+        summary="Clean pass; no findings.",
+    ), recipe, step)
+    assert approve["outcome"] == "approve" and approve["clean"] is True
+    assert approve["body"] == "Clean pass; no findings."
+
+    request = parse_verdict_v2(_v2_verdict_line(), recipe, step)
+    assert request["target_step"] == "draft" and request["clean"] is False
+    assert request["body"] == (
+        "one blocker remains\n"
+        "BLOCKER shipfactory/policy.py:16 — the citation vocabulary drifted"
+    )
+
+
+@pytest.mark.parametrize("line", [
+    "no verdict at all",
+    "SHIPFACTORY_VERDICT: {not json}",
+    _v2_verdict_line(schema=None),
+    _v2_verdict_line(schema="shipfactory.verdict/v1"),
+    _v2_verdict_line(note="unknown field"),
+    _v2_verdict_line(clean=True),
+    _v2_verdict_line(clean="false"),
+    _v2_verdict_line(outcome="approve", clean=True),
+    _v2_verdict_line(outcome="approve", clean=True, target_step=None),
+    _v2_verdict_line(findings=[]),
+    _v2_verdict_line(target_step=None),
+    _v2_verdict_line(target_step="review"),
+    _v2_verdict_line(summary="   "),
+    _v2_verdict_line(findings=[{"severity": "blocker", "location": "a.py:1"}]),
+    _v2_verdict_line(findings=[{"severity": "nit", "location": "a.py:1", "summary": "x"}]),
+    _v2_verdict_line(findings=[{"severity": "blocker", "location": "a.py:1", "summary": " "}]),
+])
+def test_parse_verdict_v2_fails_closed_with_the_stable_prefix(line):
+    from shipfactory.recipes.primitives import parse_verdict_v2
+
+    recipe, step = _v2_marker_recipe()
+    with pytest.raises(ValueError, match="^verdict_contract: "):
+        parse_verdict_v2(line, recipe, step)
+
+
+@pytest.mark.parametrize(("location", "valid"), [
+    ("shipfactory/recipes/advancer.py:1049", True),
+    ("a/b.py:1-9", True),
+    ("Sources/App.swift:12", True),
+    ("README.md:3", True),
+    ("a.py", False),
+    ("a.py:1x", False),
+    ("a.py:1-", False),
+    ("a.txt:3", False),
+    ("no citation here", False),
+    ("prose then a.py:1 then prose", False),
+])
+def test_parse_verdict_v2_finding_location_is_a_strict_fullmatch(location, valid):
+    from shipfactory.recipes.primitives import parse_verdict_v2
+
+    recipe, step = _v2_marker_recipe()
+    line = _v2_verdict_line(findings=[{
+        "severity": "warning", "location": location, "summary": "cited",
+    }])
+    if valid:
+        assert parse_verdict_v2(line, recipe, step)["findings"][0]["location"] == location
+    else:
+        with pytest.raises(ValueError, match="finding location"):
+            parse_verdict_v2(line, recipe, step)
+
+
+def test_parse_verdict_v2_accepts_kanban_task_id_targets_for_downstream_mapping():
+    from shipfactory.recipes.primitives import parse_verdict_v2
+
+    recipe, step = _v2_marker_recipe()
+    verdict = parse_verdict_v2(_v2_verdict_line(target_step="t_1082ec9b"), recipe, step)
+    assert verdict["target_step"] == "t_1082ec9b"
+
+
+def test_marker_recipes_require_v2_and_plain_recipes_reject_it():
+    from shipfactory.recipes.primitives import parse_verdict_for_review
+
+    recipe, step = _v2_marker_recipe()
+    old_shape = (
+        'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"APPROVE - clean pass; no findings."}'
+    )
+    with pytest.raises(ValueError, match="^verdict_contract: "):
+        parse_verdict_for_review(old_shape, recipe, step)
+    # No omitted-target derivation exists under the marker: explicit or reject.
+    with pytest.raises(ValueError, match="^verdict_contract: "):
+        parse_verdict_for_review(_v2_verdict_line(target_step=None), recipe, step)
+
+    plain_recipe, plain_step = _derived_target_recipe()
+    with pytest.raises(ValueError, match="invalid review verdict"):
+        parse_verdict_for_review(_v2_verdict_line(), plain_recipe, plain_step)
+
+
+def test_review_gate_with_marker_exposes_the_v2_verdict_contract(kanban_conn):
+    from shipfactory.recipes.primitives import activate, parse_verdict_v2
+
+    draft = {"id": "draft", "primitive": "agent_task", "needs": []}
+    review = {
+        "id": "review", "primitive": "review_gate", "needs": ["draft"],
+        "title": "Review",
+        "inputs": [{"from": "draft", "kind": "task-spec"}],
+        "params": {
+            "seat": "reviewer", "workspace": "worktree",
+            "instructions": "Review and emit a verdict.",
+        },
+    }
+    recipe = {
+        "schema": "shipfactory.recipe/v2",
+        "verdict_contract": "shipfactory.verdict/v2",
+        "steps": [draft, review],
+    }
+    task_id = activate(
+        kanban_conn,
+        {"id": "verdict-contract-v2", "recipe_hash": "1" * 64},
+        recipe, review, {"step_id": "review", "activation": 1}, {}, [],
+    )
+    body = kanban_conn.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+
+    assert "## Factory review verdict contract (shipfactory.verdict/v2)" in body
+    assert '"schema":"shipfactory.verdict/v2"' in body
+    assert "Allowed request_changes target_step values: draft" in body
+    # Every rendered example must satisfy the authoritative v2 parser.
+    import re as _re
+    examples = _re.findall(r"`(SHIPFACTORY_VERDICT: [^`]+)`", body)
+    assert len(examples) == 2
+    outcomes = {parse_verdict_v2(example, recipe, review)["outcome"] for example in examples}
+    assert outcomes == {"approve", "request_changes"}
+
+
+def _marker_recipe_yaml(*, schema: str = "shipfactory.recipe/v2",
+                        contract: str = "shipfactory.verdict/v2") -> str:
+    v2 = schema == "shipfactory.recipe/v2"
+    budgets = (
+        "budgets:\n  max_activations: 4\n  max_tokens: 200000\n"
+        "  step_activation_caps: {work: 2, check: 2}\n  token_pools: {standard: 200000}\n"
+        if v2 else
+        "budgets: {max_activations: 4, max_step_activations: 2, max_tokens: 200000}\n"
+    )
+    io_lines = "    inputs: []\n    outputs: []\n" if v2 else ""
+    return (
+        f"schema: {schema}\n"
+        "id: marker\nversion: 1\nstatus: active\n"
+        "description: verdict-contract marker recipe\nintent_tags: [test]\n"
+        "supersedes: null\n"
+        f"verdict_contract: {contract}\n"
+        "parameters: {}\n"
+        f"{budgets}"
+        "steps:\n"
+        "  - id: work\n    primitive: agent_task\n    title: Work\n    needs: []\n"
+        f"    optional: false\n{io_lines}"
+        "    params: {seat: dev-backend, instructions: work, execution_profile: standard, workspace: worktree}\n"
+        "  - id: check\n    primitive: review_gate\n    title: Check\n    needs: [work]\n"
+        f"    optional: false\n{io_lines}"
+        "    params: {seat: verifier, instructions: check, execution_profile: standard, workspace: worktree}\n"
+    )
+
+
+def test_loader_accepts_the_exact_verdict_contract_marker_and_round_trips(tmp_path):
+    store.init_db()
+    library_path = tmp_path / "marker-library"
+    library_path.mkdir()
+    (library_path / "marker@1.yaml").write_text(_marker_recipe_yaml(), encoding="utf-8")
+    recipe = load_library(library_path).get("marker@1")
+    assert recipe.document["verdict_contract"] == "shipfactory.verdict/v2"
+    # The pinned normalized document carries the marker immutably.
+    reloaded = load_library(library_path).get("marker@1")
+    assert reloaded.hash == recipe.hash
+    with store._connect() as db:
+        row = db.execute(
+            "SELECT hash,normalized_yaml FROM recipe_versions WHERE id='marker' AND version=1"
+        ).fetchone()
+    assert row["hash"] == recipe.hash
+    assert json.loads(row["normalized_yaml"])["verdict_contract"] == "shipfactory.verdict/v2"
+
+
+def test_loader_rejects_the_marker_on_v1_wrong_values_and_other_extra_keys(tmp_path):
+    with pytest.raises(RecipeError, match="verdict_contract must be exactly"):
+        _recipe(tmp_path, _marker_recipe_yaml(schema="shipfactory.recipe/v1"), "marker-v1@1")
+    with pytest.raises(RecipeError, match="verdict_contract must be exactly"):
+        _recipe(
+            tmp_path, _marker_recipe_yaml(contract="shipfactory.verdict/v1"),
+            "marker-wrong@1",
+        )
+    other_key = _marker_recipe_yaml().replace("verdict_contract:", "verdict_extra:")
+    with pytest.raises(RecipeError, match="top-level keys must exactly match"):
+        _recipe(tmp_path, other_key, "marker-extra@1")
+
+
 def test_restart_reconciliation_activates_review_once_after_swallowed_hook(tmp_path, kanban_conn):
     """§17.7: reconciliation reproduces the missing transition after restart."""
     from hermes_cli import kanban_db

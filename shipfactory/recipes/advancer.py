@@ -28,6 +28,30 @@ _LEASE_SECONDS = 30
 _FINDING_COUNT = re.compile(r"(?im)^\s*(?:finding_count|findings)\s*[:=]\s*(\d+)\s*$")
 _FINDING_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:BLOCKER|WARNING)\b")
 
+# Operator-releasable review blocks.  The malformed-verdict class (parse
+# ValueErrors, including every prefix-tagged verdict_contract v2 failure)
+# releases into a fresh review activation against the same sealed inputs;
+# only review_stall re-parses the parked rejecting verdict on release.
+_MALFORMED_VERDICT_REASONS = {
+    "review final line must be SHIPFACTORY_VERDICT JSON",
+    "invalid SHIPFACTORY_VERDICT JSON",
+    "invalid review verdict",
+    "approve verdict has unknown fields",
+    "invalid request_changes verdict",
+}
+_RECOVERABLE_REVIEW_REASONS = _MALFORMED_VERDICT_REASONS | {
+    "review_stall", "clarifications_nonempty",
+}
+
+
+def _malformed_verdict_reason(reason: Any) -> bool:
+    value = str(reason or "")
+    return value in _MALFORMED_VERDICT_REASONS or value.startswith("verdict_contract:")
+
+
+def _recoverable_review_reason(reason: Any) -> bool:
+    return str(reason or "") in _RECOVERABLE_REVIEW_REASONS or _malformed_verdict_reason(reason)
+
 def advance_key(instance_id: str, recipe_hash: str, step_id: str, activation: int, transition: str, source_id: str) -> str:
     return hashlib.sha256("|".join(map(str, (instance_id, recipe_hash, step_id, activation, transition, source_id))).encode()).hexdigest()
 
@@ -467,20 +491,38 @@ def _review_approval_blocker(db: Any, instance_id: str,
     # either task and must not launder collusion after spawn.
     change_set_producer_id = next((item["from"] for step_id in [definition["id"], *ancestors]
         for item in defs.get(step_id, {}).get("inputs", []) if item.get("kind") == "change-set"), None)
-    if change_set_producer_id and defs.get(change_set_producer_id, {}).get("primitive") == "agent_task":
+    producer_id = change_set_producer_id
+    if producer_id is None and recipe is not None and recipe.get("verdict_contract") == "shipfactory.verdict/v2":
+        # Plan/spec attacks have no change-set ancestry, so independence was
+        # never enforced for them (Amendment F).  Under the v2 verdict
+        # contract, derive the producer from the gate's declared agent_task
+        # inputs — mirroring review_verdict_targets — and enforce only when
+        # exactly one exists.  Plan/spec artifacts are sealed files, not
+        # worktrees, so no workspace binding applies.
+        declared = list(dict.fromkeys(
+            item["from"] for item in definition.get("inputs", [])
+            if item.get("from") in defs and defs[item["from"]]["primitive"] == "agent_task"
+        ))
+        if len(declared) == 1:
+            producer_id = declared[0]
+        elif len(declared) > 1:
+            # Multiple candidate producers must not silently disable the
+            # independence check — refusing is cheaper than guessing wrong.
+            return "review_producer_ambiguous:" + ",".join(sorted(declared))
+    if producer_id and defs.get(producer_id, {}).get("primitive") == "agent_task":
         current_steps = {row["step_id"]: row for row in _latest(db, instance_id)}
-        builder_step = current_steps.get(change_set_producer_id)
+        builder_step = current_steps.get(producer_id)
         review_step = current_steps.get(definition["id"])
         if builder_step is None:
             return "review_builder_run_missing:step"
         if review_step is None:
             return "review_reviewer_run_missing:step"
         builder_run, reason = _exact_producer_run(
-            db, instance_id=instance_id, step_id=change_set_producer_id,
+            db, instance_id=instance_id, step_id=producer_id,
             activation=int(builder_step["activation"]), role="builder",
             expected_workspace=(
                 _step_change_set_workspace(conn, current_steps, definition)[0]
-                if conn is not None else None
+                if conn is not None and change_set_producer_id is not None else None
             ),
         )
         if reason:
@@ -1030,7 +1072,15 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                                     )
                                     continue
                             if verdict["outcome"] == "request_changes":
-                                finding_count = _verdict_finding_count(verdict["body"])
+                                # v2 verdicts carry a machine-read findings
+                                # list, so counts are always >= 0 and the
+                                # stall detector cannot be bypassed by
+                                # uncountable prose (Amendment F).
+                                findings = verdict.get("findings")
+                                finding_count = (
+                                    len(findings) if isinstance(findings, list)
+                                    else _verdict_finding_count(verdict["body"])
+                                )
                                 db.execute(
                                     "UPDATE recipe_steps SET finding_count=?,updated_at=? "
                                     "WHERE instance_id=? AND step_id=? AND activation=?",
@@ -1783,12 +1833,8 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
-    recoverable = {
-        "review_stall", "clarifications_nonempty",
-        "invalid request_changes verdict",
-    }
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
-            or step["blocked_reason"] not in recoverable):
+            or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
     return enqueue(
         instance_id,
@@ -2004,12 +2050,8 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 if step is None:
                     _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
                     return
-                recoverable = {
-                    "review_stall", "clarifications_nonempty",
-                    "invalid request_changes verdict",
-                }
                 if (step["primitive"] != "review_gate" or step["state"] != "blocked"
-                        or step["blocked_reason"] not in recoverable):
+                        or not _recoverable_review_reason(step["blocked_reason"])):
                     _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return
                 recipe = recipe_for_instance(instance, db=db).document
@@ -2017,7 +2059,22 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 definition = next(
                     item for item in recipe["steps"] if item["id"] == step["step_id"]
                 )
-                if blocked_reason in {"review_stall", "invalid request_changes verdict"}:
+                if _malformed_verdict_reason(blocked_reason):
+                    # The reviewer, not the producer, failed: re-parsing the
+                    # malformed verdict here would only re-raise its parse
+                    # error and fail the event.  Release into one fresh review
+                    # activation against the SAME sealed inputs instead.
+                    _fresh_activation(
+                        db, instance, definition, dict(step),
+                        f"operator_release:{row['key']}",
+                    )
+                    db.execute(
+                        "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
+                        (store._now(), instance["id"]),
+                    )
+                    _finish_event(db, row, "applied", "malformed_verdict_released")
+                    return
+                if blocked_reason == "review_stall":
                     from hermes_cli import kanban_db
                     task = kanban_db.get_task(conn, step["kanban_task_id"])
                     verdict = parse_verdict_for_review(

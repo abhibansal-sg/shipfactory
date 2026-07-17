@@ -184,6 +184,157 @@ def test_unparseable_rejection_counts_never_stall_and_existing_cap_wins(tmp_path
     assert _instance("unknown-count")["blocked_reason"] == "activation_fuse"
 
 
+def _marker_review_loop_recipe(tmp_path: Path):
+    library = tmp_path / "marker-review-loop-library"
+    library.mkdir()
+    (library / "review-loop-v2@1.yaml").write_text(
+        """schema: shipfactory.recipe/v2
+id: review-loop-v2
+version: 1
+status: active
+description: bounded v2 verdict-contract review-stall loop
+intent_tags: [test]
+supersedes: null
+verdict_contract: shipfactory.verdict/v2
+parameters: {}
+budgets:
+  max_activations: 10
+  max_tokens: 500000
+  step_activation_caps: {build: 3, verify: 3}
+  token_pools: {standard: 500000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    inputs: []
+    outputs: []
+    params: {seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}
+  - id: verify
+    primitive: review_gate
+    title: Verify
+    needs: [build]
+    optional: false
+    inputs: []
+    outputs: []
+    params: {seat: verifier, instructions: verify, execution_profile: standard, workspace: worktree}
+""",
+        encoding="utf-8",
+    )
+    return load_library(library).get("review-loop-v2@1")
+
+
+def _reject_round_v2(kanban_conn, instance_id: str, activation: int, summary: str) -> None:
+    from hermes_cli import kanban_db
+
+    build = _step(instance_id, "build", activation)
+    assert build and build["state"] == "running"
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result=f"build {activation}")
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    review = _step(instance_id, "verify", activation)
+    assert review and review["state"] == "running"
+    verdict = {
+        "schema": "shipfactory.verdict/v2", "outcome": "request_changes",
+        "clean": False, "target_step": "build",
+        "findings": [{
+            "severity": "blocker", "location": "shipfactory/recipes/advancer.py:1",
+            "summary": "still broken",
+        }],
+        "summary": summary,
+    }
+    result = "SHIPFACTORY_VERDICT: " + json.dumps(verdict, separators=(",", ":"))
+    assert kanban_db.complete_task(kanban_conn, review["kanban_task_id"], result=result)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+
+
+def test_v2_verdict_counts_are_machine_read_and_flat_counts_stall(tmp_path, kanban_conn):
+    """Inverse of the -1 bypass above: under the verdict_contract marker the
+    count is len(findings), never a regex over untrusted prose, so a reviewer
+    whose summary smuggles decoy shrinking `finding_count:` lines still parks
+    on the second non-decreasing round instead of looping to the fuse."""
+    recipe = _marker_review_loop_recipe(tmp_path)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="machine-count")
+    reconcile(kanban_conn, "machine-count", profiles=PROFILES)
+
+    _reject_round_v2(kanban_conn, "machine-count", 1, "finding_count: 5")
+    assert _step("machine-count", "verify", 1)["finding_count"] == 1
+    assert _step("machine-count", "verify", 1)["blocked_reason"] == "changes_requested"
+
+    _reject_round_v2(kanban_conn, "machine-count", 2, "finding_count: 3")
+    assert _step("machine-count", "verify", 2)["finding_count"] == 1
+    assert _step("machine-count", "verify", 2)["blocked_reason"] == "review_stall"
+    parked = _instance("machine-count")
+    assert parked["status"] == "blocked" and parked["blocked_reason"] == "review_stall"
+
+    # The stall release path re-parses the parked v2 verdict and reopens build.
+    release_review_stall("machine-count", "verify", "operator accepts one more revision")
+    apply_events(kanban_conn, profiles=PROFILES)
+    assert _step("machine-count", "build", 3)["state"] == "running"
+
+
+def _block_review_with_result(tmp_path, kanban_conn, instance_id: str, result: str,
+                              *, marker: bool = False) -> str:
+    from hermes_cli import kanban_db
+
+    recipe = (
+        _marker_review_loop_recipe(tmp_path) if marker
+        else _review_loop_recipe(tmp_path)
+    )
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id=instance_id)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    build = _step(instance_id, "build", 1)
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result="built")
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    review = _step(instance_id, "verify", 1)
+    assert review["state"] == "running"
+    assert kanban_db.complete_task(kanban_conn, review["kanban_task_id"], result=result)
+    reconcile(kanban_conn, instance_id, profiles=PROFILES)
+    return review["kanban_task_id"]
+
+
+@pytest.mark.parametrize(("instance_id", "result", "marker", "reason"), [
+    ("malformed-json", "SHIPFACTORY_VERDICT: {invalid}", False,
+     "invalid SHIPFACTORY_VERDICT JSON"),
+    ("malformed-target",
+     'SHIPFACTORY_VERDICT: {"outcome":"request_changes",'
+     '"body":"a.py:1 broken","note":"untrusted"}',
+     False, "invalid request_changes verdict"),
+    ("malformed-v2",
+     'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"APPROVE clean pass"}',
+     True, "verdict_contract: verdict keys must exactly match the v2 schema"),
+])
+def test_operator_release_of_a_malformed_verdict_reactivates_the_review(
+    tmp_path, kanban_conn, instance_id, result, marker, reason,
+):
+    """Malformed verdicts mean the REVIEWER failed: release must produce one
+    fresh review activation against the same sealed inputs, never re-parse the
+    broken verdict (which previously failed the 'invalid request_changes
+    verdict' release event) and never reopen the producer."""
+    old_task = _block_review_with_result(
+        tmp_path, kanban_conn, instance_id, result, marker=marker,
+    )
+    blocked = _step(instance_id, "verify", 1)
+    assert blocked["state"] == "blocked" and blocked["blocked_reason"] == reason
+    assert _instance(instance_id)["status"] == "blocked"
+
+    key = release_review_stall(instance_id, "verify", "operator requests a fresh review")
+    apply_events(kanban_conn, profiles=PROFILES)
+
+    fresh = _step(instance_id, "verify", 2)
+    assert fresh is not None and fresh["state"] == "running"
+    assert fresh["kanban_task_id"] and fresh["kanban_task_id"] != old_task
+    # The producer's work is untouched: same activation, no rework cone.
+    assert _step(instance_id, "build", 2) is None
+    instance = _instance(instance_id)
+    assert instance["status"] == "running" and instance["blocked_reason"] is None
+    with store._connect() as db:
+        audit = db.execute(
+            "SELECT source,state,outcome FROM advance_events WHERE key=?", (key,),
+        ).fetchone()
+    assert tuple(audit) == ("operator_release", "applied", "malformed_verdict_released")
+
+
 def _human_gate_recipe(tmp_path: Path, primitive: str):
     recipe_id = "approval-note" if primitive == "approval_gate" else "event-note"
     gate_params = (

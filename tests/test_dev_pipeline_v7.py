@@ -103,7 +103,7 @@ def test_startup_guard_applies_closure_to_latest_active_version(monkeypatch):
     startup_guard(config)
 
     profiles["planning"]["token_allowance"] += 1
-    with pytest.raises(ValueError, match="dev-pipeline@8 token pool 'planning'"):
+    with pytest.raises(ValueError, match="dev-pipeline@9 token pool 'planning'"):
         startup_guard(config)
 
 

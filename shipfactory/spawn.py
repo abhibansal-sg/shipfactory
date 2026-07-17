@@ -44,6 +44,18 @@ class AccessModeResolutionError(RuntimeError):
     """
 
 
+class ContextDeliveryError(RuntimeError):
+    """A worker cannot be handed its full task body (Amendment 1 item H).
+
+    The ``hermes`` executor delegates to the host's own worker, which builds
+    its context in-process with the ``_CTX_MAX_BODY_BYTES`` cap — Factory's
+    full-body re-delivery (:func:`_untruncated_body_section`) never reaches
+    it. A reviewer judging a truncated copy of sealed inputs while the DB-row
+    binding check passes is exactly the hazard H closes, so an over-cap body
+    on a hermes seat refuses to spawn instead of spawning half-informed.
+    """
+
+
 def _store_module() -> Any:
     return importlib.import_module("shipfactory.store")
 
@@ -94,6 +106,33 @@ def _worker_prompt(context: str) -> str:
         "`SHIPFACTORY_RESULT: done <one-line summary>` on success, or "
         "`SHIPFACTORY_RESULT: blocked <one-line reason>` when blocked. "
         "Do not omit this line.\n"
+    )
+
+
+def _untruncated_body_section(kanban_db: Any, conn: Any, task_id: Any) -> str:
+    """Return the full task body when the host context builder truncated it.
+
+    Deployed Hermes caps ``task.body`` at ``_CTX_MAX_BODY_BYTES`` (8 KB)
+    inside ``build_worker_context``, silently truncating Factory-inlined
+    sealed review inputs while the SHIPFACTORY_REVIEW_INPUT_SHA256 marker
+    survives (Amendment 1 item H).  Any capped body is a correctness hazard
+    regardless of task type, so every over-cap body is re-delivered in full
+    here; the durable ``.prompt`` file keeps the evidence trail.
+    """
+    get_task = getattr(kanban_db, "get_task", None)
+    if not callable(get_task):
+        return ""
+    task = get_task(conn, task_id)
+    body = str(_value(task, "body") or "").strip()
+    cap = int(getattr(kanban_db, "_CTX_MAX_BODY_BYTES", 8192))
+    if len(body) <= cap:
+        return ""
+    return (
+        "\n\n## Factory full task body (host context truncated it above)\n"
+        f"The host worker-context builder caps task bodies at {cap} characters, so the "
+        "opening post above is truncated. The complete untruncated task body follows; "
+        "treat it as authoritative over the truncated copy.\n\n"
+        + body
     )
 
 
@@ -458,6 +497,17 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         enforcement_level = _enforce_readonly_workspace(root)
 
     if seat.executor == "hermes":
+        # The delegated hermes worker builds its own capped context; Factory
+        # cannot append the full body there, so an over-cap body fails closed.
+        cap = int(getattr(kanban_db, "_CTX_MAX_BODY_BYTES", 8192))
+        body = str(_value(task, "body") or "").strip()
+        if len(body) > cap:
+            raise ContextDeliveryError(
+                f"task {task_id} body is {len(body)} chars but the hermes "
+                f"worker context caps bodies at {cap}; a hermes seat cannot "
+                "receive the full body — reassign the step to a codex/claude "
+                "seat or shrink the body"
+            )
         prompt = f"work kanban task {task_id}"
         prompt_path.write_text(prompt, encoding="utf-8")
         try:
@@ -468,6 +518,7 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         conn = kanban_db.connect(board=board)
         try:
             context = kanban_db.build_worker_context(conn, task_id)
+            context += _untruncated_body_section(kanban_db, conn, task_id)
         finally:
             conn.close()
         executor.identity_files(seat, str(root))
@@ -752,6 +803,6 @@ def reap_finished() -> list[dict]:
 
 
 __all__ = [
-    "AccessModeResolutionError", "WorkerCapacityExhausted", "shipfactory_spawn",
+    "AccessModeResolutionError", "ContextDeliveryError", "WorkerCapacityExhausted", "shipfactory_spawn",
     "restore_running", "reap_finished",
 ]
