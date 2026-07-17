@@ -137,7 +137,6 @@ def _org(_args: argparse.Namespace) -> str:
 
 def _daemon(args: argparse.Namespace) -> Any:
     from shipfactory import daemon
-    from hermes_cli import kanban_db
     def argument_values(value: Any) -> list[Any]:
         if value is None:
             return []
@@ -159,23 +158,19 @@ def _daemon(args: argparse.Namespace) -> Any:
         if require_recipes:
             daemon.validate_recipe_mode(required=True)
         if len(served) == 1:
-            # Preserve the original connection ownership and result shape for
-            # the no-board and single --board forms.
-            board = served[0]
-            conn = kanban_db.connect(board=board)
-            try:
-                result = daemon.run(
-                    conn,
-                    board=board,
-                    interval=args.interval,
-                    once=args.once,
-                    sync=bool(args.sync_interval),
-                    sync_interval=args.sync_interval,
-                    require_recipes=require_recipes,
-                    _lock_held=True,
-                )
-            finally:
-                conn.close()
+            # conn=None makes the daemon open a fresh board connection per
+            # tick (stale-WAL hygiene); board=served[0] preserves the bare
+            # single-board result shape for --once consumers.
+            result = daemon.run(
+                None,
+                board=served[0],
+                interval=args.interval,
+                once=args.once,
+                sync=bool(args.sync_interval),
+                sync_interval=args.sync_interval,
+                require_recipes=require_recipes,
+                _lock_held=True,
+            )
         else:
             result = daemon.run(
                 None,
