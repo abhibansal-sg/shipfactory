@@ -449,12 +449,20 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   live execution profiles' `token_allowance`, so a later config edit fails
   closed instead of silently making a published pipeline impossible (finding
   #64, dev-pipeline@6 live shakedown).
+- Never assume execution profiles share one allowance. The first v7 closure
+  used 50k for every profile, but live `build` was 75k; the new startup guard
+  caught `build: 150k < 3 × 75k` before v7 was published to the live Factory.
+  V7 remains immutable in Git. Dev-pipeline@8 supersedes it with build 225k and
+  global 1,075k while planning/review remain 250k/600k, and tests use the
+  ratified per-profile allowance map plus prove v7 fails under it. Read live
+  allowance values before cutting the immutable successor; do not extrapolate
+  from charges observed in other pools (finding #65, v7 publication preflight).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#64 so far). When you fix one: commit message
+- Findings get numbers (#22–#65 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
