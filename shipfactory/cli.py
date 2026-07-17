@@ -331,14 +331,6 @@ def _recipe_gate(
 def _recipe_release(conn: Any, instance_id: str, step_id: str, reason: str) -> dict[str, Any]:
     from shipfactory import store
     from shipfactory.recipes import advancer
-    with store._connect() as db:
-        step = db.execute(
-            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
-            (instance_id, step_id),
-        ).fetchone()
-        if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
-                or step["blocked_reason"] not in {"review_stall", "clarifications_nonempty"}):
-            raise ValueError("review step is not parked for operator-recoverable review block")
     key = advancer.release_review_stall(instance_id, step_id, reason)
     with store._connect() as db:
         updated = db.execute("SELECT status FROM recipe_instances WHERE id=?", (instance_id,)).fetchone()

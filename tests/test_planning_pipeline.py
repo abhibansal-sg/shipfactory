@@ -341,6 +341,8 @@ def test_reconcile_derives_missing_unambiguous_review_target(tmp_path, kanban_co
 def test_operator_release_recovers_historical_missing_target_block(
     tmp_path, kanban_conn,
 ):
+    from shipfactory import cli as shipfactory_cli
+
     _advance_to_spec_attack(tmp_path, kanban_conn, "derived-target-release")
     gate = _step("derived-target-release", "spec-attack")
     _complete_review_without_target(kanban_conn, gate["kanban_task_id"])
@@ -356,10 +358,11 @@ def test_operator_release_recovers_historical_missing_target_block(
             ("invalid request_changes verdict", now, "derived-target-release"),
         )
 
-    key = release_review_stall(
-        "derived-target-release", "spec-attack",
+    queued = shipfactory_cli._recipe_release(
+        None, "derived-target-release", "spec-attack",
         "derive the sole Factory-owned review target",
     )
+    key = queued["key"]
     apply_events(kanban_conn, profiles=PIPELINE_PROFILES)
 
     assert _step("derived-target-release", "spec-draft")["activation"] == 2
