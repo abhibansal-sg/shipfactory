@@ -61,6 +61,54 @@ class RecipeLibrary:
         return [r.document for r in self.recipes.values() if r.document["status"] == "active"]
 
 
+def validate_budget_closure(
+    document: dict[str, Any], execution_profiles: dict[str, dict[str, Any]],
+) -> None:
+    """Prove v2 budgets can admit every activation allowed by their caps."""
+    if document.get("schema") != "shipfactory.recipe/v2":
+        return
+    budgets = document["budgets"]
+    caps = budgets["step_activation_caps"]
+    required_by_pool: dict[str, int] = {}
+    for step in document["steps"]:
+        if step["primitive"] not in {"agent_task", "review_gate"}:
+            continue
+        profile = step["params"]["execution_profile"]
+        if _templated(profile):
+            _error(
+                f"recipe {document['id']}@{document['version']} budget closure "
+                "cannot prove a templated execution profile"
+            )
+        config = execution_profiles.get(profile)
+        allowance = config.get("token_allowance") if isinstance(config, dict) else None
+        if not isinstance(allowance, int) or isinstance(allowance, bool) or allowance < 1:
+            _error(f"execution profile {profile!r} has no valid token_allowance")
+        assert isinstance(allowance, int) and not isinstance(allowance, bool)
+        allowance_int = allowance
+        required_by_pool[profile] = (
+            required_by_pool.get(profile, 0) + int(caps[step["id"]]) * allowance_int
+        )
+    for pool, required in sorted(required_by_pool.items()):
+        configured = int(budgets["token_pools"].get(pool, 0))
+        if configured < required:
+            _error(
+                f"recipe {document['id']}@{document['version']} token pool {pool!r} "
+                f"has {configured} tokens but activation caps require {required}"
+            )
+    required_total = sum(required_by_pool.values())
+    if int(budgets["max_tokens"]) < required_total:
+        _error(
+            f"recipe {document['id']}@{document['version']} max_tokens has "
+            f"{budgets['max_tokens']} but activation caps require {required_total}"
+        )
+    required_activations = sum(int(value) for value in caps.values())
+    if int(budgets["max_activations"]) < required_activations:
+        _error(
+            f"recipe {document['id']}@{document['version']} max_activations has "
+            f"{budgets['max_activations']} but step caps allow {required_activations}"
+        )
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
