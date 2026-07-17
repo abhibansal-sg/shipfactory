@@ -156,3 +156,40 @@ def test_parse_result_prefers_verdict_over_trailing_result():
     # Non-review workers keep the plain result contract.
     result, summary = spawn._parse_result("work\nSHIPFACTORY_RESULT: done shipped\n", 0)
     assert (result, summary) == ("done", "shipped")
+
+
+def test_hermes_seat_refuses_over_cap_body(monkeypatch, tmp_path):
+    """Amendment H, hermes leg: the delegated hermes worker builds its own
+    capped context, so Factory's full-body re-delivery can never reach it.
+    An over-cap body on a hermes seat must refuse to spawn (fail closed)
+    rather than let a worker judge a silently truncated body."""
+    import pytest
+
+    calls = []
+    seat = SimpleNamespace(name="dev", profile="dev", executor="hermes", model="native", reasoning="")
+    _install_stubs(monkeypatch, seat, calls)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    task = SimpleNamespace(id="t-hermes-big", assignee="dev", body="x" * 9001)
+
+    with pytest.raises(spawn.ContextDeliveryError, match="hermes"):
+        spawn.shipfactory_spawn(task, str(tmp_path / "work"), board="b")
+
+    assert not any(item[0] == "start" for item in calls), "refusal must precede the run record"
+
+
+def test_hermes_seat_spawns_when_body_is_under_the_cap(monkeypatch, tmp_path):
+    import pytest
+
+    class _ReachedSpawn(Exception):
+        pass
+
+    calls = []
+    seat = SimpleNamespace(name="dev", profile="dev", executor="hermes", model="native", reasoning="")
+    _install_stubs(monkeypatch, seat, calls)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.kanban_db as kanban_stub
+    kanban_stub._default_spawn = lambda *args, **kwargs: (_ for _ in ()).throw(_ReachedSpawn())
+    task = SimpleNamespace(id="t-hermes-ok", assignee="dev", body="short body")
+
+    with pytest.raises(_ReachedSpawn):
+        spawn.shipfactory_spawn(task, str(tmp_path / "work"), board="b")

@@ -505,6 +505,10 @@ def _review_approval_blocker(db: Any, instance_id: str,
         ))
         if len(declared) == 1:
             producer_id = declared[0]
+        elif len(declared) > 1:
+            # Multiple candidate producers must not silently disable the
+            # independence check — refusing is cheaper than guessing wrong.
+            return "review_producer_ambiguous:" + ",".join(sorted(declared))
     if producer_id and defs.get(producer_id, {}).get("primitive") == "agent_task":
         current_steps = {row["step_id"]: row for row in _latest(db, instance_id)}
         builder_step = current_steps.get(producer_id)

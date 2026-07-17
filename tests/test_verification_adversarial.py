@@ -1234,6 +1234,29 @@ def test_plan_spec_gate_without_the_marker_keeps_the_pinned_v8_behavior(
     assert blocker is None
 
 
+def test_plan_spec_gate_with_two_agent_inputs_fails_closed_as_ambiguous(
+    tmp_path, kanban_conn,
+):
+    """A marker gate with two candidate producers must refuse, not silently
+    skip the independence check (adversarial-review finding, Amendment F)."""
+    repo, head, tree = _repo(tmp_path)
+    definition, defs, latest, recipe = _seed_review_instance(
+        kanban_conn, tmp_path, repo, head, tree, instance_id="rvw-spec-ambiguous",
+        review_input_kind="task-spec", include_verification=False,
+        verdict_contract="shipfactory.verdict/v2", reviewer_executor="claude",
+    )
+    defs["plan"] = {"id": "plan", "title": "plan", "primitive": "agent_task",
+                    "needs": [], "inputs": [], "params": {}}
+    definition["inputs"].append({"from": "plan", "kind": "plan", "required": False})
+    with store._connect() as db:
+        blocker = advancer._review_approval_blocker(
+            db, "rvw-spec-ambiguous", definition,
+            verdict_body="Clean pass; no findings.",
+            recipe=recipe, defs=defs, conn=kanban_conn, latest=latest,
+        )
+    assert blocker == "review_producer_ambiguous:build,plan"
+
+
 def test_review_provider_identity_does_not_read_mutable_seats(tmp_path, kanban_conn):
     repo, head, tree = _repo(tmp_path)
     manifest = verify.load_verification_manifest(repo, head)
