@@ -502,6 +502,98 @@ def test_factory_generated_change_set_contract_says_worker_must_not_write(kanban
     assert ".shipfactory-output/change-set.json" in task.body
 
 
+def _activate_review_task(kanban_conn, *, change_set_input: bool = False):
+    from shipfactory.recipes.primitives import activate
+
+    draft = {"id": "draft", "primitive": "agent_task", "needs": []}
+    build = {"id": "build", "primitive": "agent_task", "needs": ["draft"]}
+    inputs = ([{"from": "build", "kind": "change-set"}]
+              if change_set_input else [{"from": "draft", "kind": "task-spec"}])
+    review = {
+        "id": "review",
+        "primitive": "review_gate",
+        "needs": ["build" if change_set_input else "draft"],
+        "title": "Review",
+        "inputs": inputs,
+        "params": {
+            "seat": "reviewer", "workspace": "worktree",
+            "instructions": "Review and emit a verdict.",
+        },
+    }
+    recipe = {"schema": "shipfactory.recipe/v2", "steps": [draft, build, review]}
+    task_id = activate(
+        kanban_conn,
+        {"id": "verdict-contract", "recipe_hash": "1" * 64},
+        recipe,
+        review,
+        {"step_id": "review", "activation": 1},
+        {},
+        [],
+    )
+    return kanban_conn.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+
+
+def test_review_gate_exposes_complete_verdict_contract(kanban_conn):
+    body = _activate_review_task(kanban_conn)
+
+    assert 'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"APPROVE - clean pass; no findings."}' in body
+    assert 'SHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"draft"' in body
+    assert "Allowed request_changes target_step values: draft" in body
+    assert "path/to/file.py:1" in body
+    assert "single line before the mandatory SHIPFACTORY_RESULT" in body
+    assert "Do not emit prose instead of this JSON" in body
+
+
+def test_review_gate_change_set_input_restricts_target_to_exact_builder(kanban_conn):
+    body = _activate_review_task(kanban_conn, change_set_input=True)
+
+    assert "Allowed request_changes target_step values: build" in body
+    assert '"target_step":"build"' in body
+    assert "Allowed request_changes target_step values: draft" not in body
+
+
+def test_review_verdict_contract_prefers_declared_agent_input_over_other_ancestors():
+    from shipfactory.recipes.primitives import _review_verdict_contract
+
+    recipe = {
+        "steps": [
+            {"id": "draft", "primitive": "agent_task", "needs": []},
+            {"id": "build", "primitive": "agent_task", "needs": ["draft"]},
+            {"id": "review", "primitive": "review_gate", "needs": ["build"]},
+        ],
+    }
+    body = _review_verdict_contract(recipe, {
+        "id": "review", "inputs": [{"from": "draft", "kind": "task-spec"}],
+    })
+
+    assert "Allowed request_changes target_step values: draft" in body
+    assert "Allowed request_changes target_step values: build" not in body
+
+
+def test_review_verdict_contract_fails_closed_without_a_valid_target():
+    from shipfactory.recipes.primitives import _review_verdict_contract
+
+    recipe = {"steps": [{"id": "review", "primitive": "review_gate", "needs": []}]}
+    with pytest.raises(ValueError, match="no valid request_changes target"):
+        _review_verdict_contract(recipe, {"id": "review", "inputs": []})
+
+
+def test_review_verdict_examples_match_the_authoritative_parser():
+    from shipfactory.recipes.primitives import parse_verdict
+
+    approve = parse_verdict(
+        'SHIPFACTORY_VERDICT: {"outcome":"approve","body":"APPROVE - clean pass; no findings."}'
+    )
+    request = parse_verdict(
+        'SHIPFACTORY_VERDICT: {"outcome":"request_changes","target_step":"draft",'
+        '"body":"test_message.py:5 - assertion conflicts with requested bytes"}'
+    )
+
+    assert approve == {"outcome": "approve", "body": "APPROVE - clean pass; no findings."}
+    assert request["outcome"] == "request_changes"
+    assert request["target_step"] == "draft"
+
+
 def test_restart_reconciliation_activates_review_once_after_swallowed_hook(tmp_path, kanban_conn):
     """§17.7: reconciliation reproduces the missing transition after restart."""
     from hermes_cli import kanban_db

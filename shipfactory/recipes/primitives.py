@@ -175,6 +175,47 @@ def parse_verdict(text: str) -> dict[str, Any]:
     if verdict["outcome"] == "request_changes" and (set(verdict) != {"outcome", "target_step", "body"} or not isinstance(verdict.get("target_step"), str)): raise ValueError("invalid request_changes verdict")
     return verdict
 
+
+def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -> str:
+    """Render the exact parser contract and valid rework targets for one v2 review."""
+    defs = {item["id"]: item for item in recipe["steps"]}
+    change_set_targets = list(dict.fromkeys(
+        item["from"] for item in step_def.get("inputs", [])
+        if item.get("kind") == "change-set"
+    ))
+    declared_agent_targets = list(dict.fromkeys(
+        item["from"] for item in step_def.get("inputs", [])
+        if item.get("from") in defs and defs[item["from"]]["primitive"] == "agent_task"
+    ))
+    allowed = change_set_targets or declared_agent_targets or [
+        step_id for step_id in _upstream_ids(recipe, step_def["id"])
+        if defs[step_id]["primitive"] == "agent_task"
+    ]
+    if not allowed:
+        raise ValueError(f"review gate {step_def['id']} has no valid request_changes target")
+    approve = json.dumps({
+        "outcome": "approve",
+        "body": "APPROVE - clean pass; no findings.",
+    }, separators=(",", ":"))
+    request_changes = json.dumps({
+        "outcome": "request_changes",
+        "target_step": allowed[0],
+        "body": "path/to/file.py:1 - describe the concrete finding",
+    }, separators=(",", ":"))
+    return (
+        "\n\n## Factory review verdict contract\n"
+        "Emit exactly one of these parser-valid forms as a single line before the mandatory "
+        "SHIPFACTORY_RESULT line. Do not wrap it in a Markdown fence. Do not emit prose instead "
+        "of this JSON.\n"
+        f"- Approve: `SHIPFACTORY_VERDICT: {approve}`\n"
+        f"- Request changes: `SHIPFACTORY_VERDICT: {request_changes}`\n"
+        f"Allowed request_changes target_step values: {', '.join(allowed)}. "
+        "Use the exact recipe step id, not a title or invented name.\n"
+        "An approve body must contain APPROVE plus an explicit clean-pass/no-findings phrase. "
+        "A request_changes body must cite at least one concrete `path/to/file.py:1`-style "
+        "repository location. Keep the verdict JSON on one physical line."
+    )
+
 def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_def: dict[str, Any], step: dict[str, Any], parameters: dict[str, Any], parents: list[str], db: Any = None) -> str | None:
     """Perform one idempotent primitive mutation and return its task id if any."""
     from hermes_cli import kanban_db
@@ -214,6 +255,8 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
             "A chat response is not an artifact; the file must exist before you report success."
         )
         body += "\n".join(lines)
+    if primitive == "review_gate" and recipe.get("schema") == "shipfactory.recipe/v2":
+        body += _review_verdict_contract(recipe, step_def)
     if primitive in {"agent_task", "review_gate"}:
         # board= must be explicit: create_task's default_workdir inheritance
         # falls back to get_current_board() (the GLOBAL current board), which
