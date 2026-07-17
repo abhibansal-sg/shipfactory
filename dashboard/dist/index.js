@@ -1084,6 +1084,6 @@
   }
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
-    window.__HERMES_PLUGINS__.register("factory", FactoryPage);
+    window.__HERMES_PLUGINS__.register("shipfactory", FactoryPage);
   }
 })();
