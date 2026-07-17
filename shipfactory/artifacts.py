@@ -19,6 +19,16 @@ from typing import Any, Iterable
 import yaml
 
 from shipfactory import store
+from shipfactory.artifact_contracts import (
+    EXPLORATION_EXISTING_REFERENCE_KEYS,
+    EXPLORATION_PROPOSED_REFERENCE_KEYS,
+    EXPLORATION_REFERENCE_BASE_KEYS,
+    PLAN_NODE_KEYS,
+    REQUIRED_TOP_LEVEL,
+    REVIEW_STORY_CHANGE_KEYS,
+    TASK_SPEC_REQUIREMENT_KEYS,
+    find_unresolved_output_placeholder,
+)
 
 
 DEFAULT_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024
@@ -110,10 +120,7 @@ def _hash_string(value: Any, lengths: tuple[int, ...]) -> bool:
 
 def _validate_exploration(document: dict[str, Any]) -> None:
     schema = "shipfactory.exploration/v1"
-    required = {
-        "schema", "intent_sha256", "base_sha", "repo_tree_sha", "references",
-        "direct_callers", "constraints", "untrusted_directives", "unknowns",
-    }
+    required = REQUIRED_TOP_LEVEL[schema]
     _require_keys(document, schema, required)
     if set(document) != required:
         raise ArtifactValidationError(f"{schema} has unknown fields")
@@ -130,14 +137,16 @@ def _validate_exploration(document: dict[str, Any]) -> None:
     )
     statuses = {"existing", "proposed", "generated", "external"}
     for index, reference in enumerate(document["references"]):
-        if not isinstance(reference, dict) or reference.get("status") not in statuses:
+        if (not isinstance(reference, dict)
+                or not EXPLORATION_REFERENCE_BASE_KEYS.issubset(reference)
+                or reference.get("status") not in statuses):
             raise ArtifactValidationError(f"{schema} reference {index} has invalid status")
         if not isinstance(reference.get("id"), str) or not isinstance(reference.get("kind"), str):
             raise ArtifactValidationError(f"{schema} reference {index} has invalid identity")
         if reference["status"] == "existing":
             _require_keys(
                 reference, f"{schema} reference {index}",
-                {"path", "git_blob_sha", "start_line", "end_line", "text_sha256"},
+                EXPLORATION_EXISTING_REFERENCE_KEYS,
             )
             if (not isinstance(reference["git_blob_sha"], str)
                     or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", reference["git_blob_sha"])
@@ -149,7 +158,7 @@ def _validate_exploration(document: dict[str, Any]) -> None:
         if reference["status"] == "proposed":
             _require_keys(
                 reference, f"{schema} reference {index}",
-                {"path", "reason", "intended_parent_directory"},
+                EXPLORATION_PROPOSED_REFERENCE_KEYS,
             )
         for field in ("path", "reason", "intended_parent_directory"):
             if field in reference and (
@@ -162,11 +171,7 @@ def _validate_exploration(document: dict[str, Any]) -> None:
 
 def _validate_task_spec(document: dict[str, Any]) -> None:
     schema = "shipfactory.task-spec/v1"
-    required = {
-        "schema", "intent_artifact_id", "problem", "non_goals", "requirements",
-        "target_files", "forbidden_paths", "risk_tags", "acceptance_cases",
-        "rollback_notes", "assumptions", "clarifications",
-    }
+    required = REQUIRED_TOP_LEVEL[schema]
     _require_keys(document, schema, required)
     if set(document) != required:
         raise ArtifactValidationError(f"{schema} has unknown fields")
@@ -193,7 +198,7 @@ def _validate_task_spec(document: dict[str, Any]) -> None:
     ids: set[str] = set()
     for requirement in document["requirements"]:
         if (not isinstance(requirement, dict)
-                or set(requirement) != {"id", "behavior", "oracle", "risk"}
+                or set(requirement) != TASK_SPEC_REQUIREMENT_KEYS
                 or not all(isinstance(requirement[key], str) and requirement[key]
                            for key in requirement)):
             raise ArtifactValidationError(f"{schema} has invalid requirement")
@@ -279,10 +284,7 @@ def _node_control_reason(
 
 def _validate_plan(document: dict[str, Any]) -> None:
     schema = "shipfactory.plan/v1"
-    required = {
-        "schema", "task_spec_sha256", "base_sha", "nodes", "integration_order",
-        "shared_file_overlaps", "residual_risks",
-    }
+    required = REQUIRED_TOP_LEVEL[schema]
     _require_keys(document, schema, required)
     if set(document) != required:
         raise ArtifactValidationError(f"{schema} has unknown fields")
@@ -292,10 +294,7 @@ def _validate_plan(document: dict[str, Any]) -> None:
     if not isinstance(document["nodes"], list):
         raise ArtifactValidationError(f"{schema} nodes must be a list")
     nodes: dict[str, dict[str, Any]] = {}
-    required_node_keys = {
-        "id", "title", "needs", "kind", "requirements", "allowed_paths",
-        "expected_outputs", "test_cases", "risk_tags",
-    }
+    required_node_keys = PLAN_NODE_KEYS
     for node in document["nodes"]:
         if (not isinstance(node, dict)
                 or set(node) not in (required_node_keys, required_node_keys | {"budget"})):
@@ -473,11 +472,7 @@ def _validate_change_set(document: dict[str, Any]) -> None:
 
 def _validate_review_story(document: dict[str, Any]) -> None:
     schema = "shipfactory.review-story/v1"
-    required = {
-        "schema", "instance_id", "revision_hash", "task_spec_sha256",
-        "plan_sha256", "change_set_sha256", "evidence_bundle_sha256", "headline", "changes",
-        "generated_or_mechanical_files", "not_changed", "residual_risks",
-    }
+    required = REQUIRED_TOP_LEVEL[schema]
     _require_keys(document, schema, required)
     if set(document) != required:
         raise ArtifactValidationError(f"{schema} has unknown fields")
@@ -495,9 +490,7 @@ def _validate_review_story(document: dict[str, Any]) -> None:
             raise ArtifactValidationError(f"{schema} field {field} must be a sha256")
     if not isinstance(document["changes"], list) or not document["changes"]:
         raise ArtifactValidationError(f"{schema} changes must be a nonempty list")
-    change_keys = {
-        "importance", "requirement_ids", "files", "why", "risk", "evidence_case_ids",
-    }
+    change_keys = REVIEW_STORY_CHANGE_KEYS
     for index, change in enumerate(document["changes"]):
         if not isinstance(change, dict) or set(change) != change_keys:
             raise ArtifactValidationError(f"{schema} change {index} has invalid shape")
@@ -565,6 +558,10 @@ def _validate_document(document: Any, *, kind: str, schema: str) -> int:
         )
     if not isinstance(document, dict):
         raise ArtifactValidationError(f"{schema} candidate must contain a JSON object")
+    if find_unresolved_output_placeholder(document) is not None:
+        raise ArtifactValidationError(
+            f"{schema} candidate contains an unresolved Factory output-contract placeholder"
+        )
     if document.get("schema") != schema:
         raise ArtifactValidationError(
             f"artifact schema mismatch: expected {schema!r}, got {document.get('schema')!r}"

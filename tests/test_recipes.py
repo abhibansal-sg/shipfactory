@@ -359,6 +359,139 @@ def test_worker_authored_v2_output_contract_names_exact_path_and_schema(kanban_c
     assert "Write the artifact" in task.body
 
 
+@pytest.mark.parametrize(("kind", "schema", "fragments"), [
+    ("exploration", "shipfactory.exploration/v1", [
+        '"intent_sha256"', '"repo_tree_sha"', '"references"', '"direct_callers"',
+        '"untrusted_directives"', '"unknowns"', '"git_blob_sha"', '"start_line"',
+        '"text_sha256"',
+    ]),
+    ("task-spec", "shipfactory.task-spec/v1", [
+        '"intent_artifact_id"', '"problem"', '"non_goals"', '"requirements"',
+        '"target_files"', '"forbidden_paths"', '"acceptance_cases"',
+        '"rollback_notes"', '"clarifications"', '"behavior"', '"oracle"',
+    ]),
+    ("plan", "shipfactory.plan/v1", [
+        '"task_spec_sha256"', '"nodes"', '"integration_order"',
+        '"shared_file_overlaps"', '"residual_risks"', '"allowed_paths"',
+        '"expected_outputs"', '"test_cases"',
+    ]),
+    ("review-story", "shipfactory.review-story/v1", [
+        '"instance_id"', '"revision_hash"', '"task_spec_sha256"',
+        '"plan_sha256"', '"change_set_sha256"', '"evidence_bundle_sha256"',
+        '"headline"', '"changes"', '"generated_or_mechanical_files"',
+        '"not_changed"', '"residual_risks"', '"evidence_case_ids"',
+    ]),
+])
+def test_worker_output_contract_exposes_complete_schema_template(
+    kanban_conn, kind, schema, fragments,
+):
+    task = _activate_output_task(kanban_conn, {
+        "kind": kind, "schema": schema,
+        "path": f".shipfactory-output/{kind}.json",
+    })
+    assert "Exact JSON template" in task.body
+    assert "Do not add other top-level fields" in task.body
+    for fragment in fragments:
+        assert fragment in task.body
+
+
+def test_unknown_worker_output_schema_fails_activation(kanban_conn):
+    with pytest.raises(ValueError, match="no worker output contract"):
+        _activate_output_task(kanban_conn, {
+            "kind": "mystery", "schema": "shipfactory.mystery/v1",
+            "path": ".shipfactory-output/mystery.json",
+        })
+    assert kanban_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_worker_output_templates_share_every_nested_validator_key_set():
+    from shipfactory.artifact_contracts import (
+        EXPLORATION_EXISTING_REFERENCE_KEYS,
+        EXPLORATION_PROPOSED_REFERENCE_KEYS,
+        PLAN_NODE_KEYS,
+        REVIEW_STORY_CHANGE_KEYS,
+        TASK_SPEC_REQUIREMENT_KEYS,
+        artifact_output_template,
+    )
+
+    exploration = artifact_output_template("shipfactory.exploration/v1")
+    spec = artifact_output_template("shipfactory.task-spec/v1")
+    plan = artifact_output_template("shipfactory.plan/v1")
+    story = artifact_output_template("shipfactory.review-story/v1")
+    assert set(exploration["references"][0]) == EXPLORATION_EXISTING_REFERENCE_KEYS
+    assert set(exploration["references"][1]) == EXPLORATION_PROPOSED_REFERENCE_KEYS
+    assert set(spec["requirements"][0]) == TASK_SPEC_REQUIREMENT_KEYS
+    assert set(plan["nodes"][0]) == PLAN_NODE_KEYS
+    assert set(story["changes"][0]) == REVIEW_STORY_CHANGE_KEYS
+
+
+@pytest.mark.parametrize(("kind", "schema"), [
+    ("exploration", "shipfactory.exploration/v1"),
+    ("task-spec", "shipfactory.task-spec/v1"),
+    ("plan", "shipfactory.plan/v1"),
+    ("review-story", "shipfactory.review-story/v1"),
+])
+def test_unmodified_worker_output_template_is_rejected(kind, schema):
+    from shipfactory.artifact_contracts import artifact_output_template
+    from shipfactory.artifacts import ArtifactValidationError, _validate_document
+
+    with pytest.raises(ArtifactValidationError, match="unresolved Factory output-contract"):
+        _validate_document(artifact_output_template(schema), kind=kind, schema=schema)
+
+
+def test_placeholder_guard_does_not_reject_arbitrary_angle_bracket_text():
+    from shipfactory.artifacts import _validate_document
+
+    document = {
+        "schema": "shipfactory.task-spec/v1",
+        "intent_artifact_id": "0" * 64,
+        "problem": "Render a literal <button> element.",
+        "non_goals": [],
+        "requirements": [],
+        "target_files": [],
+        "forbidden_paths": [],
+        "risk_tags": [],
+        "acceptance_cases": [],
+        "rollback_notes": "Revert the change.",
+        "assumptions": [],
+        "clarifications": [],
+    }
+    assert _validate_document(
+        document, kind="task-spec", schema="shipfactory.task-spec/v1",
+    ) == 1
+
+
+@pytest.mark.parametrize(("kind", "schema", "rules"), [
+    ("exploration", "shipfactory.exploration/v1", [
+        "repo_tree_sha its exact tree", "line range must be valid",
+        "symbol reference id must appear verbatim", "generated tracked path",
+    ]),
+    ("task-spec", "shipfactory.task-spec/v1", [
+        "unique REQ-N", "exact sealed exploration artifact id",
+        "checks its format, not a separate context binding", "rollback_notes are nonempty",
+    ]),
+    ("plan", "shipfactory.plan/v1", [
+        "all task-spec requirements must be covered", "Every test_cases entry",
+        "Every overlap", "control-plane or high-risk", "remaining instance and pool budgets",
+    ]),
+    ("review-story", "shipfactory.review-story/v1", [
+        "exactly match the Factory-opened producer inputs",
+        "may name only ids that exist in the task-spec",
+        "Every task-spec requirement", "at least one existing evidence case id",
+        "Every real changed path must appear exactly once", "retries, skips, or warnings",
+    ]),
+])
+def test_worker_output_contract_exposes_semantic_rejection_rules(
+    kanban_conn, kind, schema, rules,
+):
+    task = _activate_output_task(kanban_conn, {
+        "kind": kind, "schema": schema,
+        "path": f".shipfactory-output/{kind}.json",
+    })
+    for rule in rules:
+        assert rule in task.body
+
+
 def test_factory_generated_change_set_contract_says_worker_must_not_write(kanban_conn):
     task = _activate_output_task(kanban_conn, {
         "kind": "change-set", "schema": "shipfactory.change-set/v1",
