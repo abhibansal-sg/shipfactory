@@ -419,12 +419,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   artifact, and separately tells build workers that `change-set` is
   Factory-generated and must not be written by the model (finding #61,
   dev-pipeline@6 live shakedown).
+- A schema identifier is not a schema contract. Workers cannot infer private
+  required fields or nested shapes from `shipfactory.*` names, so each
+  worker-authored output now includes a complete placeholder JSON template and
+  field rules in the task body. Prompt and validator top-level/nested key sets
+  share one source to prevent documentation drift; semantic seal rules are
+  stated alongside the shape; and exact template placeholders are derived into
+  a recursive validator guard, because prompt wording is not an enforcement
+  boundary. Unsupported worker schemas fail activation instead of eliciting
+  invalid guesswork (finding #62, dev-pipeline@6 live shakedown).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#61 so far). When you fix one: commit message
+- Findings get numbers (#22–#62 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

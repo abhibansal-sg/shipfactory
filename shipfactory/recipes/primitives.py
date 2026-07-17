@@ -193,6 +193,8 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
     if (primitive in {"agent_task", "review_gate"}
             and recipe.get("schema") == "shipfactory.recipe/v2"
             and step_def.get("outputs")):
+        from shipfactory.artifact_contracts import artifact_output_contract
+
         lines = ["\n\n## Factory output contract"]
         for output in step_def["outputs"]:
             kind, schema, path = output["kind"], output["schema"], output["path"]
@@ -206,6 +208,7 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
                     f"- Write the artifact `{kind}` to the exact relative path `{path}`. "
                     f"Its JSON must validate as `{schema}`."
                 )
+                lines.extend(("", artifact_output_contract(schema)))
         lines.append(
             "Create the parent `.shipfactory-output/` directory when needed. "
             "A chat response is not an artifact; the file must exist before you report success."
