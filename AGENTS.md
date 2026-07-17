@@ -437,12 +437,24 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   one physical line immediately before the mandatory `SHIPFACTORY_RESULT`
   line. A review with no valid rework target fails activation instead of
   eliciting unparseable prose (finding #63, dev-pipeline@6 live shakedown).
+- Token pools must close mathematically against the activation caps they claim
+  to permit. Admission charges the configured 50k allowance per agent/review
+  activation, not eventual usage: dev-pipeline@6's happy path required 450k
+  while `max_tokens` was 420k, and its planning happy path required 150k from a
+  120k pool, so it could never reach approval even with no rework. Immutable
+  dev-pipeline@7 makes activation caps the single budget rule: planning 250k,
+  build 150k, review 600k, and global 1,000k exactly cover every declared cap;
+  tests derive these totals from the recipe rather than duplicating a happy-path
+  estimate. Startup re-derives closure for each latest active v2 recipe from the
+  live execution profiles' `token_allowance`, so a later config edit fails
+  closed instead of silently making a published pipeline impossible (finding
+  #64, dev-pipeline@6 live shakedown).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#63 so far). When you fix one: commit message
+- Findings get numbers (#22–#64 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
