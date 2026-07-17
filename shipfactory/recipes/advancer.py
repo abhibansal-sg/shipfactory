@@ -13,7 +13,7 @@ from typing import Any
 from shipfactory import store
 from .instantiate import RecipePolicyError, recipe_for_instance, revision_vector
 from .instantiate import task_key
-from .primitives import activate, parse_verdict
+from .primitives import activate, parse_verdict_for_review
 
 TERMINAL = {"done", "skipped", "cancelled", "failed"}
 KANBAN_TERMINAL = {"done", "archived", "failed", "cancelled"}
@@ -765,7 +765,7 @@ def _rejecting_gate_task(db: Any, conn: Any, instance_id: str, recipe: dict[str,
     from hermes_cli import kanban_db
 
     rows = db.execute(
-        "SELECT kanban_task_id FROM recipe_steps WHERE instance_id=? AND primitive='review_gate' "
+        "SELECT step_id,kanban_task_id FROM recipe_steps WHERE instance_id=? AND primitive='review_gate' "
         "AND state='blocked' AND blocked_reason='changes_requested' AND kanban_task_id IS NOT NULL "
         "ORDER BY updated_at DESC, activation DESC",
         (instance_id,),
@@ -775,7 +775,8 @@ def _rejecting_gate_task(db: Any, conn: Any, instance_id: str, recipe: dict[str,
         if task is None or not task.result:
             continue
         try:
-            verdict = parse_verdict(task.result)
+            definition = next(item for item in recipe["steps"] if item["id"] == row["step_id"])
+            verdict = parse_verdict_for_review(task.result, recipe, definition)
         except ValueError:
             continue
         if verdict["outcome"] != "request_changes":
@@ -1007,7 +1008,9 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         )
                     if step["primitive"] == "review_gate":
                         try:
-                            verdict = parse_verdict(task.result or "")
+                            verdict = parse_verdict_for_review(
+                                task.result or "", recipe, definition,
+                            )
                             if verdict["outcome"] == "approve":
                                 approval_blocker = _review_approval_blocker(
                                     db, instance_id, definition,
@@ -1780,7 +1783,10 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
-    recoverable = {"review_stall", "clarifications_nonempty"}
+    recoverable = {
+        "review_stall", "clarifications_nonempty",
+        "invalid request_changes verdict",
+    }
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
             or step["blocked_reason"] not in recoverable):
         raise ValueError("review step is not parked for operator-recoverable review block")
@@ -1995,26 +2001,34 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _finish_event(db, row, "discarded", "unknown_gate_decision")
                 return
             if row["source"] == "operator_release":
-                recoverable = {"review_stall", "clarifications_nonempty"}
+                if step is None:
+                    _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
+                    return
+                recoverable = {
+                    "review_stall", "clarifications_nonempty",
+                    "invalid request_changes verdict",
+                }
                 if (step["primitive"] != "review_gate" or step["state"] != "blocked"
                         or step["blocked_reason"] not in recoverable):
                     _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return
                 recipe = recipe_for_instance(instance, db=db).document
                 blocked_reason = step["blocked_reason"]
-                if blocked_reason == "review_stall":
+                definition = next(
+                    item for item in recipe["steps"] if item["id"] == step["step_id"]
+                )
+                if blocked_reason in {"review_stall", "invalid request_changes verdict"}:
                     from hermes_cli import kanban_db
                     task = kanban_db.get_task(conn, step["kanban_task_id"])
-                    verdict = parse_verdict(task.result if task else "")
+                    verdict = parse_verdict_for_review(
+                        task.result if task else "", recipe, definition,
+                    )
                     if verdict["outcome"] != "request_changes":
                         raise ValueError("review stall has no rejecting verdict")
                     target = _resolve_target_step(
                         db, instance["id"], recipe, verdict["target_step"],
                     )
                 else:
-                    definition = next(
-                        item for item in recipe["steps"] if item["id"] == step["step_id"]
-                    )
                     producers = [
                         item["from"] for item in definition.get("inputs", [])
                         if item.get("kind") == "task-spec" and item.get("required", False)
