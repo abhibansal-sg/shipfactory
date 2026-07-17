@@ -157,10 +157,30 @@ def _budget_for(db: Any, instance: dict[str, Any]) -> dict[str, Any]:
     return {"charged": charged, "budget": budget, "remaining": max(budget - charged, 0) if budget is not None else None}
 
 
-def _instance_summary(db: Any, instance: dict[str, Any]) -> dict[str, Any]:
+def _instance_summary(
+    db: Any, instance: dict[str, Any],
+    order_cache: dict[tuple[str, int], list[str]] | None = None,
+) -> dict[str, Any]:
     latest = _latest_steps(db, instance["id"])
+    order_key = (instance["recipe_id"], instance["recipe_version"])
+    if order_cache is not None and order_key in order_cache:
+        recipe_order = order_cache[order_key]
+    else:
+        recipe_order = _recipe_step_order_for(db, *order_key)
+        if order_cache is not None:
+            order_cache[order_key] = recipe_order
+    positions = {step_id: index + 1 for index, step_id in enumerate(recipe_order)}
+    fallback_position = len(positions) + 1
+    # Recipe order when the pinned version is readable; the pre-existing
+    # alphabetical order remains the fallback for missing/unparsable rows.
+    latest.sort(
+        key=lambda step: (
+            positions.get(step["step_id"], fallback_position), step["step_id"],
+        )
+    )
     states: dict[str, int] = defaultdict(int)
     for step in latest:
+        step["step_position"] = positions.get(step["step_id"])
         states[step["state"]] += 1
     return {
         **instance,
@@ -441,7 +461,9 @@ def list_instances() -> list[dict[str, Any]]:
     store.init_db()
     with store._connect() as db:
         rows = db.execute("SELECT * FROM recipe_instances ORDER BY updated_at DESC, id DESC").fetchall()
-        return [_instance_summary(db, dict(row)) for row in rows]
+        # Memoized per (recipe_id, recipe_version) within this request only.
+        order_cache: dict[tuple[str, int], list[str]] = {}
+        return [_instance_summary(db, dict(row), order_cache) for row in rows]
 
 
 @router.get("/instances/{instance_id}")
@@ -516,6 +538,93 @@ def get_instance(instance_id: str) -> dict[str, Any]:
             "review_story": story,
         })
         return instance
+
+
+_RECEIPT_FILE_CAP_BYTES = 256 * 1024
+
+
+@router.get("/instances/{instance_id}/receipts")
+def instance_receipts(instance_id: str) -> list[dict[str, Any]]:
+    """Per-attempt harness execution receipts for one instance (Amendment C).
+
+    Raw filesystem paths never enter the payload; callers fetch content by
+    ``run_id`` through the log/prompt endpoints below.
+    """
+    store.init_db()
+    with store._connect() as db:
+        if not db.execute(
+            "SELECT 1 FROM recipe_instances WHERE id=?", (instance_id,)
+        ).fetchone():
+            raise HTTPException(status_code=404, detail="unknown recipe instance")
+        rows = db.execute(
+            """
+            SELECT s.step_id, s.activation, s.kanban_task_id, r.id AS run_id,
+                   r.seat, r.executor, r.provider, r.resolved_model, r.model,
+                   r.started_at, r.ended_at, r.exit_code, r.result,
+                   r.tokens_in, r.tokens_out, r.tokens_total, r.duration_s,
+                   r.log_path, r.prompt_path, r.workspace_path,
+                   r.access_enforcement_level
+            FROM recipe_steps s
+            JOIN runs r ON r.task_id = s.kanban_task_id
+             AND (r.recipe_activation IS NULL OR r.recipe_activation = s.activation)
+            WHERE s.instance_id = ?
+            ORDER BY s.step_id, s.activation, r.id
+            """,
+            (instance_id,),
+        ).fetchall()
+    receipts = []
+    for row in rows:
+        receipt = dict(row)
+        receipt["has_log"] = receipt.pop("log_path") is not None
+        receipt["has_prompt"] = receipt.pop("prompt_path") is not None
+        receipt.pop("workspace_path")
+        receipts.append(receipt)
+    return receipts
+
+
+def _run_file(run_id: int, kind: str) -> dict[str, Any]:
+    """Serve one run's log/prompt tail from the path recorded in the runs row.
+
+    The path comes exclusively from shipfactory.db (never the client), and only
+    runs belonging to a recipe step activation are served.
+    """
+    store.init_db()
+    row = store.run_row(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown run")
+    with store._connect() as db:
+        step = db.execute(
+            "SELECT 1 FROM recipe_steps WHERE kanban_task_id=?", (row["task_id"],)
+        ).fetchone()
+    if step is None:
+        raise HTTPException(status_code=404, detail="run is not a recipe step execution")
+    path = row.get("log_path" if kind == "log" else "prompt_path")
+    if not path:
+        raise HTTPException(status_code=404, detail=f"run has no recorded {kind}")
+    try:
+        size = Path(path).stat().st_size
+        with Path(path).open("rb") as handle:
+            if size > _RECEIPT_FILE_CAP_BYTES:
+                handle.seek(size - _RECEIPT_FILE_CAP_BYTES)
+            data = handle.read(_RECEIPT_FILE_CAP_BYTES)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"run {kind} file is unavailable") from exc
+    return {
+        "run_id": int(run_id),
+        "kind": kind,
+        "content": data.decode("utf-8", errors="replace"),
+        "truncated": size > _RECEIPT_FILE_CAP_BYTES,
+    }
+
+
+@router.get("/runs/{run_id}/log")
+def run_log(run_id: int) -> dict[str, Any]:
+    return _run_file(run_id, "log")
+
+
+@router.get("/runs/{run_id}/prompt")
+def run_prompt(run_id: int) -> dict[str, Any]:
+    return _run_file(run_id, "prompt")
 
 
 @router.get("/waiting")

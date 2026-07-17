@@ -997,6 +997,104 @@ steps:
     assert _step("revision", "build", 1)["output_revision"] != _step("revision", "build", 2)["output_revision"]
 
 
+def test_request_changes_persists_verdict_and_rework_provenance(tmp_path, kanban_conn):
+    """Amendment A: rework causality is durable in shipfactory.db.
+
+    RED control: before migration 15 the ``verdict_json``/``rejected_by_*``
+    columns did not exist, so the rejecting verdict lived only in Hermes
+    ``task.result`` and the gate->new-activation edge was only re-derivable by
+    re-reading and re-parsing the kanban task.
+    """
+    from hermes_cli import kanban_db
+
+    recipe = _recipe(
+        tmp_path,
+        """schema: shipfactory.recipe/v1
+id: provenance
+version: 1
+status: active
+description: rework provenance test
+intent_tags: [test]
+supersedes: null
+parameters: {}
+budgets: {max_activations: 10, max_step_activations: 3, max_tokens: 500000}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    params: {seat: dev-backend, instructions: build, execution_profile: standard, workspace: worktree}
+  - id: qa
+    primitive: review_gate
+    title: QA
+    needs: [build]
+    optional: false
+    params: {seat: verifier, instructions: qa, execution_profile: standard, workspace: worktree}
+  - id: review
+    primitive: review_gate
+    title: Final review
+    needs: [qa]
+    optional: false
+    params: {seat: verifier, instructions: review, execution_profile: standard, workspace: worktree}
+""",
+        "provenance@1",
+    )
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="provenance")
+    reconcile(kanban_conn, "provenance", profiles=PROFILES)
+    assert kanban_db.complete_task(
+        kanban_conn, _step("provenance", "build", 1)["kanban_task_id"], result="built",
+    )
+    reconcile(kanban_conn, "provenance", profiles=PROFILES)
+    _complete_review(
+        kanban_db, kanban_conn, _step("provenance", "qa", 1)["kanban_task_id"],
+        outcome="approve",
+    )
+    reconcile(kanban_conn, "provenance", profiles=PROFILES)
+    rejecting = "SHIPFACTORY_VERDICT: " + json.dumps({
+        "outcome": "request_changes", "target_step": "build",
+        "body": "BLOCKER factory/recipes/advancer.py:84 - build breaks the gate",
+    }, separators=(",", ":"))
+    assert kanban_db.complete_task(
+        kanban_conn, _step("provenance", "review", 1)["kanban_task_id"],
+        result=rejecting, summary="reviewed",
+    )
+    reconcile(kanban_conn, "provenance", profiles=PROFILES)
+
+    # Approve outcomes persist their verdict too: the audit is complete.
+    qa1 = _step("provenance", "qa", 1)
+    assert json.loads(qa1["verdict_json"])["outcome"] == "approve"
+    assert qa1["rejected_by_step_id"] is None and qa1["rejected_by_activation"] is None
+    review1 = _step("provenance", "review", 1)
+    verdict = json.loads(review1["verdict_json"])
+    assert verdict["outcome"] == "request_changes"
+    assert verdict["target_step"] == "build"
+    assert review1["finding_count"] == 1
+    # First activations were never sent to rework by anyone.
+    assert _step("provenance", "build", 1)["rejected_by_step_id"] is None
+    # Every cone activation records the rejecting gate attempt durably.
+    for step_id in ("build", "qa", "review"):
+        rework = _step("provenance", step_id, 2)
+        assert rework["rejected_by_step_id"] == "review"
+        assert rework["rejected_by_activation"] == 1
+        assert rework["verdict_json"] is None
+
+    # _fresh_activation heals a lost board task without inventing provenance:
+    # its ``source`` string already records why, so the columns stay NULL.
+    build2 = _step("provenance", "build", 2)
+    assert build2["state"] == "running"
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET kanban_task_id='t_missing_provenance' "
+            "WHERE instance_id='provenance' AND step_id='build' AND activation=2",
+        )
+    reconcile(kanban_conn, "provenance", profiles=PROFILES)
+    healed = _step("provenance", "build", 3)
+    assert healed["rejected_by_step_id"] is None
+    assert healed["rejected_by_activation"] is None
+    assert healed["verdict_json"] is None
+
+
 def test_budget_fuse_charges_worked_example_without_refunds(tmp_path, kanban_conn):
     """§17.8 round-3 example: six admissions consume 300k; the seventh refuses."""
     from hermes_cli import kanban_db

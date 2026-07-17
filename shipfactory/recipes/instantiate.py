@@ -62,10 +62,19 @@ def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, 
     base_sha = _base_sha(base_sha)
     instance_id = instance_id or str(uuid.uuid4())
     collector_key = f"recipe/{instance_id}/{recipe.hash}/collector"
-    collector = kanban_db.create_blocked_task(conn, title=f"Recipe collector {recipe.key}", body="Inert Factory completion collector.", parents=parent_tasks or (), idempotency_key=collector_key, board=board, block_kind="needs_input", reason="recipe_collector")
+    # The collector is the logical journey card's stock-kanban anchor
+    # (Amendment A/B): give it a recognizable human title and a body naming
+    # the overlay identity, while keeping the idempotency key unchanged.
+    human_title = str(bound.get("title") or "").strip() or str(recipe.document["description"]).strip()
+    collector_title = f"Journey: {human_title} ({recipe.key})"
+    collector_body = (
+        "Inert Factory completion collector for one logical journey card.\n"
+        f"instance_id: {instance_id}\nrecipe: {recipe.key}\nbase_sha: {base_sha}"
+    )
+    collector = kanban_db.create_blocked_task(conn, title=collector_title, body=collector_body, parents=parent_tasks or (), idempotency_key=collector_key, board=board, block_kind="needs_input", reason="recipe_collector")
     now = store._now(); skips = set(skip_steps or [])
     with store._connect() as db:
-        db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,base_sha,updated_base_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), base_sha, now, now, now))
+        db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,parent_tasks_json,base_sha,updated_base_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), json.dumps(sorted(parent_tasks or [])), base_sha, now, now, now))
         for step in recipe.document["steps"]:
             state = "skipped" if step["id"] in skips else "pending"
             db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance_id, step["id"], 1, step["primitive"], state, now, now))

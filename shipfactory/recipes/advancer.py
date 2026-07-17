@@ -828,7 +828,7 @@ def _rejecting_gate_task(db: Any, conn: Any, instance_id: str, recipe: dict[str,
     return None
 
 
-def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str) -> None:
+def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str, *, rejecting_activation: int | None = None) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
     if target not in defs or defs[target]["primitive"] != "agent_task":
@@ -894,12 +894,21 @@ def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], 
             & {node for node in defs
                if node == rejecting_step or node in upstream(rejecting_step)}
         )
+    # Rework provenance (Amendment A): every new activation records which
+    # gate attempt sent it to rework, so the folded card renders the causal
+    # edge from shipfactory.db alone.
+    if rejecting_activation is None:
+        gate_row = db.execute(
+            "SELECT MAX(activation) AS activation FROM recipe_steps WHERE instance_id=? AND step_id=?",
+            (instance["id"], rejecting_step),
+        ).fetchone()
+        rejecting_activation = int(gate_row["activation"]) if gate_row and gate_row["activation"] is not None else None
     now = store._now()
     for node in sorted(cone):
         current = db.execute("SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1", (instance["id"], node)).fetchone()
         if not current: continue
         activation = int(current["activation"]) + 1
-        db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance["id"], node, activation, defs[node]["primitive"], "pending", now, now))
+        db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,rejected_by_step_id,rejected_by_activation,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (instance["id"], node, activation, defs[node]["primitive"], "pending", rejecting_step, rejecting_activation, now, now))
 
 
 def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, Any],
@@ -1053,6 +1062,16 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                             verdict = parse_verdict_for_review(
                                 task.result or "", recipe, definition,
                             )
+                            # Rework provenance (Amendment A): persist the
+                            # parsed verdict on the gate's attempt row so the
+                            # folded card can render it after board archival,
+                            # without re-reading kanban task.result.
+                            db.execute(
+                                "UPDATE recipe_steps SET verdict_json=?,updated_at=? "
+                                "WHERE instance_id=? AND step_id=? AND activation=?",
+                                (json.dumps(verdict, sort_keys=True), store._now(),
+                                 instance_id, step["step_id"], step["activation"]),
+                            )
                             if verdict["outcome"] == "approve":
                                 approval_blocker = _review_approval_blocker(
                                     db, instance_id, definition,
@@ -1100,6 +1119,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                                     db, instance, recipe,
                                     _resolve_target_step(db, instance_id, recipe, verdict["target_step"]),
                                     step["step_id"], f"kanban:{task.id}",
+                                    rejecting_activation=int(step["activation"]),
                                 )
                                 changed |= _transition(db, instance, step, "blocked", f"kanban:{task.id}", reason="changes_requested")
                                 continue
@@ -2098,6 +2118,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 _invalidate_cone(
                     db, instance, recipe, target,
                     step["step_id"], f"operator_release:{row['key']}",
+                    rejecting_activation=int(step["activation"]),
                 )
                 _transition(
                     db, instance, dict(step), "blocked", f"operator_release:{row['key']}",

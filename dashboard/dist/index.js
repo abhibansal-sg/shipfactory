@@ -987,7 +987,342 @@
     );
   }
 
+  // Journey view — Amendment 1 items A/B/G4. ONE logical card per recipe
+  // instance: steps fold inside in recipe order, attempts stack under each
+  // step as immutable history, and a rejected review visibly returns work to
+  // the same logical card with the rejecting verdict attached.
+
+  var JOURNEY_CURRENT_STATES = ["ready", "running", "waiting", "blocked"];
+
+  function parseJsonArray(raw) {
+    if (!raw) return [];
+    try {
+      var parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_ignore) { return []; }
+  }
+
+  function parseVerdict(raw) {
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    } catch (_ignore) { return null; }
+  }
+
+  function findingText(finding) {
+    if (typeof finding === "string") return finding;
+    if (!finding || typeof finding !== "object") return "";
+    return String(finding.title || finding.summary || finding.issue || finding.message || finding.body || finding.id || "");
+  }
+
+  // The rework annotation for a PRIOR attempt is carried by the NEXT attempt
+  // row (rejected_by_step_id / rejected_by_activation / verdict_json describe
+  // why that rework attempt exists). Tolerate null or malformed verdict_json
+  // by falling back to the recorded finding_count alone.
+  function reworkAnnotation(prior, next) {
+    if (!next || !next.rejected_by_step_id) return null;
+    var verdict = parseVerdict(next.verdict_json) || parseVerdict(prior && prior.verdict_json);
+    var findings = verdict && Array.isArray(verdict.findings) ? verdict.findings : null;
+    var count = findings ? findings.length
+      : prior && prior.finding_count != null ? Number(prior.finding_count)
+      : next.finding_count != null ? Number(next.finding_count)
+      : null;
+    return {
+      gate: String(next.rejected_by_step_id),
+      gateActivation: next.rejected_by_activation,
+      count: count,
+      findings: findings || [],
+    };
+  }
+
+  function reworkHeadline(rework) {
+    var text = "Rework ordered by " + rework.gate;
+    if (rework.gateActivation != null) text += " (attempt " + rework.gateActivation + ")";
+    if (rework.count != null) text += " — " + rework.count + (Number(rework.count) === 1 ? " finding" : " findings");
+    return text;
+  }
+
+  function receiptsForAttempt(receipts, stepId, activation) {
+    if (!Array.isArray(receipts)) return [];
+    return receipts.filter(function (row) {
+      return row.step_id === stepId && Number(row.activation) === Number(activation);
+    });
+  }
+
+  function RunContentBlock(props) {
+    var block = props.block;
+    if (!block || !block.open) return null;
+    return h("div", { className: "factory-journey-run" },
+      h("div", { className: "flex flex-wrap items-center gap-2 text-xs text-text-tertiary" },
+        h(MonoChip, { title: "Run artifact" }, props.kind + " · " + props.runId),
+        block.truncated ? h(Badge, { className: "factory-pill text-xs", tone: "warning", title: "The API truncated this content" }, "truncated") : null
+      ),
+      block.loading ? h(Spinner, { label: "Loading " + props.kind + "…" }) :
+      block.error ? h("p", { className: "text-xs text-destructive" }, block.error) :
+      h("pre", { className: "factory-journey-run-content font-mono-ui text-xs text-text-secondary" }, block.content || "(empty)")
+    );
+  }
+
+  function ReceiptLine(props) {
+    var receipt = props.receipt;
+    var lane = (receipt.executor || "executor?") + (receipt.provider ? "/" + receipt.provider : "");
+    var logBlock = props.runBlocks[receipt.run_id + ":log"];
+    var promptBlock = props.runBlocks[receipt.run_id + ":prompt"];
+    return h("div", { className: "factory-journey-receipt" },
+      h("div", { className: "flex flex-wrap items-center gap-2 text-xs" },
+        h(MonoChip, { title: "Seat" }, receipt.seat || "unassigned"),
+        h(MonoChip, { title: "Executor and provider lane" }, lane),
+        h(MonoChip, { title: "Resolved model" }, receipt.resolved_model || receipt.model || "model unknown"),
+        h("span", { className: "font-mono-ui tabular-nums text-text-secondary", title: "Total tokens" }, formatNumber(receipt.tokens_total) + " tok"),
+        receipt.duration_s != null ? h("span", { className: "font-mono-ui tabular-nums text-text-secondary", title: "Run duration" }, formatDuration(receipt.duration_s)) : null,
+        receipt.exit_code != null
+          ? h(StatePill, { value: Number(receipt.exit_code) === 0 ? "done" : "failed", title: "Exit code" }, "exit " + receipt.exit_code)
+          : receipt.result ? h(StatePill, { value: receipt.result }) : null,
+        receipt.run_id && receipt.has_log ? h(Button, {
+          type: "button", size: "xs", ghost: true,
+          "aria-expanded": !!(logBlock && logBlock.open),
+          onClick: function () { props.onToggleRun(receipt.run_id, "log"); },
+        }, "log") : null,
+        receipt.run_id && receipt.has_prompt ? h(Button, {
+          type: "button", size: "xs", ghost: true,
+          "aria-expanded": !!(promptBlock && promptBlock.open),
+          onClick: function () { props.onToggleRun(receipt.run_id, "prompt"); },
+        }, "prompt") : null
+      ),
+      h(RunContentBlock, { runId: receipt.run_id, kind: "log", block: logBlock }),
+      h(RunContentBlock, { runId: receipt.run_id, kind: "prompt", block: promptBlock })
+    );
+  }
+
+  function JourneyAttempt(props) {
+    var attempt = props.attempt;
+    var rework = props.rework;
+    return h("li", {
+      className: "factory-journey-attempt " + (props.latest ? "factory-journey-attempt--current" : "factory-journey-attempt--history"),
+      "aria-label": "Attempt " + attempt.activation + (props.latest ? " (current)" : " (history)"),
+    },
+      h("div", { className: "flex flex-wrap items-center gap-2 text-xs" },
+        h("strong", { className: "font-mono-ui text-foreground" }, "attempt " + attempt.activation),
+        h(StatePill, { value: attempt.state }),
+        props.latest
+          ? h(Badge, { className: "factory-pill text-xs", tone: "secondary", title: "The live attempt for this step" }, "current")
+          : h("span", { className: "text-text-tertiary" }, "history"),
+        attempt.kanban_task_id
+          ? h("a", { href: "/kanban?task=" + encodeURIComponent(attempt.kanban_task_id), className: "font-mono-ui text-xs text-primary hover:underline" }, attempt.kanban_task_id)
+          : null,
+        attempt.updated_at || attempt.created_at ? h(Ago, { value: attempt.updated_at || attempt.created_at }) : null
+      ),
+      attempt.blocked_reason ? h("p", { className: "text-xs leading-relaxed text-destructive" }, attempt.blocked_reason) : null,
+      rework ? h("div", { className: "factory-journey-verdict border border-destructive/30 bg-destructive/10" },
+        h("strong", { className: "text-xs font-medium text-destructive" }, reworkHeadline(rework)),
+        rework.findings.length ? h("ul", { className: "mt-1 grid gap-1 text-xs text-text-secondary" },
+          rework.findings.slice(0, 4).map(function (finding, index) {
+            return h("li", { key: index }, findingText(finding) || "finding " + (index + 1));
+          }),
+          rework.findings.length > 4 ? h("li", { className: "text-text-tertiary" }, "… " + (rework.findings.length - 4) + " more") : null
+        ) : null
+      ) : null,
+      props.receipts.map(function (receipt, index) {
+        return h(ReceiptLine, { key: (receipt.run_id || "receipt") + ":" + index, receipt: receipt, runBlocks: props.runBlocks, onToggleRun: props.onToggleRun });
+      })
+    );
+  }
+
+  function JourneyAttemptStack(props) {
+    if (props.loading) return h("div", { className: "factory-journey-attempts-shell" }, h(Spinner, { label: "Loading attempt history…" }));
+    if (props.error) return h("div", { className: "factory-journey-attempts-shell" },
+      h(ErrorState, { title: "Attempt history could not be loaded", message: props.error, onRetry: props.onRetry })
+    );
+    var detail = props.detail;
+    var attempts = (detail && detail.activations && detail.activations[props.stepId]) || [];
+    if (!attempts.length && detail && Array.isArray(detail.steps)) {
+      attempts = detail.steps.filter(function (row) { return row.step_id === props.stepId; });
+    }
+    attempts = attempts.slice().sort(function (a, b) { return Number(a.activation) - Number(b.activation); });
+    if (!attempts.length) return h("p", { className: "factory-journey-attempts-shell text-xs text-text-tertiary" }, "No activations recorded for this step yet.");
+    return h("ol", { className: "factory-journey-attempts", "aria-label": "Attempt history, oldest first" }, attempts.map(function (attempt, index) {
+      return h(JourneyAttempt, {
+        key: props.stepId + ":" + attempt.activation,
+        attempt: attempt,
+        latest: index === attempts.length - 1,
+        rework: reworkAnnotation(attempt, attempts[index + 1] || null),
+        receipts: receiptsForAttempt(props.receipts, props.stepId, attempt.activation),
+        runBlocks: props.runBlocks,
+        onToggleRun: props.onToggleRun,
+      });
+    }));
+  }
+
+  function JourneyStepRow(props) {
+    var step = props.step;
+    return h("li", { className: "factory-journey-step" + (props.current ? " factory-journey-step--current" : "") },
+      h("button", {
+        type: "button",
+        className: "factory-journey-step-row flex w-full flex-wrap items-center gap-2 text-left text-sm",
+        "aria-expanded": props.expanded,
+        onClick: function () { props.onToggle(step.step_id); },
+      },
+        h("span", { className: "factory-journey-marker", "aria-hidden": "true" }),
+        h("strong", { className: "font-medium text-foreground" }, step.step_id),
+        h(StatePill, { value: step.state }),
+        Number(step.activation) > 1 ? h(Badge, {
+          className: "factory-pill text-xs tabular-nums", tone: "secondary",
+          title: "This step re-activated; earlier attempts are kept as immutable history.",
+        }, "attempt " + step.activation) : null,
+        step.rejected_by_step_id && step.rejected_by_step_id !== step.step_id ? h(MonoChip, { title: "Latest attempt is rework ordered by " + step.rejected_by_step_id }, "rework ← " + step.rejected_by_step_id) : null,
+        h("span", { className: "ml-auto shrink-0 text-xs text-text-tertiary" }, props.expanded ? "Fold attempts" : "Attempts")
+      ),
+      step.blocked_reason ? h("p", { className: "mt-1 text-xs leading-relaxed text-destructive" }, step.blocked_reason) : null,
+      props.expanded ? props.children : null
+    );
+  }
+
+  function JourneyCard(props) {
+    var instance = props.instance;
+    var _a = useState(null), expandedStep = _a[0], setExpandedStep = _a[1];
+    var _b = useState(null), detail = _b[0], setDetail = _b[1];
+    var _c = useState(false), detailLoading = _c[0], setDetailLoading = _c[1];
+    var _d = useState(""), detailError = _d[0], setDetailError = _d[1];
+    var _e = useState(null), receipts = _e[0], setReceipts = _e[1];
+    var _f = useState({}), runBlocks = _f[0], setRunBlocks = _f[1];
+
+    var steps = (instance.latest_steps || []).slice().sort(function (a, b) {
+      var left = a.step_position == null ? Number.MAX_SAFE_INTEGER : Number(a.step_position);
+      var right = b.step_position == null ? Number.MAX_SAFE_INTEGER : Number(b.step_position);
+      return left - right;
+    });
+    var currentStepId = null;
+    steps.some(function (step) {
+      if (JOURNEY_CURRENT_STATES.indexOf(normalizedState(step.state)) >= 0) { currentStepId = step.step_id; return true; }
+      return false;
+    });
+    var parents = parseJsonArray(instance.parent_tasks_json);
+
+    // Mirrors InstancesView.loadDetail; receipts errors stay quiet so legacy
+    // rows without receipt history render nothing noisy.
+    function loadDetail() {
+      setDetailLoading(true);
+      setDetailError("");
+      request("/instances/" + encodeURIComponent(instance.id)).then(setDetail).catch(function (err) {
+        setDetailError(errorText(err));
+      }).finally(function () { setDetailLoading(false); });
+      request("/instances/" + encodeURIComponent(instance.id) + "/receipts").then(function (rows) {
+        setReceipts(Array.isArray(rows) ? rows : []);
+      }).catch(function () { setReceipts([]); });
+    }
+
+    function toggleStep(stepId) {
+      if (expandedStep === stepId) { setExpandedStep(null); return; }
+      setExpandedStep(stepId);
+      if (detail === null && !detailLoading) loadDetail();
+    }
+
+    function toggleRun(runId, kind) {
+      var key = runId + ":" + kind;
+      var existing = runBlocks[key];
+      function put(block) {
+        setRunBlocks(function (current) {
+          var next = Object.assign({}, current);
+          next[key] = block;
+          return next;
+        });
+      }
+      if (existing && existing.open) { put(Object.assign({}, existing, { open: false })); return; }
+      if (existing && existing.content != null) { put(Object.assign({}, existing, { open: true })); return; }
+      put({ open: true, loading: true, error: "", content: null, truncated: false });
+      request("/runs/" + encodeURIComponent(runId) + "/" + kind).then(function (payload) {
+        put({
+          open: true, loading: false, error: "",
+          content: payload && payload.content != null ? String(payload.content) : "",
+          truncated: !!(payload && payload.truncated),
+        });
+      }).catch(function (err) {
+        put({ open: true, loading: false, error: errorText(err), content: null, truncated: false });
+      });
+    }
+
+    return h(Card, { className: "factory-journey-card" },
+      h(CardContent, { className: "flex flex-col gap-3 p-4" },
+        h("div", { className: "flex flex-wrap items-start justify-between gap-3" },
+          h("div", { className: "min-w-0" },
+            h("span", { className: "font-mondwest text-display text-xs tracking-[0.12em] text-text-tertiary" }, instance.board),
+            h("h3", { className: "mt-1 font-mono-ui text-sm font-medium text-foreground" }, instance.recipe || (instance.recipe_id + "@" + instance.recipe_version)),
+            h("div", { className: "mt-2 flex flex-wrap items-center gap-2" },
+              h(MonoChip, { title: "Instance" }, instance.id),
+              instance.collector_task_id ? h("a", {
+                href: "/kanban?task=" + encodeURIComponent(instance.collector_task_id),
+                className: "max-w-full truncate font-mono-ui text-xs text-primary hover:underline",
+                title: "Collector task — this journey's logical card",
+              }, instance.collector_task_id) : null,
+              parents.map(function (parent, index) {
+                var id = typeof parent === "string" ? parent : parent && (parent.task_id || parent.id);
+                if (!id) return null;
+                return h(MonoChip, { key: id + ":" + index, title: "Parent task (containment overlay)" }, "parent " + id);
+              })
+            )
+          ),
+          h("div", { className: "ml-auto flex shrink-0 flex-col items-end gap-2" },
+            h("div", { className: "flex items-center gap-2" },
+              h(StatePill, { value: instance.status }),
+              h(Ago, { value: instance.updated_at })
+            ),
+            steps.length ? h(Button, {
+              type: "button", size: "xs", ghost: true,
+              onClick: function () { toggleStep(expandedStep || currentStepId || steps[0].step_id); },
+            }, expandedStep ? "Fold" : "Unfold") : null
+          )
+        ),
+        instance.blocked_reason ? h("p", { className: "border border-destructive/30 bg-destructive/10 p-3 text-xs leading-relaxed text-destructive" }, instance.blocked_reason) : null,
+        h(BudgetProgress, { tokens: instance.tokens }),
+        steps.length === 0 ? h("p", { className: "text-xs text-text-tertiary" }, "No step activations yet.") :
+        h("ol", { className: "factory-journey-steps", "aria-label": "Journey steps in recipe order" }, steps.map(function (step) {
+          return h(JourneyStepRow, {
+            key: step.step_id,
+            step: step,
+            current: step.step_id === currentStepId,
+            expanded: expandedStep === step.step_id,
+            onToggle: toggleStep,
+          }, h(JourneyAttemptStack, {
+            stepId: step.step_id,
+            loading: detailLoading,
+            error: detailError,
+            detail: detail,
+            receipts: receipts,
+            runBlocks: runBlocks,
+            onToggleRun: toggleRun,
+            onRetry: loadDetail,
+          }));
+        })),
+        props.children || null
+      )
+    );
+  }
+
+  function JourneyView(props) {
+    var resource = usePollingResource("/instances", props.refreshKey);
+    var journeys = resource.data || [];
+    useReportViewMeta(props, resource, journeys.map(function (item) { return item.board; }));
+    return h("section", { className: "factory-view flex min-w-0 flex-col gap-4" },
+      h(ViewHeading, {
+        title: "Journeys",
+        description: "One logical card per recipe instance; attempts fold inside as immutable history.",
+        action: h("a", { href: "/kanban", className: "font-mondwest text-display text-xs tracking-[0.1em] text-text-secondary hover:text-midground" }, "Open Kanban →"),
+      }),
+      resource.error && resource.data !== null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) : null,
+      resource.loading && resource.data === null ? h(LoadingState, { label: "Loading journeys…" }) :
+      resource.error && resource.data === null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) :
+      journeys.length === 0 ? h(EmptyState, {
+        title: "No journeys yet",
+        description: "A journey card appears when a task is matched to an active recipe.",
+      }) : h("div", { className: "factory-journey-grid" }, journeys.map(function (item) {
+        return h(JourneyCard, { key: item.id, instance: item });
+      }))
+    );
+  }
+
   var VIEW_REGISTRY = [
+    { id: "journey", label: "Journeys", component: JourneyView },
     { id: "waiting", label: "Waiting gates", component: WaitingView },
     { id: "instances", label: "Instances", component: InstancesView },
     { id: "seats", label: "Seats", component: SeatsView },
@@ -1052,7 +1387,7 @@
   }
 
   function FactoryPage() {
-    var _a = useState("waiting"), activeId = _a[0], setActiveId = _a[1];
+    var _a = useState(VIEW_REGISTRY[0].id), activeId = _a[0], setActiveId = _a[1];
     var _b = useState(0), refreshKey = _b[0], setRefreshKey = _b[1];
     var _c = useState({ board: "All boards", loadedAt: null }), meta = _c[0], setMeta = _c[1];
     var statusResource = usePollingResource("/status", refreshKey);

@@ -483,11 +483,26 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   blocking an otherwise valid build before the Factory commit is journaled
   (finding #69, v8 live build finalization).
 
+- A rename must chase every registration surface: the Headframe -> ShipFactory
+  rename updated manifest.json and the API prefix but left the dashboard
+  bundle registering the tab under the old name, so the operator trust
+  surface rendered NO_REGISTER for three days while 17 PRs shipped. Names
+  that must agree across files need a drift-guard test, not discipline
+  (finding #70, SF-17 lane 1, PR #21).
+- Sealed context must be verified at the consumer, not the producer: Hermes
+  caps worker-context task bodies at 8KB, silently truncating Factory-inlined
+  sealed review inputs while the body-binding check passed against the
+  untruncated DB row. Reviewers judged inputs they never saw. Fixed by
+  re-delivering the full body in the prompt (codex/claude) and refusing to
+  spawn hermes-executor seats on over-cap bodies — the delegated hermes
+  worker's capped context is unreachable from the plugin (finding #71,
+  SF-17 lane 3, PR #23).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#69 so far). When you fix one: commit message
+- Findings get numbers (#22–#71 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

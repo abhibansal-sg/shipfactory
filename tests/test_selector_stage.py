@@ -318,3 +318,24 @@ def test_selector_stage_enforces_max_per_tick(
     assert result == {"leased": 3, "instantiated": 3, "parked": 0, "skipped": 0}
     assert len(fake_aux.calls) == 3
     assert len(kanban_db.list_tasks(kanban_conn, status="triage")) == 1
+
+
+def test_selector_stage_records_parent_collectors_in_overlay(
+    kanban_conn, stage_config, fake_aux,
+):
+    """Amendment B: the DAG edge is durable in shipfactory.db, not only task_links."""
+    _source(kanban_conn)
+    fake_aux.queue(_selection(
+        _node("build"),
+        _node("operate", chosen=None, needs=["build"]),
+    ))
+    assert selector_stage.run_stage(kanban_conn, "test")["instantiated"] == 2
+    with store._connect() as db:
+        instances = {
+            row["recipe_id"]: dict(row)
+            for row in db.execute("SELECT * FROM recipe_instances").fetchall()
+        }
+    parent = instances["dev-pipeline"]
+    child = instances["bare-task-default"]
+    assert json.loads(parent["parent_tasks_json"]) == []
+    assert json.loads(child["parent_tasks_json"]) == [parent["collector_task_id"]]
