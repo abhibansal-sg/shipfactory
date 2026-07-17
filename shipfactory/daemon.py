@@ -435,9 +435,13 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
         _lock_held: bool = False) -> dict[str, Any] | None:
     """Run one tick loop across one or more isolated board connections.
 
-    A traditional single-board caller continues to pass its connection in
-    ``conn``.  Multi-board callers may pass a board-to-connection mapping, or
-    ``None`` to let the daemon own and reconnect each board connection.
+    Connection ownership contract (stale-WAL hygiene, Amendment G2):
+    connections passed by the caller (bare or mapping) are borrowed and never
+    closed. Any connection the daemon opens itself lives for exactly one tick
+    and is closed before the next sleep — a long-lived cached handle keeps a
+    dead inode after board heal/REINDEX/file swap and reads a frozen WAL
+    snapshot forever, while reopening by path re-reads the wal-index header
+    every tick.
     """
     from shipfactory import store
     board_names = _served_boards(board, boards)
@@ -449,7 +453,6 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
                 require_recipes=require_recipes, _lock_held=True,
             )
     first_board = board_names[0]
-    owns_connections = conn is None
     if isinstance(conn, Mapping):
         connections = dict(conn)
     elif conn is None:
@@ -473,11 +476,11 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
             results: dict[str, Any] = {}
             for board_name in board_names:
                 board_conn = connections.get(board_name)
+                fresh_conn = None
                 if board_conn is None:
                     try:
                         from hermes_cli import kanban_db
-                        board_conn = kanban_db.connect(board=board_name)
-                        connections[board_name] = board_conn
+                        fresh_conn = board_conn = kanban_db.connect(board=board_name)
                     except Exception as exc:
                         _record_board_tick_failure(board_name, exc)
                         results[board_name] = {"error": str(exc)}
@@ -493,30 +496,24 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
                 except Exception as exc:
                     _record_board_tick_failure(board_name, exc)
                     results[board_name] = {"error": str(exc)}
-                    if owns_connections:
+                finally:
+                    if fresh_conn is not None:
                         try:
-                            board_conn.close()
+                            fresh_conn.close()
                         except Exception:
                             logger.exception(
-                                "Factory could not close failed board connection for %s",
+                                "Factory could not close board connection for %s",
                                 board_name,
                             )
-                        connections.pop(board_name, None)
             if do_sync:
                 last_sync = now
             if once:
                 return results[first_board] if len(board_names) == 1 else {"boards": results}
             time.sleep(max(0.01, interval))
     finally:
-        try:
-            store.record_daemon_end(run_id)
-        finally:
-            if owns_connections:
-                for board_conn in connections.values():
-                    try:
-                        board_conn.close()
-                    except Exception:
-                        logger.exception("Factory could not close a board connection")
+        # Borrowed connections stay open for their caller; daemon-opened
+        # connections were already closed at the end of their single tick.
+        store.record_daemon_end(run_id)
 
 
 __all__ = ["daemon_lock", "tick", "run", "validate_recipe_mode"]

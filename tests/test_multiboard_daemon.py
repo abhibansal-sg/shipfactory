@@ -158,17 +158,16 @@ def test_poisoned_board_is_telemetry_logged_while_other_board_advances(
         board_b.close()
 
 
-def test_single_board_cli_keeps_original_connection_and_result_shape(monkeypatch):
+def test_single_board_cli_delegates_connections_and_keeps_result_shape(monkeypatch):
+    """The CLI must not pre-open a long-lived board connection: the production
+    single-board daemon previously ran its whole life on one cached handle,
+    which is the stale-WAL defect. conn=None hands connection lifecycle to the
+    daemon (fresh per tick) while the bare single-board result shape stays."""
     calls = []
 
-    class Connection:
-        def close(self):
-            calls.append(("close",))
-
-    connection = Connection()
     monkeypatch.setattr(
         "hermes_cli.kanban_db.connect",
-        lambda *, board=None: calls.append(("connect", board)) or connection,
+        lambda *, board=None: calls.append(("connect", board)),
     )
     monkeypatch.setattr(
         daemon,
@@ -181,11 +180,10 @@ def test_single_board_cli_keeps_original_connection_and_result_shape(monkeypatch
     ))
 
     assert result == {"ok": True}
-    assert calls[0] == ("connect", "solo")
-    assert calls[1][0:2] == ("run", connection)
-    assert calls[1][2]["board"] == "solo"
-    assert "boards" not in calls[1][2]
-    assert calls[2] == ("close",)
+    assert calls == [("run", None, {
+        "board": "solo", "interval": 5.0, "once": True, "sync": False,
+        "sync_interval": None, "require_recipes": False, "_lock_held": True,
+    })]
 
 
 def test_cli_accepts_comma_list_and_repeatable_board(monkeypatch):
@@ -203,3 +201,80 @@ def test_cli_accepts_comma_list_and_repeatable_board(monkeypatch):
 
     assert calls[0][0] is None
     assert calls[0][1]["boards"] == ["board-c", "board-a", "board-b"]
+
+
+class _Stop(Exception):
+    """Sentinel to break the daemon loop after a fixed number of ticks."""
+
+
+def test_daemon_opens_a_fresh_connection_per_tick_and_closes_it(monkeypatch):
+    """Stale-WAL hygiene (Amendment G2): a daemon-opened board connection lives
+    for exactly one tick. A cached long-lived connection keeps a dead inode after
+    board heal/REINDEX/file swap and reads a frozen snapshot forever."""
+    opened = []
+    ticked = []
+
+    class StubConnection:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    def _connect(*, board=None):
+        conn = StubConnection()
+        opened.append(conn)
+        return conn
+
+    sleeps = []
+
+    def _sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 3:
+            raise _Stop
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", _connect)
+    monkeypatch.setattr(
+        daemon, "tick", lambda conn, **kwargs: ticked.append(conn) or {"ok": True}
+    )
+    monkeypatch.setattr(daemon.time, "sleep", _sleep)
+
+    try:
+        daemon.run(None, board="fresh-board", interval=0.01)
+    except _Stop:
+        pass
+
+    assert len(ticked) == 3
+    assert len(opened) == 3, "expected one fresh connection per tick, got caching"
+    assert [id(conn) for conn in ticked] == [id(conn) for conn in opened]
+    assert [conn.closed for conn in opened] == [1, 1, 1]
+
+
+def test_daemon_never_closes_borrowed_connections_even_on_tick_failure(monkeypatch):
+    """Caller-provided connections are borrowed: the daemon must not close or
+    discard them, even when a tick raises."""
+    class Sentinel:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    conns = {"board-a": Sentinel(), "board-b": Sentinel()}
+
+    def _tick(conn, *, board=None, **kwargs):
+        if board == "board-a":
+            raise RuntimeError("tick blew up")
+        return {"ok": True}
+
+    monkeypatch.setattr(daemon, "tick", _tick)
+    telemetry = []
+    monkeypatch.setattr("shipfactory.telemetry.append_jsonl", telemetry.append)
+
+    result = daemon.run(conns, boards=["board-a", "board-b"], once=True)
+
+    assert "tick blew up" in result["boards"]["board-a"]["error"]
+    assert result["boards"]["board-b"] == {"ok": True}
+    assert conns["board-a"].closed == 0
+    assert conns["board-b"].closed == 0
+    assert [record["event"] for record in telemetry] == ["daemon_board_tick_failure"]
