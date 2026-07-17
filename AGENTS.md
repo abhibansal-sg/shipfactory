@@ -428,12 +428,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   a recursive validator guard, because prompt wording is not an enforcement
   boundary. Unsupported worker schemas fail activation instead of eliciting
   invalid guesswork (finding #62, dev-pipeline@6 live shakedown).
+- A review worker cannot emit a parseable verdict when its task merely names
+  the `SHIPFACTORY_VERDICT` sentinel without exposing the JSON contract. The
+  v2 review task body now includes parser-valid approve/request examples,
+  derives the exact allowed upstream `target_step` values (preferring declared
+  agent-task inputs and binding change-set reviews to the builder), states the
+  line-citation rule, and resolves the executor protocol ordering: verdict on
+  one physical line immediately before the mandatory `SHIPFACTORY_RESULT`
+  line. A review with no valid rework target fails activation instead of
+  eliciting unparseable prose (finding #63, dev-pipeline@6 live shakedown).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#62 so far). When you fix one: commit message
+- Findings get numbers (#22–#63 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
