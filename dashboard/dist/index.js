@@ -1170,7 +1170,7 @@
           className: "factory-pill text-xs tabular-nums", tone: "secondary",
           title: "This step re-activated; earlier attempts are kept as immutable history.",
         }, "attempt " + step.activation) : null,
-        step.rejected_by_step_id ? h(MonoChip, { title: "Latest attempt is rework ordered by " + step.rejected_by_step_id }, "rework ← " + step.rejected_by_step_id) : null,
+        step.rejected_by_step_id && step.rejected_by_step_id !== step.step_id ? h(MonoChip, { title: "Latest attempt is rework ordered by " + step.rejected_by_step_id }, "rework ← " + step.rejected_by_step_id) : null,
         h("span", { className: "ml-auto shrink-0 text-xs text-text-tertiary" }, props.expanded ? "Fold attempts" : "Attempts")
       ),
       step.blocked_reason ? h("p", { className: "mt-1 text-xs leading-relaxed text-destructive" }, step.blocked_reason) : null,

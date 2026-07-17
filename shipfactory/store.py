@@ -631,6 +631,10 @@ def init_db() -> None:
                         {"expected_instance_id", "expected_head_sha"} & app_columns
                     )
                 else:
+                    # This bare else IS the version-15 detector. Adding
+                    # migration 16 requires converting it to `elif version
+                    # == 15:` first, or 16 inherits 15's artifact check and
+                    # falsely reports partial application on migrated DBs.
                     instance_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(recipe_instances)"
                     )}
