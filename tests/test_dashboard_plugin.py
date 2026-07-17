@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -236,3 +237,27 @@ def test_waiting_gate_returns_complete_inert_operator_review_card(hermetic_herme
     assert "function ReviewStoryCard" in bundle
     assert "gate.review_story" in bundle and "detail.review_story" in bundle
     assert "dangerouslySetInnerHTML" not in bundle and ".innerHTML" not in bundle
+
+
+def test_bundle_registers_under_the_manifest_name() -> None:
+    """Drift guard for the tab registration name (Amendment G1).
+
+    The Hermes host resolves the tab component via getPluginComponent(manifest.name)
+    after the bundle's script.onload fires; a bundle that registers under any other
+    string renders the NO_REGISTER error page. The Headframe -> ShipFactory rename
+    orphaned the register() call once already; this pins bundle, manifest, and
+    conformance harness to one name forever.
+    """
+    root = Path(__file__).resolve().parents[1] / "dashboard"
+    manifest = json.loads((root / "manifest.json").read_text())
+    bundle = (root / manifest["entry"]).read_text()
+    calls = re.findall(r"__HERMES_PLUGINS__\.register\(\s*['\"]([^'\"]+)['\"]", bundle)
+    assert calls, "bundle never calls window.__HERMES_PLUGINS__.register(name, Component)"
+    assert calls == [manifest["name"]], (
+        f"bundle registers {calls!r} but manifest.json name is {manifest['name']!r}; "
+        "the host resolves the tab via getPluginComponent(manifest.name)"
+    )
+    harness = (root / "conformance-harness.js").read_text()
+    assert "manifest.name" in harness or f'"{manifest["name"]}"' in harness, (
+        "conformance harness must gate registration on the manifest name"
+    )

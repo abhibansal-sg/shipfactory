@@ -5,6 +5,7 @@ import { Button } from "../../hermes-mobile/web/node_modules/@nous-research/ui/s
 import { Card, CardContent } from "../../hermes-mobile/web/node_modules/@nous-research/ui/src/ui/components/card.tsx";
 import "../../hermes-mobile/web/src/index.css";
 import "./dist/style.css";
+import manifest from "./manifest.json";
 
 const h = React.createElement;
 const now = Date.now();
@@ -131,10 +132,12 @@ const instanceCosts = instances.map((item, index) => ({
   tokens_total: item.tokens.charged,
 }));
 
+let registeredId = null;
 let registeredPage = null;
 window.__HERMES_PLUGINS__ = {
   register(id, component) {
-    if (id === "factory") registeredPage = component;
+    registeredId = id;
+    registeredPage = component;
   },
 };
 
@@ -190,6 +193,12 @@ window.__HERMES_PLUGIN_SDK__ = {
 await import("./dist/index.js");
 
 if (!registeredPage) throw new Error("Factory bundle did not register a page");
+if (registeredId !== manifest.name) {
+  throw new Error(
+    "Bundle registered as \"" + registeredId + "\" but manifest.name is \"" + manifest.name +
+    "\"; the Hermes host resolves the tab via getPluginComponent(manifest.name)"
+  );
+}
 createRoot(document.querySelector(".factory-root")).render(h(registeredPage));
 
 const requestedView = scenario.get("view");
