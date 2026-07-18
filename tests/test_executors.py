@@ -99,3 +99,43 @@ def test_worktree_git_root_helper(tmp_path):
     assert worktree_git_root(str(ws)) is None  # malformed pointer
     (ws / ".git").write_text("gitdir: ../repo/.git/worktrees/t_y")
     assert worktree_git_root(str(ws)) == str((tmp_path / "repo" / ".git").resolve())
+
+
+def test_grok_command_and_usage(tmp_path):
+    seat = SimpleNamespace(profile="qa", model="grok-4.5", reasoning="")
+    executor = get_executor("grok")
+    cmd = executor.build_cmd(seat, "prompt", str(tmp_path))
+    assert cmd[:4] == ["grok", "--prompt-file", "/dev/stdin", "--output-format"]
+    assert cmd[4] == "json"
+    assert "-m" in cmd and "grok-4.5" in cmd
+    # grok emits one pretty-printed JSON object with a usage record.
+    log = '{\n  "text": "hi",\n  "usage": {"input_tokens": 24167, "output_tokens": 27, "total_tokens": 29570}\n}'
+    assert executor.parse_usage(log) == {"tokens_in": 24167, "tokens_out": 27, "tokens_total": 24194}
+    assert executor.parse_usage("not json") == {"tokens_in": None, "tokens_out": None, "tokens_total": None}
+
+
+def test_grok_extract_text_finds_sentinel_in_single_json_object():
+    """grok --output-format json returns one object whose `text` field holds
+    the agent's final message; the sentinel lives there, not on a JSONL line."""
+    grok = get_executor("grok")
+    log = (
+        'Hermes Git runtime note\n'  # stderr merged ahead of stdout
+        '{\n  "text": "reviewed\\n\\nSHIPFACTORY_VERDICT: {\\"schema\\":\\"shipfactory.verdict/v2\\",'
+        '\\"outcome\\":\\"approve\\",\\"clean\\":true,\\"findings\\":[],\\"summary\\":\\"clean\\"}",\n'
+        '  "usage": {"input_tokens": 5, "output_tokens": 2}\n}'
+    )
+    text = grok.extract_text(log)
+    assert text.splitlines()[-1].startswith("SHIPFACTORY_VERDICT:")
+    # Non-JSON fallback returns the raw log so a crash is still inspectable.
+    assert grok.extract_text("boom, no json") == "boom, no json"
+
+
+def test_grok_is_a_distinct_provider_family_for_cross_provider_review():
+    """A codex builder paired with a grok reviewer must be accepted as
+    cross-provider (finding #77 non-Anthropic reviewer path)."""
+    from shipfactory.recipes.advancer import _run_provider_family
+
+    builder = {"provider": "codex", "executor": "codex"}
+    reviewer = {"provider": "grok", "executor": "grok"}
+    assert _run_provider_family(builder, "builder") == ("codex", None)
+    assert _run_provider_family(reviewer, "reviewer") == ("grok", None)

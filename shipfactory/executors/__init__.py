@@ -3,9 +3,10 @@
 from .base import Executor
 from .claude_exec import ClaudeExecutor
 from .codex_exec import CodexExecutor
+from .grok_exec import GrokExecutor
 from .hermes_exec import HermesExecutor
 
-_EXECUTORS = {item.name: item for item in (HermesExecutor(), CodexExecutor(), ClaudeExecutor())}
+_EXECUTORS = {item.name: item for item in (HermesExecutor(), CodexExecutor(), ClaudeExecutor(), GrokExecutor())}
 
 
 def get_executor(name: str) -> Executor:
@@ -16,4 +17,4 @@ def get_executor(name: str) -> Executor:
         raise ValueError(f"unknown Factory executor: {name}") from exc
 
 
-__all__ = ["Executor", "HermesExecutor", "CodexExecutor", "ClaudeExecutor", "get_executor"]
+__all__ = ["Executor", "HermesExecutor", "CodexExecutor", "ClaudeExecutor", "GrokExecutor", "get_executor"]
