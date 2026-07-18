@@ -1,0 +1,26 @@
+schema: shipfactory.verification/v1
+cases:
+  # Protected baseline: the full Factory suite (minus the environment-coupled
+  # e2e smoke test, which shells the live `hermes` binary and flaps on the
+  # ABH-370 provenance issue). Any candidate that breaks an existing test
+  # fails verification — "all tests green" is the repo's One Law for changes.
+  # min_passed guards against a candidate that silently deselects the suite.
+  - id: protected-pytest
+    requirement_ids: [REQ-1]
+    driver: command
+    argv:
+      - python
+      - -m
+      - pytest
+      - tests/
+      - -q
+      - --ignore=tests/test_e2e_smoke.py
+      - -p
+      - no:cacheprovider
+    oracle:
+      type: pytest_summary
+      min_passed: 500
+capture:
+  video: false
+  trace: false
+  screenshots: on-failure

@@ -1,0 +1,13 @@
+schema: shipfactory.runtime/v1
+bootstrap:
+  argv: [scripts/sf-bootstrap.sh]
+  tracked_inputs: []
+  network: deny
+app:
+  start_argv: [scripts/sf-app.sh, "${PORT}"]
+  healthcheck:
+    path: /healthz
+    expected_status: 200
+  stop_signal: TERM
+seed:
+  argv: [scripts/sf-seed.sh]
