@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import multiprocessing
 import os
@@ -12,6 +13,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 # Multiprocessing ``spawn`` re-imports this module. Pin the checkout root so a
 # checkout directory itself named ``shipfactory`` cannot shadow the package.
@@ -433,3 +436,87 @@ def test_gate_decision_migration_is_normative_sql():
         "consumed_at", "advance_event_key",
     ]
     assert indexes  # includes the normative UNIQUE advance_event_key auto-index
+
+
+_PLUGIN_API = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
+_DASHBOARD_BUNDLE = Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
+
+
+def _dashboard_client() -> TestClient:
+    spec = importlib.util.spec_from_file_location("factory_dashboard_gate_test", _PLUGIN_API)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    app = FastAPI()
+    app.include_router(module.router, prefix="/api/plugins/shipfactory")
+    return TestClient(app)
+
+
+def test_dashboard_waiting_gate_carries_binding_and_approve_round_trips(tmp_path, kanban_conn):
+    """finding #81: the front-end must echo the /waiting revision binding to /approve.
+
+    The pre-fix dashboard posted only ``{instance, step, reason}``; the gate
+    endpoint fail-closed with 422. The gate object /waiting hands the client
+    carries every binding field the decision requires, and a decision shaped
+    like the fixed ``decide()`` (binding + fresh nonce + operator actor) is
+    accepted and recorded exactly once.
+    """
+    binding = _gate(tmp_path, kanban_conn, instance_id="dash-gate")
+    bundle = _evidence(tmp_path, "dash-gate", binding["revision_hash"])
+    client = _dashboard_client()
+
+    waiting = client.get("/api/plugins/shipfactory/waiting")
+    assert waiting.status_code == 200, waiting.text
+    gate = next(g for g in waiting.json() if g["instance_id"] == "dash-gate")
+    assert gate["revision_hash"] == binding["revision_hash"]
+    assert gate["activation"] == binding["activation"]
+    assert gate["evidence_bundle_hash"] == bundle["bundle_sha256"]
+    assert gate.get("binding_error") is None
+
+    body = {
+        "instance": gate["instance_id"], "step": gate["step_id"],
+        "activation": gate["activation"], "revision_hash": gate["revision_hash"],
+        "evidence_bundle_hash": gate["evidence_bundle_hash"],
+        "nonce": "dashboard-nonce-1", "actor_kind": "operator",
+        "actor_id": "dashboard-operator", "channel": "dashboard", "reason": "",
+    }
+    approve = client.post("/api/plugins/shipfactory/approve", json=body)
+    assert approve.status_code == 200, approve.text
+    assert approve.json()["decision_id"]
+
+    with store._connect() as db:
+        rows = db.execute(
+            "SELECT decision, actor_kind, channel FROM gate_decisions "
+            "WHERE instance_id='dash-gate' AND step_id='approve'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "approve"
+    assert rows[0]["actor_kind"] == "operator" and rows[0]["channel"] == "dashboard"
+
+
+def test_dashboard_approve_body_missing_binding_is_unprocessable(tmp_path, kanban_conn):
+    """The exact operator failure: a three-field body is rejected as 422."""
+    _gate(tmp_path, kanban_conn, instance_id="dash-thin")
+    client = _dashboard_client()
+    resp = client.post(
+        "/api/plugins/shipfactory/approve",
+        json={"instance": "dash-thin", "step": "approve", "reason": ""},
+    )
+    assert resp.status_code == 422
+    missing = {entry["loc"][-1] for entry in resp.json()["detail"]}
+    assert {
+        "activation", "revision_hash", "evidence_bundle_hash",
+        "nonce", "actor_kind", "actor_id", "channel",
+    } <= missing
+
+
+def test_dashboard_bundle_decide_forwards_full_gate_binding():
+    """The served bundle's decide() must forward the binding, not just 3 fields."""
+    bundle = _DASHBOARD_BUNDLE.read_text(encoding="utf-8")
+    assert 'request("/" + action' in bundle
+    for key in (
+        "activation:", "revision_hash:", "evidence_bundle_hash:",
+        "nonce:", "actor_kind:", "actor_id:", "channel:",
+    ):
+        assert key in bundle, f"dashboard decide() body is missing {key}"
+    assert "newNonce()" in bundle

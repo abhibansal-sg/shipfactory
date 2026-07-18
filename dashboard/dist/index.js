@@ -49,6 +49,18 @@
     return body || raw;
   }
 
+  function newNonce() {
+    // A fresh, single-use nonce per decision click (finding #81). The server
+    // treats a replayed nonce for a different tuple as a conflict, so it must
+    // never be derived from the gate.
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID().replace(/-/g, "");
+      }
+    } catch (_ignore) { /* fall through to the timestamped fallback */ }
+    return "n" + Date.now().toString(16) + Math.floor(Math.random() * 0xffffffff).toString(16);
+  }
+
   function formatNumber(value) {
     var number = Number(value || 0);
     try { return new Intl.NumberFormat().format(number); }
@@ -514,6 +526,14 @@
         reason = window.prompt("Reason for rejecting this gate:", "") || "";
         if (!reason.trim()) return;
       }
+      // A gate is only decidable once /waiting has attached its verified
+      // revision binding (finding #81). Without it the decision endpoint
+      // fail-closes; refuse locally with the server's binding error rather
+      // than posting a doomed 3-field body.
+      if (!gate.revision_hash) {
+        setToast({ ok: false, text: gate.binding_error || "This gate has no verified revision binding yet; refresh and try again." });
+        return;
+      }
       var key = gate.instance_id + ":" + gate.step_id;
       var previous = gates.slice();
       setBusy(key + ":" + action);
@@ -523,7 +543,18 @@
       }));
       request("/" + action, {
         method: "POST",
-        body: JSON.stringify({ instance: gate.instance_id, step: gate.step_id, reason: reason }),
+        body: JSON.stringify({
+          instance: gate.instance_id,
+          step: gate.step_id,
+          activation: gate.activation,
+          revision_hash: gate.revision_hash,
+          evidence_bundle_hash: gate.evidence_bundle_hash == null ? null : gate.evidence_bundle_hash,
+          nonce: newNonce(),
+          actor_kind: "operator",
+          actor_id: "dashboard-operator",
+          channel: "dashboard",
+          reason: reason,
+        }),
       }).then(function () {
         setToast({ ok: true, text: action === "approve" ? "Approval queued for the advancer." : "Rejection queued for the advancer." });
         resource.reload().catch(function () {});

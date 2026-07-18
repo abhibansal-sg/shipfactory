@@ -573,12 +573,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   the normal verify-failed rework path. Only bites on a failing build. Fix
   candidate: trust binary captures from the sandboxed verification runner, or
   surface the test failure ahead of the redaction block (finding #80, deferred).
+- A read surface that enriches an object and a write surface that consumes it
+  must agree on the full field set. `/waiting` attached every gate binding
+  (activation, revision_hash, evidence_bundle_hash) via current_binding, and
+  the card even rendered `gate.activation`, but the dashboard `decide()` posted
+  only `{instance, step, reason}` — so the operator's first real approval click
+  422'd on the seven missing binding fields. The bundle's decide() now echoes
+  the binding + a fresh client-minted nonce + operator actor/channel, and
+  refuses locally when a gate has no revision binding yet. Round-trip and
+  3-field-422 tests plus a bundle-guard lock it (finding #81, first-light-14).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#80 so far). When you fix one: commit message
+- Findings get numbers (#22–#81 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
