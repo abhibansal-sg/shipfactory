@@ -296,8 +296,7 @@ def _validate_plan(document: dict[str, Any]) -> None:
     nodes: dict[str, dict[str, Any]] = {}
     required_node_keys = PLAN_NODE_KEYS
     for node in document["nodes"]:
-        if (not isinstance(node, dict)
-                or set(node) not in (required_node_keys, required_node_keys | {"budget"})):
+        if not isinstance(node, dict) or set(node) != required_node_keys:
             raise ArtifactValidationError(f"{schema} has invalid node shape")
         if (not isinstance(node["id"], str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", node["id"])
                 or node["id"] in nodes
@@ -318,25 +317,7 @@ def _validate_plan(document: dict[str, Any]) -> None:
             )
             for path in node["allowed_paths"]
         ]
-        if "budget" in node:
-            budget = node["budget"]
-            if (not isinstance(budget, dict)
-                    or set(budget) != {"token_pool", "tokens"}
-                    or not isinstance(budget["token_pool"], str)
-                    or not budget["token_pool"]
-                    or not isinstance(budget["tokens"], int)
-                    or isinstance(budget["tokens"], bool)
-                    or budget["tokens"] < 1):
-                raise ArtifactValidationError(
-                    f"{schema} node {node['id']} budget must contain a nonempty "
-                    "token_pool and positive integer tokens"
-                )
         nodes[node["id"]] = node
-    budgeted = {node_id for node_id, node in nodes.items() if "budget" in node}
-    if budgeted and budgeted != set(nodes):
-        raise ArtifactValidationError(
-            f"{schema} every node must declare budget when any node declares budget"
-        )
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -1970,58 +1951,10 @@ def _trusted_runtime_control_paths(workspace: Path, base_sha: str) -> set[str]:
     return paths
 
 
-def _validate_plan_budget(
-    document: dict[str, Any], instance: dict[str, Any], recipe: dict[str, Any], db: Any,
-) -> None:
-    """Reject declared first-activation reservations that cannot be admitted."""
-    declarations = [node["budget"] for node in document["nodes"] if "budget" in node]
-    if not declarations:
-        return
-    budgets = recipe.get("budgets", {})
-    if recipe.get("schema") != "shipfactory.recipe/v2":
-        raise ArtifactValidationError(
-            "shipfactory.plan/v1 node budgets require a v2 recipe instance"
-        )
-    remaining_activations = int(budgets["max_activations"]) - int(instance["activation_count"])
-    if len(declarations) > remaining_activations:
-        raise ArtifactValidationError(
-            "shipfactory.plan/v1 budget infeasible: declared node first activations "
-            f"{len(declarations)} exceed instance remaining activations "
-            f"{remaining_activations}"
-        )
-    declared_total = sum(int(item["tokens"]) for item in declarations)
-    remaining_total = int(budgets["max_tokens"]) - int(instance["tokens_charged"])
-    if declared_total > remaining_total:
-        raise ArtifactValidationError(
-            "shipfactory.plan/v1 budget infeasible: declared node tokens "
-            f"{declared_total} exceed instance remaining tokens {remaining_total}"
-        )
-    declared_by_pool: dict[str, int] = {}
-    for item in declarations:
-        pool = item["token_pool"]
-        if pool not in budgets["token_pools"]:
-            raise ArtifactValidationError(
-                f"shipfactory.plan/v1 budget infeasible: unknown token pool {pool!r}"
-            )
-        declared_by_pool[pool] = declared_by_pool.get(pool, 0) + int(item["tokens"])
-    for pool, declared in sorted(declared_by_pool.items()):
-        charged = int(db.execute(
-            "SELECT COALESCE(SUM(tokens),0) FROM budget_charges "
-            "WHERE instance_id=? AND token_pool=?",
-            (instance["id"], pool),
-        ).fetchone()[0])
-        remaining = int(budgets["token_pools"][pool]) - charged
-        if declared > remaining:
-            raise ArtifactValidationError(
-                f"shipfactory.plan/v1 budget infeasible: token pool {pool!r} "
-                f"declares {declared} tokens but only {remaining} remain"
-            )
-
-
 def _validate_plan_context(
     document: dict[str, Any], instance_id: str, workspace: Path,
 ) -> None:
-    """Validate plan coverage, risk, budget, and revision binding."""
+    """Validate plan coverage, risk, and revision binding."""
     with store._connect() as db:
         task_spec = _latest_sealed(db, instance_id, "task-spec")
         exploration = _latest_sealed(db, instance_id, "exploration")
@@ -2030,10 +1963,6 @@ def _validate_plan_context(
         ).fetchone()
         if instance_row is None:
             raise ArtifactValidationError("shipfactory.plan/v1 requires a recipe instance")
-        instance = dict(instance_row)
-        from shipfactory.recipes.instantiate import recipe_for_instance
-        recipe = recipe_for_instance(instance, db=db).document
-        _validate_plan_budget(document, instance, recipe, db)
     if task_spec is None:
         raise ArtifactValidationError("shipfactory.plan/v1 requires a sealed task-spec")
     if document["task_spec_sha256"].lower() != str(task_spec["sha256"]).lower():

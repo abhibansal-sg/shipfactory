@@ -90,23 +90,16 @@ def startup_guard(config: Any) -> None:
     # a deliberately partial configuration into an unrelated KeyError.
     if not recipes.get("library_path"):
         return
-    from shipfactory.recipes.loader import load_library, validate_budget_closure
-    library = load_library(
+    from shipfactory.recipes.loader import load_library
+    # Loading validates every recipe (including the count invariant that
+    # max_activations covers the sum of step_activation_caps); token-budget
+    # closure was removed with the token system (finding #77).
+    load_library(
         recipes["library_path"], seats=set(config.seats),
         profiles=set(recipes.get("execution_profiles", {})),
         verification_profiles=set(recipes.get("verification_profiles", {})),
         persist=False,
     )
-    latest_active: dict[str, Any] = {}
-    for recipe in library.recipes.values():
-        document = recipe.document
-        if document["status"] != "active":
-            continue
-        current = latest_active.get(document["id"])
-        if current is None or int(document["version"]) > int(current["version"]):
-            latest_active[document["id"]] = document
-    for document in latest_active.values():
-        validate_budget_closure(document, recipes.get("execution_profiles", {}))
 
 def _latest(db: Any, instance_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in db.execute("SELECT s.* FROM recipe_steps s JOIN (SELECT step_id,MAX(activation) activation FROM recipe_steps WHERE instance_id=? GROUP BY step_id) l ON l.step_id=s.step_id AND l.activation=s.activation WHERE s.instance_id=?", (instance_id, instance_id)).fetchall()]

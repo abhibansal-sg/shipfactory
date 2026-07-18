@@ -16,7 +16,6 @@ EXECUTORS = frozenset({"hermes", "codex", "claude"})
 SELECTOR_DEFAULTS = {
     "enabled": True,
     "max_per_tick": 3,
-    "selection_allowance": 5_000,
 }
 RECIPE_RUNTIME_DEFAULTS = {
     "max_workers": 2,
@@ -215,14 +214,18 @@ def validate(cfg) -> None:
     if recipes and not isinstance(recipes.get("enabled", False), bool):
         raise FactoryConfigError("recipes.enabled must be boolean")
     if recipes.get("enabled"):
-        for field in ("library_path", "bare_task_recipe", "notify_target", "board_day_token_ceiling", "dispatcher_max_in_progress", "execution_profiles"):
+        for field in ("library_path", "bare_task_recipe", "notify_target", "dispatcher_max_in_progress", "execution_profiles"):
             if field not in recipes:
                 raise FactoryConfigError(f"recipes.{field} is required when enabled")
         profiles = recipes["execution_profiles"]
         if not isinstance(profiles, dict) or not profiles:
             raise FactoryConfigError("recipes.execution_profiles must be nonempty mapping")
         for name, profile in profiles.items():
-            if not isinstance(profile, dict) or set(profile) != {"max_runtime_seconds", "max_retries", "token_allowance"} or any(not isinstance(profile[x], int) or profile[x] < 1 for x in profile):
+            # token_allowance is accepted-but-ignored for backward compatibility
+            # with configs that predate token-budget removal (finding #77).
+            if (not isinstance(profile, dict)
+                    or not {"max_runtime_seconds", "max_retries"} <= set(profile) <= {"max_runtime_seconds", "max_retries", "token_allowance"}
+                    or any(not isinstance(profile[x], int) or profile[x] < 1 for x in profile)):
                 raise FactoryConfigError(f"invalid execution profile {name!r}")
         verification_profiles = recipes.get("verification_profiles", {})
         if not isinstance(verification_profiles, dict):
@@ -276,19 +279,17 @@ def validate(cfg) -> None:
             raise FactoryConfigError("recipes.selector has unknown keys")
         if "enabled" in selector and not isinstance(selector["enabled"], bool):
             raise FactoryConfigError("recipes.selector.enabled must be boolean")
-        for field in ("max_per_tick", "selection_allowance"):
-            if field in selector and (
-                not isinstance(selector[field], int)
-                or isinstance(selector[field], bool)
-                or selector[field] < 1
-            ):
-                raise FactoryConfigError(f"recipes.selector.{field} must be a positive integer")
+        if "max_per_tick" in selector and (
+            not isinstance(selector["max_per_tick"], int)
+            or isinstance(selector["max_per_tick"], bool)
+            or selector["max_per_tick"] < 1
+        ):
+            raise FactoryConfigError("recipes.selector.max_per_tick must be a positive integer")
     for field in (
         "max_workers",
         "watchdog_subprocess_timeout_seconds",
         "watchdog_tick_timeout_seconds",
         "artifact_max_bytes",
-        "board_day_token_ceiling",
         "dispatcher_max_in_progress",
     ):
         if field in recipes and (

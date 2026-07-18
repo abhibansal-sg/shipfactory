@@ -189,7 +189,7 @@ _NOTES = {
         "plural fields are string lists."
     ),
     "shipfactory.plan/v1": (
-        "Node objects have exactly the shown keys, optionally plus budget={token_pool,tokens}. "
+        "Node objects have exactly the shown keys. "
         "Node ids are unique lowercase slugs; needs name existing nodes; integration_order "
         "contains unique known node ids; needs must form an acyclic graph. task_spec_sha256 must "
         "match the exact sealed task-spec input and base_sha must match its trusted base. Node "
@@ -201,9 +201,7 @@ _NOTES = {
         "have one matching shared_file_overlaps declaration, and every declaration must match "
         "an actual overlap. A node with deployment/release kind, .shipfactory or workflow paths, "
         "policy/verification/deploy paths, or trusted runtime-manifest scripts needs a "
-        "control-plane or high-risk risk tag. If any node has budget, every node must have one; "
-        "token_pool must be configured and positive token totals must fit remaining instance and "
-        "pool budgets. Omit budget unless exact Factory context supplies those values."
+        "control-plane or high-risk risk tag."
     ),
     "shipfactory.review-story/v1": (
         "changes is nonempty and each item has exactly the shown keys. not_changed is either "

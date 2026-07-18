@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from shipfactory.recipes.loader import load_library, validate_budget_closure
+from shipfactory.recipes.loader import load_library
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,40 +59,6 @@ def test_dev_pipeline_10_is_only_the_calibration_and_headroom_successor():
         if old["id"] in CALIBRATED:
             old["params"]["instructions"] = new["params"]["instructions"]
     assert v10 == v9
-
-
-def test_dev_pipeline_10_closes_against_ratified_live_allowances():
-    v10 = _recipe(10)
-    profiles = {
-        name: {"token_allowance": allowance}
-        for name, allowance in RATIFIED_PROFILE_ALLOWANCES.items()
-    }
-    validate_budget_closure(v10, profiles)
-
-    required: dict[str, int] = defaultdict(int)
-    caps = v10["budgets"]["step_activation_caps"]
-    for step in v10["steps"]:
-        if step["primitive"] in {"agent_task", "review_gate"}:
-            pool = step["params"]["execution_profile"]
-            required[pool] += caps[step["id"]] * RATIFIED_PROFILE_ALLOWANCES[pool]
-    assert dict(required) == {
-        "planning": 350_000,
-        "review": 600_000,
-        "build": 225_000,
-    }
-    assert v10["budgets"]["token_pools"] == dict(required)
-    assert v10["budgets"]["max_tokens"] == sum(required.values()) == 1_175_000
-    assert v10["budgets"]["max_activations"] == sum(caps.values()) + 4
-
-
-def test_dev_pipeline_10_fails_closed_on_future_live_allowance_drift():
-    profiles = {
-        name: {"token_allowance": allowance}
-        for name, allowance in RATIFIED_PROFILE_ALLOWANCES.items()
-    }
-    profiles["planning"]["token_allowance"] += 1
-    with pytest.raises(ValueError, match="token pool 'planning'.*activation caps"):
-        validate_budget_closure(_recipe(10), profiles)
 
 
 def test_dev_pipeline_10_published_bytes_are_pinned():

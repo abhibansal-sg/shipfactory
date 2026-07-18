@@ -20,8 +20,12 @@ _STEP_V1 = {"id", "primitive", "title", "needs", "optional", "params"}
 _STEP_V2 = {"id", "primitive", "title", "needs", "optional", "inputs", "outputs", "params"}
 _INPUT_V2 = {"from", "kind", "required"}
 _OUTPUT_V2 = {"kind", "schema", "path"}
-_BUDGETS_V1 = {"max_activations", "max_step_activations", "max_tokens"}
-_BUDGETS_V2 = {"max_activations", "max_tokens", "step_activation_caps", "token_pools"}
+# Count-only run caps are required; the token fields (max_tokens, token_pools)
+# are accepted-but-ignored for backward compatibility with published recipes
+# that predate token-budget removal (finding #77).
+_BUDGETS_V1_REQUIRED = {"max_activations", "max_step_activations"}
+_BUDGETS_V2_REQUIRED = {"max_activations", "step_activation_caps"}
+_BUDGETS_TOKEN_OPTIONAL = {"max_tokens", "token_pools"}
 _PRIMITIVES = {
     "agent_task", "review_gate", "approval_gate", "notify", "wait_for_event",
     "verification",
@@ -59,54 +63,6 @@ class RecipeLibrary:
 
     def active_manifest(self) -> list[dict[str, Any]]:
         return [r.document for r in self.recipes.values() if r.document["status"] == "active"]
-
-
-def validate_budget_closure(
-    document: dict[str, Any], execution_profiles: dict[str, dict[str, Any]],
-) -> None:
-    """Prove v2 budgets can admit every activation allowed by their caps."""
-    if document.get("schema") != "shipfactory.recipe/v2":
-        return
-    budgets = document["budgets"]
-    caps = budgets["step_activation_caps"]
-    required_by_pool: dict[str, int] = {}
-    for step in document["steps"]:
-        if step["primitive"] not in {"agent_task", "review_gate"}:
-            continue
-        profile = step["params"]["execution_profile"]
-        if _templated(profile):
-            _error(
-                f"recipe {document['id']}@{document['version']} budget closure "
-                "cannot prove a templated execution profile"
-            )
-        config = execution_profiles.get(profile)
-        allowance = config.get("token_allowance") if isinstance(config, dict) else None
-        if not isinstance(allowance, int) or isinstance(allowance, bool) or allowance < 1:
-            _error(f"execution profile {profile!r} has no valid token_allowance")
-        assert isinstance(allowance, int) and not isinstance(allowance, bool)
-        allowance_int = allowance
-        required_by_pool[profile] = (
-            required_by_pool.get(profile, 0) + int(caps[step["id"]]) * allowance_int
-        )
-    for pool, required in sorted(required_by_pool.items()):
-        configured = int(budgets["token_pools"].get(pool, 0))
-        if configured < required:
-            _error(
-                f"recipe {document['id']}@{document['version']} token pool {pool!r} "
-                f"has {configured} tokens but activation caps require {required}"
-            )
-    required_total = sum(required_by_pool.values())
-    if int(budgets["max_tokens"]) < required_total:
-        _error(
-            f"recipe {document['id']}@{document['version']} max_tokens has "
-            f"{budgets['max_tokens']} but activation caps require {required_total}"
-        )
-    required_activations = sum(int(value) for value in caps.values())
-    if int(budgets["max_activations"]) < required_activations:
-        _error(
-            f"recipe {document['id']}@{document['version']} max_activations has "
-            f"{budgets['max_activations']} but step caps allow {required_activations}"
-        )
 
 
 def _canonical(value: Any) -> str:
@@ -220,22 +176,37 @@ def validate(
         if spec.get("type") not in _PARAM_TYPES or not isinstance(spec.get("required"), bool): _error(f"invalid parameter {name!r}")
         if spec["type"] == "enum" and (not isinstance(spec.get("values"), list) or not spec["values"]): _error(f"enum {name!r} requires values")
     budgets = document["budgets"]
-    expected_budgets = _BUDGETS_V2 if v2 else _BUDGETS_V1
-    if not isinstance(budgets, dict) or set(budgets) != expected_budgets:
+    required = _BUDGETS_V2_REQUIRED if v2 else _BUDGETS_V1_REQUIRED
+    allowed = required | _BUDGETS_TOKEN_OPTIONAL
+    if not isinstance(budgets, dict) or not (required <= set(budgets) <= allowed):
         _error("invalid budgets")
-    for field in ("max_activations", "max_tokens"):
-        value = budgets.get(field)
+    if not isinstance(budgets["max_activations"], int) or isinstance(budgets["max_activations"], bool) or budgets["max_activations"] < 1:
+        _error("invalid budgets")
+    # max_tokens / token_pools, when present on a legacy recipe, are only
+    # shape-checked; they are never enforced (finding #77).
+    if "max_tokens" in budgets:
+        value = budgets["max_tokens"]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             _error("invalid budgets")
     if v2:
-        for field in ("step_activation_caps", "token_pools"):
-            values = budgets[field]
-            if (not isinstance(values, dict)
-                    or (field == "token_pools" and not values)
+        caps = budgets["step_activation_caps"]
+        # Empty is valid for a recipe with no agent/review steps; the
+        # "names every agent and review step exactly" check below enforces
+        # coherence with the actual steps.
+        if (not isinstance(caps, dict)
+                or any(not isinstance(name, str) or not _ID.fullmatch(name)
+                       or not isinstance(value, int) or isinstance(value, bool) or value < 1
+                       for name, value in caps.items())):
+            _error("invalid v2 budget field step_activation_caps")
+        if "token_pools" in budgets:
+            pools = budgets["token_pools"]
+            if (not isinstance(pools, dict) or not pools
                     or any(not isinstance(name, str) or not _ID.fullmatch(name)
                            or not isinstance(value, int) or isinstance(value, bool) or value < 1
-                           for name, value in values.items())):
-                _error(f"invalid v2 budget field {field}")
+                           for name, value in pools.items())):
+                _error("invalid v2 budget field token_pools")
+        if sum(caps.values()) > budgets["max_activations"]:
+            _error("max_activations must cover the sum of step_activation_caps")
     else:
         value = budgets.get("max_step_activations")
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -324,15 +295,6 @@ def validate(
         }
         if set(step_caps) != expected_caps:
             _error("v2 step_activation_caps must name every agent and review step exactly")
-        pools = budgets["token_pools"]
-        for step in steps:
-            if step["primitive"] not in {"agent_task", "review_gate"}:
-                continue
-            profile = step["params"]["execution_profile"]
-            if not _templated(profile) and profile not in pools:
-                _error(
-                    f"v2 step {step['id']!r} execution_profile must name a token pool"
-                )
     # directed cycle check and v1 shared-workspace total ordering rule
     visiting: set[str] = set(); visited: set[str] = set()
     def visit(node: str) -> None:
@@ -488,9 +450,6 @@ def bind_parameters(recipe: Recipe, provided: dict[str, Any], skip_steps: list[s
                 _error(f"unknown seat {seat!r}")
             if profiles is not None and profile not in profiles:
                 _error(f"unknown profile {profile!r}")
-            if (recipe.document["schema"] == "shipfactory.recipe/v2"
-                    and profile not in recipe.document["budgets"]["token_pools"]):
-                _error(f"execution profile {profile!r} has no v2 token pool")
             if workspace not in {"worktree", "shared"}:
                 _error("workspace must be worktree or shared")
         elif step["primitive"] == "approval_gate" and seats is not None:
