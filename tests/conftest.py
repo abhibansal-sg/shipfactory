@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 
-HERMES_MOBILE = Path.home() / "Developer/products/hermes-mobile"
+# ShipFactory imports the Hermes `hermes_cli` package from a checkout that must
+# carry the recipe-kanban APIs (create_blocked_task / cancel_subtree). The
+# default checkout may be switched to another branch for unrelated work, so the
+# Hermes source is resolved from HERMES_MOBILE_PATH when set (e.g. a dedicated
+# `feat-kanban-recipe-apis` git worktree), falling back to the conventional path.
+HERMES_MOBILE = Path(
+    os.environ.get("HERMES_MOBILE_PATH") or (Path.home() / "Developer/products/hermes-mobile")
+)
 if str(HERMES_MOBILE) not in sys.path:
     sys.path.insert(0, str(HERMES_MOBILE))
 
