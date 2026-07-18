@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,14 +71,12 @@ def stage_config(monkeypatch) -> FactoryConfig:
             "library_path": str(ROOT / "recipes"),
             "bare_task_recipe": "bare-task-default@1",
             "notify_target": "test:noop",
-            "board_day_token_ceiling": 500_000,
             "dispatcher_max_in_progress": 4,
             "execution_profiles": PROFILES,
             "verification_profiles": {"browser-standard": {}},
             "selector": {
                 "enabled": True,
                 "max_per_tick": 3,
-                "selection_allowance": 5_000,
             },
         },
     )
@@ -149,12 +146,7 @@ def test_selector_stage_fans_out_mixed_recipe_and_bare_nodes_with_needs(
         instances = [dict(row) for row in db.execute(
             "SELECT * FROM recipe_instances ORDER BY recipe_id",
         ).fetchall()]
-        charge = db.execute(
-            "SELECT step_id,tokens FROM budget_charges WHERE board='test'",
-        ).fetchone()
     assert {row["recipe_id"] for row in instances} == {"bare-task-default", "dev-pipeline"}
-    assert tuple(charge) == ("selector", 5_000)
-    assert fake_aux.calls[0]["max_tokens"] == 5_000
     collectors = {row["recipe_id"]: row["collector_task_id"] for row in instances}
     assert kanban_conn.execute(
         "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
@@ -254,9 +246,6 @@ def test_selector_stage_crash_between_instantiate_and_outcome_is_idempotent(
     with store._connect() as db:
         instance = dict(db.execute("SELECT * FROM recipe_instances").fetchone())
         assert db.execute("SELECT COUNT(*) FROM recipe_instances").fetchone()[0] == 1
-        assert db.execute(
-            "SELECT COUNT(*) FROM budget_charges WHERE instance_id=(SELECT id FROM triage_selections)"
-        ).fetchone()[0] == 1
     assert kanban_conn.execute(
         "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
         (f"recipe/{instance['id']}/{instance['recipe_hash']}/collector",),
@@ -264,40 +253,12 @@ def test_selector_stage_crash_between_instantiate_and_outcome_is_idempotent(
     assert _selection_row(source)["outcome"] == "selected"
 
 
-def test_selector_stage_budget_refusal_parks_before_model_call(
-    kanban_conn, stage_config, fake_aux,
-):
-    from shipfactory import cli
-
-    source = _source(kanban_conn)
-    stage_config.recipes["board_day_token_ceiling"] = 5_000
-    day = datetime.now(timezone.utc).date().isoformat()
-    store.init_db()
-    with store._connect() as db:
-        db.execute(
-            "INSERT INTO budget_charges"
-            "(key,board,utc_day,instance_id,step_id,activation,tokens,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            ("prior", "test", day, "prior", "work", 1, 1, store._now()),
-        )
-    result = selector_stage.run_stage(kanban_conn, "test")
-    assert result["parked"] == 1
-    assert fake_aux.calls == []
-    assert _blocked_reason(kanban_conn, source) == "budget_refused"
-    assert _selection_row(source)["outcome"] == "budget_refused"
-    waiting = cli.main(["recipe", "waiting"])
-    assert any(
-        row.get("source_task_id") == source and row.get("blocked_reason") == "budget_refused"
-        for row in waiting
-    )
-
-
 def test_selector_stage_disabled_is_noop(
     kanban_conn, stage_config, fake_aux,
 ):
     _source(kanban_conn)
     assert selector_config({"enabled": True}) == {
-        "enabled": True, "max_per_tick": 3, "selection_allowance": 5_000,
+        "enabled": True, "max_per_tick": 3,
     }
     stage_config.recipes["selector"]["enabled"] = False
     assert selector_stage.run_stage(kanban_conn, "test") == {

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from shipfactory.recipes.loader import load_library, validate_budget_closure
+from shipfactory.recipes.loader import load_library
 from shipfactory.config import FactoryConfig
 from shipfactory.recipes.advancer import startup_guard
 
@@ -63,20 +63,10 @@ def test_dev_pipeline_7_pools_cover_every_declared_activation_cap():
     assert budgets["max_activations"] >= sum(caps.values())
 
 
-def test_runtime_budget_closure_tracks_configured_profile_allowances():
-    recipe = _recipe(7)
-    profiles = {
-        name: {"token_allowance": TOKEN_ALLOWANCE}
-        for name in ("planning", "build", "review")
-    }
-    validate_budget_closure(recipe, profiles)
-
-    profiles["planning"]["token_allowance"] += 1
-    with pytest.raises(ValueError, match="token pool 'planning'.*activation caps"):
-        validate_budget_closure(recipe, profiles)
-
-
-def test_startup_guard_applies_closure_to_latest_active_version(monkeypatch):
+def test_startup_guard_loads_the_published_library_under_the_count_only_regime(monkeypatch):
+    """Token-budget closure was removed (finding #77); startup_guard now
+    validates the whole published library on load, including the count
+    invariant that max_activations covers the sum of step_activation_caps."""
     from hermes_cli import config as hermes_config  # type: ignore[import-not-found]
 
     monkeypatch.setattr(
@@ -84,7 +74,7 @@ def test_startup_guard_applies_closure_to_latest_active_version(monkeypatch):
         lambda: {"kanban": {"auto_decompose": False}},
     )
     profiles = {
-        name: {"token_allowance": TOKEN_ALLOWANCE}
+        name: {"max_runtime_seconds": 1800, "max_retries": 2}
         for name in ("standard", "planning", "build", "review")
     }
     config = FactoryConfig(
@@ -101,10 +91,6 @@ def test_startup_guard_applies_closure_to_latest_active_version(monkeypatch):
         },
     )
     startup_guard(config)
-
-    profiles["planning"]["token_allowance"] += 1
-    with pytest.raises(ValueError, match="dev-pipeline@10 token pool 'planning'"):
-        startup_guard(config)
 
 
 def test_dev_pipeline_7_published_bytes_are_pinned():

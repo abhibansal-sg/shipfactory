@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from shipfactory.recipes.loader import load_library, validate_budget_closure
+from shipfactory.recipes.loader import load_library
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,40 +62,6 @@ def test_dev_pipeline_9_reworded_instructions_only_swap_the_sentinel_sentence():
             "the exact\nSHIPFACTORY_VERDICT JSON sentinel",
             "the exact\nstructured SHIPFACTORY_VERDICT v2 JSON sentinel",
         )
-
-
-def test_dev_pipeline_9_closes_against_ratified_live_allowances():
-    v9 = _recipe(9)
-    profiles = {
-        name: {"token_allowance": allowance}
-        for name, allowance in RATIFIED_PROFILE_ALLOWANCES.items()
-    }
-    validate_budget_closure(v9, profiles)
-
-    required: dict[str, int] = defaultdict(int)
-    caps = v9["budgets"]["step_activation_caps"]
-    for step in v9["steps"]:
-        if step["primitive"] in {"agent_task", "review_gate"}:
-            pool = step["params"]["execution_profile"]
-            required[pool] += caps[step["id"]] * RATIFIED_PROFILE_ALLOWANCES[pool]
-    assert dict(required) == {
-        "planning": 250_000,
-        "review": 600_000,
-        "build": 225_000,
-    }
-    assert v9["budgets"] == _recipe(8)["budgets"]
-    assert v9["budgets"]["token_pools"] == dict(required)
-    assert v9["budgets"]["max_tokens"] == sum(required.values()) == 1_075_000
-
-
-def test_dev_pipeline_9_fails_closed_on_future_live_allowance_drift():
-    profiles = {
-        name: {"token_allowance": allowance}
-        for name, allowance in RATIFIED_PROFILE_ALLOWANCES.items()
-    }
-    profiles["build"]["token_allowance"] += 1
-    with pytest.raises(ValueError, match="token pool 'build'.*activation caps"):
-        validate_budget_closure(_recipe(9), profiles)
 
 
 def test_dev_pipeline_9_published_bytes_are_pinned():

@@ -422,27 +422,18 @@ def test_plan_rejects_deployment_control_without_high_risk_tag(tmp_path, kanban_
         )
 
 
-def test_plan_rejects_node_budgets_exceeding_remaining_pool(tmp_path, kanban_conn):
+def test_plan_rejects_node_budget_key_after_token_removal(tmp_path, kanban_conn):
+    """Plan-node token budgets were removed with the token system (finding
+    #77); a node declaring the old budget key is now an invalid node shape."""
     repo, base_sha, task_spec, output = _advance_to_plan_draft(
         tmp_path, kanban_conn, "plan-budget",
     )
 
-    def infeasible(document):
+    def with_budget(document):
         document["nodes"][0]["budget"] = {"token_pool": "build", "tokens": 70_000}
-        document["nodes"].append({
-            "id": "second-build", "title": "Build the second half", "needs": [],
-            "kind": "logic", "requirements": ["REQ-1"],
-            "allowed_paths": ["second.py"], "expected_outputs": ["change-set"],
-            "test_cases": ["TEST-REQ-1-B"], "risk_tags": [],
-            "budget": {"token_pool": "build", "tokens": 70_000},
-        })
-        document["integration_order"].append("second-build")
 
-    with pytest.raises(
-        ValueError,
-        match="token pool 'build' declares 140000 tokens but only 130000 remain",
-    ):
-        _seal_plan_candidate(repo, "plan-budget", base_sha, task_spec, output, infeasible)
+    with pytest.raises(ValueError, match="invalid node shape"):
+        _seal_plan_candidate(repo, "plan-budget", base_sha, task_spec, output, with_budget)
 
 
 def test_spec_rejection_reactivates_only_the_spec_cone(tmp_path, kanban_conn):

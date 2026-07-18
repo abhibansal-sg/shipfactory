@@ -1446,33 +1446,6 @@ def nonterminal_app_sessions() -> list[dict[str, Any]]:
         ))
 
 
-def admit_budget_charge(db: sqlite3.Connection, *, key: str, board: str, utc_day: str, instance_id: str,
-                        step_id: str, activation: int, tokens: int,
-                        ceiling: int, token_pool: str | None = None) -> bool:
-    """Enforce the one configured board-day ceiling in the caller's transaction."""
-    tokens, ceiling = int(tokens), int(ceiling)
-    existing = db.execute(
-        "SELECT 1 FROM budget_charges WHERE key=?", (key,)
-    ).fetchone()
-    if existing:
-        return True
-    daily = int(db.execute(
-        "SELECT COALESCE(SUM(tokens),0) FROM budget_charges WHERE board=? AND utc_day=?",
-        (board, utc_day),
-    ).fetchone()[0])
-    if daily + tokens > ceiling:
-        return False
-    db.execute(
-        "INSERT INTO budget_charges(key,board,utc_day,instance_id,step_id,activation,tokens,created_at,token_pool) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
-        (
-            key, board, utc_day, instance_id, step_id, int(activation), tokens,
-            _now(), token_pool,
-        ),
-    )
-    return True
-
-
 def sync_get(gh_number) -> dict | None:
     """Return the synchronization mapping for a GitHub issue."""
     init_db()
@@ -1490,4 +1463,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "admit_budget_charge", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]

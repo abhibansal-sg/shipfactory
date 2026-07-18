@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from shipfactory import store
@@ -54,23 +53,6 @@ def _record_outcome(selection_id: str, outcome: str, *, selection: dict | None =
                 json.dumps(chosen, sort_keys=True), json.dumps(parameters, sort_keys=True),
                 json.dumps(skips, sort_keys=True), outcome, root, store._now(), selection_id,
             ),
-        )
-
-
-def _admit_selection(selection_id: str, board: str, allowance: int, ceiling: int) -> bool:
-    """Atomically debit one non-refundable selector attempt against board-day."""
-    day = datetime.now(timezone.utc).date().isoformat()
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        activation = int(db.execute(
-            "SELECT COUNT(*) FROM budget_charges WHERE instance_id=? AND step_id='selector'",
-            (selection_id,),
-        ).fetchone()[0]) + 1
-        key = hashlib.sha256(f"{selection_id}|selector|{activation}|admit".encode()).hexdigest()
-        return store.admit_budget_charge(
-            db, key=key, board=board, utc_day=day, instance_id=selection_id,
-            step_id="selector", activation=activation, tokens=allowance,
-            ceiling=ceiling,
         )
 
 
@@ -204,8 +186,6 @@ def run_stage(conn: Any, board: str) -> dict[str, int]:
         recipes["library_path"], seats=seats, profiles=profiles,
         verification_profiles=set(recipes.get("verification_profiles", {})),
     )
-    allowance = int(settings["selection_allowance"])
-    ceiling = int(recipes["board_day_token_ceiling"])
     tasks = kanban_db.list_tasks(
         conn, status="triage", limit=int(settings["max_per_tick"]), order_by="created",
     )
@@ -221,14 +201,7 @@ def run_stage(conn: Any, board: str) -> dict[str, int]:
             if row.get("ranked_json") not in (None, "[]"):
                 cached = json.loads(row["ranked_json"])
             if cached is None:
-                if not _admit_selection(selection_id, board, allowance, ceiling):
-                    _park(conn, task.id, "budget_refused")
-                    _record_outcome(selection_id, "budget_refused")
-                    result["parked"] += 1
-                    continue
-                cached = run_selection(
-                    task, library, seats=cfg.seats, max_tokens=allowance,
-                )
+                cached = run_selection(task, library, seats=cfg.seats)
                 _cache_selection(selection_id, cached)
             try:
                 nodes = validate_or_park_selection(

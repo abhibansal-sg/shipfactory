@@ -266,7 +266,7 @@ def _recipe(args: argparse.Namespace) -> Any:
                     "kind": "triage_selection",
                 } for row in db.execute(
                     "SELECT * FROM triage_selections WHERE outcome IN "
-                    "('budget_refused','needs_clarification','no_recipe_match') ORDER BY updated_at"
+                    "('needs_clarification','no_recipe_match') ORDER BY updated_at"
                 ))
             else:
                 answer = [dict(r) for r in db.execute("SELECT * FROM recipe_instances ORDER BY created_at DESC")]

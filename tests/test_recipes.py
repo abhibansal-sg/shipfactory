@@ -472,7 +472,7 @@ def test_placeholder_guard_does_not_reject_arbitrary_angle_bracket_text():
     ]),
     ("plan", "shipfactory.plan/v1", [
         "all task-spec requirements must be covered", "Every test_cases entry",
-        "Every overlap", "control-plane or high-risk", "remaining instance and pool budgets",
+        "Every overlap", "control-plane or high-risk",
     ]),
     ("review-story", "shipfactory.review-story/v1", [
         "exactly match the Factory-opened producer inputs",
