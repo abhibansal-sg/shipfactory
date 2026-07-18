@@ -531,11 +531,20 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   checked directly; the subprocess probe survives only as a fallback
   (finding #75, first-light-8 2026-07-18).
 
+- Environment grants must be made where the environment is constructed:
+  fixing the browser-cache resolver (finding #75) changed nothing because the
+  v2 verification runner is spawned with a REBUILT scrubbed env and an
+  isolated HOME — the grant made at the inner sidecar site never existed in
+  the outer child, and inside that child every fallback was structurally
+  blind. _runner_env itself now grants PLAYWRIGHT_BROWSERS_PATH, resolved
+  from the real HOME in the daemon and inherited explicitly by nested
+  children (finding #76, first-light-9 2026-07-18).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#75 so far). When you fix one: commit message
+- Findings get numbers (#22–#76 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

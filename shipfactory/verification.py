@@ -765,6 +765,15 @@ def _runner_env(bundle_id: str) -> dict[str, str]:
     if os.environ.get("PYTHONPATH"):
         python_paths.append(os.environ["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
+    # The runner HOME is isolated, which also hides the real user's Playwright
+    # cache — grant exactly the trusted browser cache here, where the env is
+    # constructed (finding #76): the daemon resolves it from the real HOME and
+    # the runner child inherits the explicit variable, so browser drivers at
+    # any depth see it. Without this every browser case fails with
+    # "Executable doesn't exist" inside the isolated cache path.
+    browsers = _playwright_browsers_path(sys.executable)
+    if browsers:
+        env["PLAYWRIGHT_BROWSERS_PATH"] = browsers
     return env
 
 
