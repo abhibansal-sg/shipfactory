@@ -729,10 +729,15 @@ def test_parse_verdict_v2_fails_closed_with_the_stable_prefix(line):
     ("a/b.py:1-9", True),
     ("Sources/App.swift:12", True),
     ("README.md:3", True),
+    # finding #72 (first-light): any short alphanumeric extension is a real
+    # repository file — a reviewer citing message.txt:1 must not be rejected.
+    ("message.txt:1", True),
+    (".shipfactory/verification.yaml:2-16", True),
+    ("config.toml:7", True),
     ("a.py", False),
     ("a.py:1x", False),
     ("a.py:1-", False),
-    ("a.txt:3", False),
+    ("README:3", False),
     ("no citation here", False),
     ("prose then a.py:1 then prose", False),
 ])

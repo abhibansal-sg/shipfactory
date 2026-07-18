@@ -498,11 +498,19 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   worker's capped context is unreachable from the plugin (finding #71,
   SF-17 lane 3, PR #23).
 
+- Contract gates must validate shape, not curate content: the v2 finding-
+  location gate's extension allowlist rejected a reviewer's legitimate
+  citation of message.txt:1 — the exact file the task changed — turning a
+  correct hostile review into a malformed-verdict block on the very first
+  live dev-pipeline@9 journey. The gate now requires one concrete
+  file.ext:line location with any short alphanumeric extension
+  (finding #72, first-light 2026-07-18).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#71 so far). When you fix one: commit message
+- Findings get numbers (#22–#72 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
