@@ -1208,8 +1208,39 @@ def _playwright_python() -> str | None:
     return sys.executable
 
 
+def _default_browsers_cache() -> Path:
+    """Playwright's per-platform default browser cache for the real HOME."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
 def _playwright_browsers_path(interpreter: str) -> str | None:
-    """Resolve the installed browser cache before the child HOME is isolated."""
+    """Resolve the installed browser cache before the child HOME is isolated.
+
+    Deterministic-first (finding #75): the original implementation launched a
+    full Playwright driver subprocess with a 5s timeout to ask for the
+    executable path. Under verification load (build reap + app bootstrap +
+    sidecar spawn on one tick) that probe intermittently timed out and
+    silently returned None, downgrading every browser case to
+    infrastructure_error. A hot-path trust probe must not depend on winning a
+    race, so the well-known cache locations are checked directly and the
+    subprocess probe remains only as a fallback for exotic installs.
+    """
+    explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    for candidate in (Path(explicit) if explicit else None, _default_browsers_cache()):
+        if candidate is None:
+            continue
+        try:
+            if candidate.is_dir() and any(candidate.glob("chromium*")):
+                return str(candidate)
+        except OSError:
+            continue
+    return _probed_browsers_path(interpreter)
+
+
+def _probed_browsers_path(interpreter: str) -> str | None:
+    """Fallback: ask a Playwright driver subprocess for the executable path."""
     probe = (
         "from playwright.sync_api import sync_playwright; "
         "p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()"
