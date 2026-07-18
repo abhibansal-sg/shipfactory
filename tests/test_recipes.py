@@ -475,7 +475,7 @@ def test_placeholder_guard_does_not_reject_arbitrary_angle_bracket_text():
         "Every overlap", "control-plane or high-risk",
     ]),
     ("review-story", "shipfactory.review-story/v1", [
-        "exactly match the Factory-opened producer inputs",
+        "copied VERBATIM from the input_artifact_set_hash",
         "may name only ids that exist in the task-spec",
         "Every task-spec requirement", "at least one existing evidence case id",
         "Every real changed path must appear exactly once", "retries, skips, or warnings",

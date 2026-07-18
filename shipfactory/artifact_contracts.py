@@ -114,7 +114,7 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
     "shipfactory.review-story/v1": {
         "schema": "shipfactory.review-story/v1",
         "instance_id": "<exact recipe instance id from input context>",
-        "revision_hash": "<64 hex: exact producer input artifact revision>",
+        "revision_hash": "<64 hex: copy input_artifact_set_hash from your review inputs verbatim>",
         "task_spec_sha256": "<64 hex: exact sealed task-spec SHA-256 from input>",
         "plan_sha256": "<64 hex: exact sealed plan SHA-256 from input>",
         "change_set_sha256": "<64 hex: exact sealed change-set SHA-256 from input>",
@@ -206,8 +206,12 @@ _NOTES = {
     "shipfactory.review-story/v1": (
         "changes is nonempty and each item has exactly the shown keys. not_changed is either "
         "empty or contains explicit not-implemented objects with requirement_ids, reason, "
-        "and not_implemented=true (or disposition='not_implemented'). instance_id, revision_hash, "
-        "and all four artifact hashes must exactly match the Factory-opened producer inputs. "
+        "and not_implemented=true (or disposition='not_implemented'). revision_hash must be "
+        "copied VERBATIM from the input_artifact_set_hash value in your Factory-opened "
+        "review-input context — do NOT compute, derive, or hash anything for it; it is not the "
+        "change-set hash. instance_id and all four artifact hashes (task_spec_sha256, "
+        "plan_sha256, change_set_sha256, evidence_bundle_sha256) must likewise be copied "
+        "exactly from those same Factory-opened producer inputs. "
         "changes.requirement_ids and not_changed requirement ids may name only ids that exist in "
         "the task-spec. "
         "Every task-spec requirement must appear in changes or an explicit not_changed item. "
