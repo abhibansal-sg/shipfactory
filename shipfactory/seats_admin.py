@@ -73,7 +73,9 @@ def _validate_fields(name: str, profile: str, executor: str, model: str, max_con
     if not isinstance(profile, str) or profile not in list_profiles():
         raise FactoryConfigError(f"profile {profile!r} does not exist")
     if executor not in EXECUTORS:
-        raise FactoryConfigError(f"unknown executor {executor!r}; expected hermes, codex, or claude")
+        raise FactoryConfigError(
+            f"unknown executor {executor!r}; expected one of {', '.join(sorted(EXECUTORS))}"
+        )
     if not isinstance(model, str) or not model.strip():
         raise FactoryConfigError("model is required")
     if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or max_concurrent < 1:

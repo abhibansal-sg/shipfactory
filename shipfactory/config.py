@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 
 AGENT_ROLES = frozenset({"ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"})
-EXECUTORS = frozenset({"hermes", "codex", "claude"})
+EXECUTORS = frozenset({"hermes", "codex", "claude", "grok"})
 SELECTOR_DEFAULTS = {
     "enabled": True,
     "max_per_tick": 3,

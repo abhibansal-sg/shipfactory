@@ -301,7 +301,7 @@ def _run_provider_family(run: Any, role: str) -> tuple[str | None, str | None]:
     """Resolve a run's persisted provider family, failing closed if unknown."""
     value = run["provider"] if run["provider"] is not None else run["executor"]
     family = str(value or "").strip().casefold()
-    if family not in {"codex", "claude", "hermes"}:
+    if family not in {"codex", "claude", "hermes", "grok"}:
         return None, f"review_{role}_provider_unknown:{value!r}"
     return family, None
 

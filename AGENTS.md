@@ -550,11 +550,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   unconditionally on admission so the run caps stand alone (finding #77,
   token-budget removal PR 1).
 
+- grok is a first-class executor / provider family (finding #78): the grok
+  CLI runs headless via `grok --prompt-file /dev/stdin --output-format json
+  -m grok-4.5`, authenticated by its own session (no API key in Factory
+  config; ~/.grok permission_mode=always-approve keeps it non-interactive).
+  It emits ONE JSON object whose `text` field carries the agent's final
+  message (and the sentinel) and a `usage` record — so extract_text/parse_usage
+  parse the whole log as one object, not JSONL. grok is a distinct family from
+  codex/claude, so a codex builder + grok reviewer satisfies the cross-provider
+  law with zero Anthropic.
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#77 so far). When you fix one: commit message
+- Findings get numbers (#22–#78 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
