@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, Callable
 
 import yaml
@@ -2319,6 +2319,31 @@ def run_action(payload: dict[str, Any]) -> dict[str, Any]:
     return _spawn_runner(runner_payload)
 
 
+_EVIDENCE_READ_ATTEMPTS = 4
+_EVIDENCE_READ_BACKOFF_SECONDS = 0.05
+
+
+def _read_evidence_item(path: Path) -> tuple[Any, bytes]:
+    """lstat+read an evidence item, retrying only transient OSErrors.
+
+    A momentarily busy evidence volume can raise OSError on lstat/read. A human
+    gate decision re-verifies every sealed item on disk, so a single stall would
+    otherwise fail-close a legitimate approve/reject (finding #82). The last
+    OSError still propagates, so a genuinely missing/unreadable file remains a
+    fail-closed invariant violation; the caller keeps hash/size verification.
+    """
+    last: OSError | None = None
+    for attempt in range(_EVIDENCE_READ_ATTEMPTS):
+        try:
+            return path.lstat(), path.read_bytes()
+        except OSError as exc:
+            last = exc
+            if attempt + 1 < _EVIDENCE_READ_ATTEMPTS:
+                sleep(_EVIDENCE_READ_BACKOFF_SECONDS)
+    assert last is not None
+    raise last
+
+
 def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str, Any]:
     """Verify a bundle by ID, including its exact sealed item membership."""
     if db is None:
@@ -2389,13 +2414,27 @@ def verify_evidence_bundle(bundle_id: str, *, db: Any | None = None) -> dict[str
         )
     if document.get("cases") != cases:
         raise EvidenceInvariantError("sealed bundle case manifest does not match the database")
+    # ~/.hermes is a symlink (-> /Volumes/MainData/Runtime/Hermes on this host),
+    # so the item paths and the evidence root can be recorded/computed in
+    # different symlink forms depending on the process's HERMES_HOME. A lexical
+    # relative_to then falsely rejects a genuinely-contained item and fail-closes
+    # a legitimate human decision (finding #82). Compare fully-resolved real
+    # paths: containment is symlink-agnostic, and an item (or an in-root symlink)
+    # whose real target escapes the sealed root still fails closed.
+    root_real = root.resolve()
     for item in items:
         path = Path(item["path"])
         try:
-            path.relative_to(root)
-            info = path.lstat()
-            data = path.read_bytes()
+            path.resolve().relative_to(root_real)
         except (OSError, ValueError) as exc:
+            raise EvidenceInvariantError(f"evidence item {item['id']} path is invalid") from exc
+        # A lstat/read stall on a busy evidence volume is transient; the decision
+        # re-verifies every item on disk, so a momentary OSError must not
+        # fail-close. Read with a short bounded retry; a genuinely missing or
+        # unreadable file still fails closed, and hash/size stays fatal.
+        try:
+            info, data = _read_evidence_item(path)
+        except OSError as exc:
             raise EvidenceInvariantError(f"evidence item {item['id']} path is invalid") from exc
         if (not stat.S_ISREG(info.st_mode) or len(data) != int(item["size_bytes"])
                 or hashlib.sha256(data).hexdigest() != item["sha256"]):

@@ -506,3 +506,136 @@ def test_runner_env_grants_the_trusted_browser_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(verification.Path, "home", classmethod(lambda cls: tmp_path / "isolated"))
     child_env = verification._runner_env("bundle-a")
     assert child_env["PLAYWRIGHT_BROWSERS_PATH"] == str(cache)
+
+
+def test_evidence_item_read_retries_transient_oserror(tmp_path, monkeypatch):
+    """finding #82: a momentary OSError on an item read is retried, not fatal."""
+    real = tmp_path / "item.log"
+    real.write_bytes(b"payload")
+    info = os.lstat(real)
+
+    class _Flaky:
+        def __init__(self, fail_times):
+            self.left = fail_times
+            self.reads = 0
+
+        def lstat(self):
+            return info
+
+        def read_bytes(self):
+            self.reads += 1
+            if self.left > 0:
+                self.left -= 1
+                raise OSError("evidence volume momentarily busy")
+            return b"payload"
+
+    monkeypatch.setattr(verify, "_EVIDENCE_READ_BACKOFF_SECONDS", 0)
+    flaky = _Flaky(fail_times=verify._EVIDENCE_READ_ATTEMPTS - 1)
+    got_info, data = verify._read_evidence_item(flaky)
+    assert data == b"payload" and got_info is info
+    assert flaky.reads == verify._EVIDENCE_READ_ATTEMPTS  # rode the cap, then succeeded
+
+
+def test_evidence_item_read_fails_closed_after_persistent_oserror(monkeypatch):
+    """A truly unreadable item still propagates OSError after the retries."""
+    monkeypatch.setattr(verify, "_EVIDENCE_READ_BACKOFF_SECONDS", 0)
+
+    class _Dead:
+        def lstat(self):
+            return None
+
+        def read_bytes(self):
+            raise OSError("evidence volume offline")
+
+    with pytest.raises(OSError):
+        verify._read_evidence_item(_Dead())
+
+
+def test_evidence_bundle_rides_a_transient_item_read_stall(tmp_path, monkeypatch):
+    """A one-shot item-read stall no longer surfaces as 'path is invalid'."""
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest)
+    assert bundle["state"] == "done"
+
+    real_read = Path.read_bytes
+    stalled = {"fired": False}
+
+    def flaky_read_bytes(self):
+        if not stalled["fired"] and "/evidence/items/" in str(self):
+            stalled["fired"] = True
+            raise OSError("evidence volume momentarily busy")
+        return real_read(self)
+
+    monkeypatch.setattr(verify, "_EVIDENCE_READ_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
+
+    verified = verify.verify_evidence_bundle(bundle["id"])
+    assert verified["head_sha"] == head
+    assert stalled["fired"]  # the transient genuinely fired and was ridden over
+
+
+def test_evidence_bundle_fails_closed_on_persistent_item_read_stall(tmp_path, monkeypatch):
+    """A persistent item-read failure still fails closed (fail-closed preserved)."""
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest)
+    assert bundle["state"] == "done"
+
+    real_read = Path.read_bytes
+
+    def dead_read_bytes(self):
+        if "/evidence/items/" in str(self):
+            raise OSError("evidence volume offline")
+        return real_read(self)
+
+    monkeypatch.setattr(verify, "_EVIDENCE_READ_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(Path, "read_bytes", dead_read_bytes)
+
+    with pytest.raises(verify.EvidenceInvariantError, match="path is invalid"):
+        verify.verify_evidence_bundle(bundle["id"])
+
+
+def test_evidence_bundle_verifies_across_symlinked_home(tmp_path, monkeypatch):
+    """finding #82: a symlinked HERMES_HOME must not fail-close a contained item.
+
+    Reproduces the live ~/.hermes -> /Volumes symlink: the evidence root is
+    served in one symlink form while the stored item paths use another. A
+    lexical relative_to raised 'path is invalid'; the resolve-both check accepts
+    it because both denote the same real directory.
+    """
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest)
+    assert bundle["state"] == "done"
+
+    db_path = store._db_path()                       # HERMES_HOME/shipfactory/shipfactory.db
+    home = db_path.parent.parent
+    link_home = tmp_path / "hermes-home-link"
+    link_home.symlink_to(home)                       # link -> real home
+    link_db = link_home / db_path.parent.name / db_path.name
+    # Evidence root now resolves via the symlink; DB item paths stay real form.
+    monkeypatch.setattr(store, "_db_path", lambda: link_db)
+
+    verified = verify.verify_evidence_bundle(bundle["id"])
+    assert verified["head_sha"] == head
+
+
+def test_evidence_bundle_rejects_item_symlink_escaping_root(tmp_path):
+    """resolve-both keeps fail-closed: an in-root item symlinked outside fails."""
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest)
+    with store._connect() as db:
+        item = dict(db.execute(
+            "SELECT id, path FROM evidence_items WHERE bundle_id=? ORDER BY id LIMIT 1",
+            (bundle["id"],),
+        ).fetchone())
+    p = Path(item["path"])
+    data = p.read_bytes()
+    outside = tmp_path / "exfil.log"
+    outside.write_bytes(data)                          # identical bytes: hash would pass
+    p.unlink()
+    p.symlink_to(outside)                              # in-root name, real target outside
+    with pytest.raises(verify.EvidenceInvariantError, match="path is invalid"):
+        verify.verify_evidence_bundle(bundle["id"])
