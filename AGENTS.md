@@ -43,12 +43,21 @@ publish `@N+1`; never edit a published version in place.
 ## Running
 
 The package needs the Hermes repo on `PYTHONPATH` (it imports
-`hermes_cli.kanban_db`) and file descriptors ≥ 4096:
+`hermes_cli.kanban_db`) and file descriptors ≥ 4096. **The Hermes checkout on
+`PYTHONPATH` must carry the recipe-kanban APIs** (`create_blocked_task` /
+`cancel_subtree`, the `feat-kanban-recipe-apis` line) — the shared Hermes tree
+is often switched to another branch for unrelated work, which drops those
+functions and hard-fails the startup guard. Use a dedicated git worktree so the
+shared tree is never disturbed:
 
 ```bash
 cd /Volumes/MainData/Developer/products/shipfactory
 ulimit -n 4096
-export PYTHONPATH=/Users/abbhinnav/Developer/products/hermes-mobile
+# One-time: a worktree pinned to the recipe-API line (shares the repo .git).
+#   git -C <hermes-repo> worktree add <WT> feat-kanban-recipe-apis
+WT=/Volumes/MainData/Developer/worktrees/hermes-shipfactory-recipe-apis
+export PYTHONPATH="$WT"                 # daemon: SHIPFACTORY_HERMES_PATH
+export HERMES_MOBILE_PATH="$WT"         # tests: conftest reads this
 PY=/Users/abbhinnav/Developer/products/hermes-mobile/.venv/bin/python
 
 $PY -m shipfactory.cli daemon --board <board>     # the daemon
@@ -58,6 +67,14 @@ $PY -m pytest tests/ -q                           # the tests (all must pass)
 State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
 `runs/`, `telemetry.jsonl`). The kanban boards live in
 `$HERMES_HOME/kanban/boards/<board>/kanban.db`.
+
+**Hermes CLI provenance flap (ABH-370):** if `hermes send`/`hermes kanban …`
+starts failing with `Hermes Git runtime failed provenance check; run: hermes
+update`, do NOT run `hermes update` (it restarts the managed 9119 gateway and
+advances the runtime). A dashboard-startup npm step re-dirties the managed
+runtime's `package-lock.json`; the clean, non-destructive fix is:
+`git -C "$HOME/Library/Application Support/StraitsLab/HermesGit/hermes-agent"
+checkout -- package-lock.json`. It is a generated lockfile line, never real code.
 
 ## Engine invariants
 
