@@ -506,11 +506,20 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   file.ext:line location with any short alphanumeric extension
   (finding #72, first-light 2026-07-18).
 
+- A hostile gate needs sufficiency conditions, not just necessary ones:
+  dev-pipeline@9's attack instructions said "approve only when ..." with no
+  clause compelling approval, so a maximally diligent reviewer found the
+  next-deeper (always technically correct) gap every round — four live
+  first-light journeys died at the spec gate across three request rewrites.
+  dev-pipeline@10 gives all four review gates explicit blocker criteria plus
+  a MUST-approve-otherwise clause, routing non-blocking observations into
+  the approve verdict's summary (finding #73, first-light 2026-07-18).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#72 so far). When you fix one: commit message
+- Findings get numbers (#22–#73 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
