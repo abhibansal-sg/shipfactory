@@ -441,3 +441,43 @@ def test_foreign_evidence_membership_is_rejected(tmp_path):
         )
     with pytest.raises(verify.EvidenceInvariantError, match="outside its sealed set"):
         verify.verify_evidence_bundle(bundle["id"])
+
+
+def test_browsers_path_resolves_deterministically_without_a_driver_subprocess(monkeypatch, tmp_path):
+    """finding #75: the subprocess probe intermittently timed out under
+    verification load, silently downgrading every browser case to
+    infrastructure_error. Well-known cache locations must win without a race."""
+    from shipfactory import verification
+
+    cache = tmp_path / "Library" / "Caches" / "ms-playwright"
+    (cache / "chromium_headless_shell-1228").mkdir(parents=True)
+    monkeypatch.setattr(verification.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(verification.sys, "platform", "darwin")
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(
+        verification, "_probed_browsers_path",
+        lambda interpreter: pytest.fail("deterministic path must not probe"),
+    )
+    assert verification._playwright_browsers_path("/usr/bin/false") == str(cache)
+
+
+def test_browsers_path_prefers_explicit_env_and_falls_back_to_probe(monkeypatch, tmp_path):
+    from shipfactory import verification
+
+    explicit = tmp_path / "custom-cache"
+    (explicit / "chromium-1228").mkdir(parents=True)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(explicit))
+    monkeypatch.setattr(
+        verification, "_probed_browsers_path",
+        lambda interpreter: pytest.fail("explicit env must not probe"),
+    )
+    assert verification._playwright_browsers_path("/usr/bin/false") == str(explicit)
+
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(verification.Path, "home", classmethod(lambda cls: empty_home))
+    monkeypatch.setattr(
+        verification, "_probed_browsers_path", lambda interpreter: "probed-result",
+    )
+    assert verification._playwright_browsers_path("/usr/bin/false") == "probed-result"

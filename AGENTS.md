@@ -523,11 +523,19 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   test_infrastructure_error blocks. The launcher now exports the venv onto
   PATH (finding #74, first-light-5 2026-07-18).
 
+- Hot-path trust probes must be deterministic: resolving the Playwright
+  browser cache by launching a driver subprocess with a 5s timeout
+  intermittently lost the race under verification load, silently returning
+  None so PLAYWRIGHT_BROWSERS_PATH was never granted and every browser case
+  died in the isolated runner HOME. Well-known cache locations are now
+  checked directly; the subprocess probe survives only as a fallback
+  (finding #75, first-light-8 2026-07-18).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#74 so far). When you fix one: commit message
+- Findings get numbers (#22–#75 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
