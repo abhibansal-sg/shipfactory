@@ -10,16 +10,19 @@ from pathlib import Path
 from typing import Any
 
 from shipfactory import store
-from shipfactory.policy import _CITATION_SUFFIX, citation_ok
+from shipfactory.policy import citation_ok
 from .instantiate import task_key
 
 _VERDICT = re.compile(r"^SHIPFACTORY_VERDICT:\s*(\{.*\})\s*$")
 VERDICT_CONTRACT_V2 = "shipfactory.verdict/v2"
-# A v2 finding location is one strict file.ext:line(-line) citation; the
-# accepted extensions derive from the policy citation suffix so the two
-# vocabularies cannot drift apart.
+# A v2 finding location is one strict file.ext:line(-line) citation. The
+# extension is any short alphanumeric suffix rather than an allowlist:
+# finding #72 (first-light) — a reviewer legitimately cited message.txt:1,
+# the exact file under change, and the enumerated-extension gate rejected
+# the verdict. The gate's job is forcing one concrete repository location,
+# not curating file types.
 _FINDING_LOCATION = re.compile(
-    r"[A-Za-z0-9._/-]+" + _CITATION_SUFFIX.pattern + r"(?:-\d+)?"
+    r"[A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,8}:\d+(?:-\d+)?"
 )
 
 
