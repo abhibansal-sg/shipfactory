@@ -334,7 +334,6 @@ def test_finding_15_approval_gate_parks_with_upstream_case_file(tmp_path, kanban
     assert "Verifier approved the revision" in case_file
     assert "APPROVE clean pass" in case_file
     assert "12 passed" in case_file and "1 skipped" in case_file
-    assert "100000 / 300000" in case_file
     assert "build (done)" in case_file
     assert "verify (done)" in case_file
     assert "approval (waiting)" in case_file

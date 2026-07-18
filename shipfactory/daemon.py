@@ -312,13 +312,6 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                     event_kwargs["environment_config"] = environment_runtime_config(recipes_cfg)
             except (ImportError, TypeError, ValueError):
                 pass
-            try:
-                if "board_day_token_ceiling" in inspect.signature(apply_events).parameters:
-                    event_kwargs["board_day_token_ceiling"] = int(
-                        recipes_cfg.get("board_day_token_ceiling", 10**18)
-                    )
-            except (TypeError, ValueError):
-                pass
             result_recipes = {
                 "events": apply_events(conn, **event_kwargs),
                 "outbox": deliver_outbox(conn, board=recipe_board),

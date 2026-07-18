@@ -216,35 +216,6 @@ def test_missing_start_identity_records_nullable_reconcilable_run(tmp_path, monk
     store.release_resource_lease(f"worker_slot:run:{row['id']}")
 
 
-def test_daemon_passes_config_ceiling_and_ignores_environment(kanban_conn, monkeypatch):
-    from hermes_cli import kanban_db
-
-    cfg = SimpleNamespace(company="budget", recipes={
-        "enabled": True,
-        "dispatcher_max_in_progress": 2,
-        "board_day_token_ceiling": 1234,
-        "execution_profiles": {"standard": {}},
-        "selector": {"enabled": False},
-    })
-    monkeypatch.setenv("FACTORY_BOARD_DAY_TOKEN_CEILING", "1")
-    monkeypatch.setattr(daemon, "validate_recipe_mode", lambda **kwargs: cfg)
-    monkeypatch.setattr(spawn, "restore_running", lambda **kwargs: {"restored": [], "crashed": []})
-    monkeypatch.setattr(spawn, "reap_finished", lambda: [])
-    monkeypatch.setattr(kanban_db, "dispatch_once", lambda *args, **kwargs: None)
-    captured = []
-
-    def apply(conn, *, profiles, board, board_day_token_ceiling):
-        captured.append(board_day_token_ceiling)
-        return 0
-
-    monkeypatch.setattr(advancer, "apply_events", apply)
-    monkeypatch.setattr(advancer, "deliver_outbox", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(advancer, "reconcile_root_collectors", lambda *args, **kwargs: 0)
-
-    daemon.tick(kanban_conn, board="budget")
-    assert captured == [1234]
-
-
 def test_missing_usage_stays_null_and_rollup_reports_unknown():
     unknown = store.record_run_start("unknown", "dev", "codex", "gpt", 1)
     known = store.record_run_start("known", "dev", "codex", "gpt", 2)

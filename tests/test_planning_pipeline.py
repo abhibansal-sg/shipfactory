@@ -502,40 +502,6 @@ def _budget_recipe(tmp_path: Path, text: str, key: str):
     return load_library(library).get(key)
 
 
-def test_named_pool_exhaustion_blocks_with_visible_reason(tmp_path, kanban_conn):
-    from hermes_cli import kanban_db
-    recipe = _budget_recipe(tmp_path, """schema: shipfactory.recipe/v2
-id: pool-budget
-version: 1
-status: active
-description: pool budget
-intent_tags: [test]
-supersedes: null
-parameters: {}
-budgets:
-  max_activations: 3
-  max_tokens: 300
-  step_activation_caps: {first: 1, second: 1}
-  token_pools: {planning: 100}
-steps:
-  - {id: first, primitive: agent_task, title: First, needs: [], optional: false, inputs: [], outputs: [], params: {seat: dev-backend, instructions: first, execution_profile: planning, workspace: worktree}}
-  - {id: second, primitive: agent_task, title: Second, needs: [first], optional: false, inputs: [], outputs: [], params: {seat: dev-backend, instructions: second, execution_profile: planning, workspace: worktree}}
-""", "pool-budget@1")
-    profiles = {"planning": {"max_runtime_seconds": 1, "max_retries": 1, "token_allowance": 60}}
-    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="pool")
-    reconcile(kanban_conn, "pool", profiles=profiles)
-    assert kanban_db.complete_task(kanban_conn, _step("pool", "first")["kanban_task_id"], result="done")
-    reconcile(kanban_conn, "pool", profiles=profiles)
-    assert _step("pool", "second")["blocked_reason"] == "budget_exhausted:token_pool:planning"
-    with store._connect() as db:
-        instance = db.execute("SELECT blocked_reason FROM recipe_instances WHERE id='pool'").fetchone()
-        charges = db.execute(
-            "SELECT token_pool,SUM(tokens) FROM budget_charges WHERE instance_id='pool' GROUP BY token_pool"
-        ).fetchone()
-    assert instance["blocked_reason"] == "budget_exhausted:token_pool:planning"
-    assert tuple(charges) == ("planning", 60)
-
-
 def test_step_activation_cap_exhaustion_blocks_instance(tmp_path, kanban_conn):
     from hermes_cli import kanban_db
     recipe = _budget_recipe(tmp_path, """schema: shipfactory.recipe/v2

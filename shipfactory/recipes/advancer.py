@@ -192,14 +192,21 @@ def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
                      )},
         )
 
-def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict[str, Any],
-           profile: dict[str, Any], profile_name: str,
-           board_day_token_ceiling: int) -> str | None:
-    allowance = int(profile["token_allowance"]); budgets = recipe["budgets"]; day = datetime.now(timezone.utc).date().isoformat()
+def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any],
+           step: dict[str, Any]) -> str | None:
+    """Count-only admission guard (finding #77 — token budgets removed).
+
+    Infinite loops are bounded by run counts here — total runs per instance
+    (max_activations) and runs per step (step_activation_caps / v1
+    max_step_activations) — and by the per-run wall-clock deadline in the
+    execution profile. Never by tokens. The activation counter is incremented
+    unconditionally on successful admission; it used to ride the (now deleted)
+    token charge, so decoupling it keeps the run caps enforcing on their own.
+    """
+    budgets = recipe["budgets"]
     v2 = recipe.get("schema") == "shipfactory.recipe/v2"
-    exhausted = "budget_exhausted" if v2 else "activation_fuse"
     if instance["activation_count"] + 1 > budgets["max_activations"]:
-        return f"{exhausted}:max_activations" if v2 else exhausted
+        return "budget_exhausted:max_activations" if v2 else "activation_fuse"
     count = db.execute("SELECT COUNT(*) FROM recipe_steps WHERE instance_id=? AND step_id=? AND primitive IN ('agent_task','review_gate')", (instance["id"], step["step_id"])).fetchone()[0]
     step_cap = (
         budgets["step_activation_caps"][step["step_id"]]
@@ -210,30 +217,10 @@ def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any], step: dict
             f"budget_exhausted:step_activation_cap:{step['step_id']}"
             if v2 else "activation_fuse"
         )
-    if instance["tokens_charged"] + allowance > budgets["max_tokens"]:
-        return "budget_exhausted:max_tokens" if v2 else "instance_budget"
-    if v2:
-        pool_limit = budgets["token_pools"].get(profile_name)
-        if pool_limit is None:
-            return f"budget_exhausted:unknown_token_pool:{profile_name}"
-        pool_charged = int(db.execute(
-            "SELECT COALESCE(SUM(tokens),0) FROM budget_charges "
-            "WHERE instance_id=? AND token_pool=?",
-            (instance["id"], profile_name),
-        ).fetchone()[0])
-        if pool_charged + allowance > int(pool_limit):
-            return f"budget_exhausted:token_pool:{profile_name}"
-    charge_key = advance_key(instance["id"], instance["recipe_hash"], step["step_id"], step["activation"], "admit", str(step["activation"]))
-    before = db.total_changes
-    if not store.admit_budget_charge(
-        db, key=charge_key, board=instance["board"], utc_day=day,
-        instance_id=instance["id"], step_id=step["step_id"],
-        activation=step["activation"], tokens=allowance,
-        ceiling=board_day_token_ceiling,
-        token_pool=profile_name if v2 else None,
-    ):
-        return "board_day_budget"
-    if db.total_changes > before: db.execute("UPDATE recipe_instances SET activation_count=activation_count+1,tokens_charged=tokens_charged+?,updated_at=? WHERE id=?", (allowance, store._now(), instance["id"]))
+    db.execute(
+        "UPDATE recipe_instances SET activation_count=activation_count+1,updated_at=? WHERE id=?",
+        (store._now(), instance["id"]),
+    )
     return None
 
 def _summary(db: Any, instance: dict[str, Any]) -> str:
@@ -731,9 +718,6 @@ def _resume_note(db: Any, conn: Any, instance: dict[str, Any], recipe: dict[str,
         "## Step Chain",
         chain,
         "",
-        "## Budget",
-        f"Tokens charged: {instance['tokens_charged']} / {recipe['budgets']['max_tokens']}",
-        "",
         "## Left",
         f"- Resume {unblocks} after this gate is consumed.",
         "",
@@ -949,7 +933,6 @@ def _fresh_activation(db: Any, instance: dict[str, Any], definition: dict[str, A
     return inserted
 
 def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]] | None = None,
-              board_day_token_ceiling: int = 10**18,
               verification_profiles: dict[str, dict[str, Any]] | None = None,
               environment_config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Idempotently reconcile every nonterminal activation with kanban/outbox."""
@@ -1338,10 +1321,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                     if not profile:
                         changed |= _transition(db, instance, step, "failed", "profile", reason="missing execution profile")
                         continue
-                    fuse = _admit(
-                        db, instance, recipe, step, profile, profile_name,
-                        int(board_day_token_ceiling),
-                    )
+                    fuse = _admit(db, instance, recipe, step)
                     if fuse:
                         changed |= _transition(db, instance, step, "blocked", "fuse", reason=fuse)
                         db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
@@ -2143,7 +2123,6 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
 
 def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None,
                  board: str | None = None,
-                 board_day_token_ceiling: int = 10**18,
                  verification_profiles: dict[str, dict[str, Any]] | None = None,
                  environment_config: dict[str, Any] | None = None) -> int:
     """Lease queued events one at a time, consume them, and reconcile instances."""
@@ -2173,7 +2152,6 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
         try:
             reconcile(
                 conn, ident, profiles=profiles,
-                board_day_token_ceiling=board_day_token_ceiling,
                 verification_profiles=verification_profiles,
                 environment_config=environment_config,
             )
@@ -2190,7 +2168,6 @@ def apply_events(conn: Any, *, profiles: dict[str, dict[str, Any]] | None = None
             try:
                 reconcile(
                     conn, ident, profiles=profiles,
-                    board_day_token_ceiling=board_day_token_ceiling,
                     verification_profiles=verification_profiles,
                     environment_config=environment_config,
                 )
