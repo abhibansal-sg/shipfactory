@@ -481,3 +481,28 @@ def test_browsers_path_prefers_explicit_env_and_falls_back_to_probe(monkeypatch,
         verification, "_probed_browsers_path", lambda interpreter: "probed-result",
     )
     assert verification._playwright_browsers_path("/usr/bin/false") == "probed-result"
+
+
+def test_runner_env_grants_the_trusted_browser_cache(monkeypatch, tmp_path):
+    """finding #76: the v2 runner is spawned with a rebuilt scrubbed env and an
+    isolated HOME, so a grant made anywhere else never reaches the browser
+    driver — every browser case failed with 'Executable doesn't exist' in the
+    isolated cache. The grant must be made where the env is constructed."""
+    from shipfactory import verification
+
+    cache = tmp_path / "Library" / "Caches" / "ms-playwright"
+    (cache / "chromium-1228").mkdir(parents=True)
+    monkeypatch.setattr(verification.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(verification.sys, "platform", "darwin")
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+
+    env = verification._runner_env("bundle-a")
+    assert env["PLAYWRIGHT_BROWSERS_PATH"] == str(cache)
+    assert env["HOME"] != str(tmp_path), "runner HOME must stay isolated"
+
+    # Child-process shape: isolated HOME, but the inherited explicit variable
+    # must win so nested sidecars keep the grant.
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
+    monkeypatch.setattr(verification.Path, "home", classmethod(lambda cls: tmp_path / "isolated"))
+    child_env = verification._runner_env("bundle-a")
+    assert child_env["PLAYWRIGHT_BROWSERS_PATH"] == str(cache)
