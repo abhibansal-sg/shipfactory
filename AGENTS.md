@@ -582,12 +582,29 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   the binding + a fresh client-minted nonce + operator actor/channel, and
   refuses locally when a gate has no revision binding yet. Round-trip and
   3-field-422 tests plus a bundle-guard lock it (finding #81, first-light-14).
+- A human gate decision re-verifies the whole evidence bundle by reading every
+  sealed item off disk (input_artifacts -> verify_evidence_bundle). `~/.hermes`
+  is a SYMLINK (-> /Volumes/MainData/Runtime/Hermes here), so the stored item
+  paths and the computed evidence root land in different symlink forms depending
+  on the serving process's HERMES_HOME: the daemon/CLI use `~/.hermes` on both
+  sides (pass), but the dashboard host resolves the root to `/Volumes/...` while
+  item paths stay `~/.hermes` — a lexical `path.relative_to(root)` then raises
+  ValueError -> "evidence item <id> path is invalid" and fail-closes EVERY
+  browser approve/reject deterministically (first misread as a transient because
+  the CLI path passes). Fix: compare fully-resolved real paths
+  (`path.resolve().relative_to(root.resolve())`) — symlink-agnostic, and an
+  in-root item symlinked to a target OUTSIDE root now fails closed too (stronger
+  than the old lexical check). Secondary hardening: `_read_evidence_item` retries
+  a genuinely transient lstat/read OSError (bounded 4 x 50ms); hash/size mismatch
+  stays fatal. NB: the fix only reaches a process that reloads shipfactory — the
+  running Hermes host serves the OLD check until it restarts; CLI decisions run
+  fresh code immediately (finding #82, first-light-14).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#81 so far). When you fix one: commit message
+- Findings get numbers (#22–#82 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
