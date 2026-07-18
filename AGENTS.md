@@ -540,11 +540,21 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   from the real HOME in the daemon and inherited explicitly by nested
   children (finding #76, first-light-9 2026-07-18).
 
+- Loop prevention is count-based, never token-based (operator decision,
+  2026-07-18): the token-budget system (max_tokens, token_pools,
+  token_allowance, board-day token ceiling, budget_charges accounting) is
+  being removed wholesale. Infinite loops are bounded by run counts
+  (max_activations per instance, step_activation_caps per step) and the
+  per-run wall-clock deadline. One subtlety: the activation counter used to
+  increment only as a side effect of the token charge; it is now incremented
+  unconditionally on admission so the run caps stand alone (finding #77,
+  token-budget removal PR 1).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#76 so far). When you fix one: commit message
+- Findings get numbers (#22–#77 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

@@ -1100,21 +1100,23 @@ steps:
     assert healed["verdict_json"] is None
 
 
-def test_budget_fuse_charges_worked_example_without_refunds(tmp_path, kanban_conn):
-    """§17.8 round-3 example: six admissions consume 300k; the seventh refuses."""
+def test_v1_run_cap_blocks_a_build_rework_loop(tmp_path, kanban_conn):
+    """Count-only loop guard (finding #77): max_step_activations bounds a
+    build<->review rework loop with no token budget. Two build runs are
+    allowed; the third rework attempt is refused by the run cap."""
     from hermes_cli import kanban_db
 
     recipe = _recipe(
         tmp_path,
         """schema: shipfactory.recipe/v1
-id: budget-loop
+id: run-cap-loop
 version: 1
 status: active
-description: exact budget-fuse example
+description: run-cap fuse example
 intent_tags: [test]
 supersedes: null
 parameters: {}
-budgets: {max_activations: 10, max_step_activations: 3, max_tokens: 300000}
+budgets: {max_activations: 10, max_step_activations: 2, max_tokens: 300000}
 steps:
   - id: build
     primitive: agent_task
@@ -1128,48 +1130,32 @@ steps:
     needs: [build]
     optional: false
     params: {seat: verifier, instructions: review, execution_profile: standard, workspace: worktree}
-  - id: ship
-    primitive: agent_task
-    title: Ship
-    needs: [review]
-    optional: false
-    params: {seat: release, instructions: ship, execution_profile: standard, workspace: worktree}
 """,
-        "budget-loop@1",
+        "run-cap-loop@1",
     )
-    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="budget")
-    reconcile(kanban_conn, "budget", profiles=PROFILES)
+    instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="runcap")
+    reconcile(kanban_conn, "runcap", profiles=PROFILES)
 
-    for activation in (1, 2, 3):
-        build = _step("budget", "build", activation)
+    for activation in (1, 2):
+        build = _step("runcap", "build", activation)
         assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result=f"build {activation}")
-        reconcile(kanban_conn, "budget", profiles=PROFILES)
-        review = _step("budget", "review", activation)
-        outcome = "approve" if activation == 3 else "request_changes"
+        reconcile(kanban_conn, "runcap", profiles=PROFILES)
+        review = _step("runcap", "review", activation)
         _complete_review(
-            kanban_db,
-            kanban_conn,
-            review["kanban_task_id"],
-            outcome=outcome,
-            target=None if outcome == "approve" else "build",
+            kanban_db, kanban_conn, review["kanban_task_id"],
+            outcome="request_changes", target="build",
         )
-        reconcile(kanban_conn, "budget", profiles=PROFILES)
+        reconcile(kanban_conn, "runcap", profiles=PROFILES)
 
-    blocked = _step("budget", "ship", 1)
-    instance = _instance("budget")
+    blocked = _step("runcap", "build", 3)
+    instance = _instance("runcap")
     assert blocked["state"] == "blocked"
-    assert blocked["blocked_reason"] == "instance_budget"
+    assert blocked["blocked_reason"] == "activation_fuse"
     assert blocked["kanban_task_id"] is None
     assert instance["status"] == "blocked"
-    assert instance["activation_count"] == 6
-    assert instance["tokens_charged"] == 300_000
-    with store._connect() as db:
-        charges = db.execute(
-            "SELECT COUNT(*),SUM(tokens) FROM budget_charges WHERE instance_id='budget'"
-        ).fetchone()
-    assert tuple(charges) == (6, 300_000)
-    reconcile(kanban_conn, "budget", profiles=PROFILES)
-    assert _instance("budget")["tokens_charged"] == 300_000
+    # Four runs admitted (build 1, review 1, build 2, review 2); the counter
+    # advances on its own now that it no longer rides a token charge.
+    assert instance["activation_count"] == 4
 
 
 def test_three_day_human_gate_is_never_claimed_reclaimed_or_duplicated(tmp_path, kanban_conn, monkeypatch):
