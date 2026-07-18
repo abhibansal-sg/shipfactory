@@ -560,11 +560,25 @@ State lives in `$HERMES_HOME/shipfactory/` (`shipfactory.db`, `seats.yaml`,
   codex/claude, so a codex builder + grok reviewer satisfies the cross-provider
   law with zero Anthropic.
 
+- An artifact field that must echo a Factory-provided value needs an
+  echo-it-verbatim instruction, not a describe-it one: the review-story worker
+  computed its own revision_hash (a change-set-style hash) instead of copying
+  the input_artifact_set_hash it was handed, blocking one step from the
+  approval card. The output contract now says revision_hash and the four
+  artifact hashes must be copied VERBATIM from the Factory-opened review
+  inputs — do not compute or derive them (finding #79, first-light-13).
+- KNOWN OPEN: on a failing browser case the on-failure screenshot (binary,
+  un-text-scannable) seals as redaction_state=uncertain and blocks the whole
+  bundle with `redaction_failed`, masking the real test failure and denying
+  the normal verify-failed rework path. Only bites on a failing build. Fix
+  candidate: trust binary captures from the sandboxed verification runner, or
+  surface the test failure ahead of the redaction block (finding #80, deferred).
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#78 so far). When you fix one: commit message
+- Findings get numbers (#22–#80 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
