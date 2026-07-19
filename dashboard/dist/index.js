@@ -894,7 +894,7 @@
         h("div", { className: "grid gap-4 sm:grid-cols-2" },
           h(FieldLabel, { htmlFor: "seat-name", required: true, control: h("input", { id: "seat-name", className: FIELD_CLASS, required: true, disabled: !!props.seat, value: values.name, onChange: function (event) { set("name", event.target.value); } }) }, "Seat name"),
           h(FieldLabel, { htmlFor: "seat-profile", required: true, control: h("select", { id: "seat-profile", className: FIELD_CLASS, required: true, value: values.profile, onChange: function (event) { set("profile", event.target.value); } }, profileOptions.map(function (profile) { return h("option", { key: profile, value: profile }, profile); })) }, "Profile · labor pool"),
-          h(FieldLabel, { htmlFor: "seat-executor", required: true, control: h("select", { id: "seat-executor", className: FIELD_CLASS, value: values.executor, onChange: function (event) { set("executor", event.target.value); } }, ["hermes", "codex", "claude"].map(function (executor) { return h("option", { key: executor, value: executor }, executor); })) }, "Executor"),
+          h(FieldLabel, { htmlFor: "seat-executor", required: true, control: h("select", { id: "seat-executor", className: FIELD_CLASS, value: values.executor, onChange: function (event) { set("executor", event.target.value); } }, ["hermes", "codex", "claude", "grok", "opencode"].map(function (executor) { return h("option", { key: executor, value: executor }, executor); })) }, "Executor"),
           h(FieldLabel, { htmlFor: "seat-model", required: true, control: h("input", { id: "seat-model", className: FIELD_CLASS, required: true, value: values.model, onChange: function (event) { set("model", event.target.value); } }) }, "Seat model")
         ),
         values.executor === "hermes" ? h("fieldset", { className: "grid gap-3 border border-border p-3" },
@@ -906,7 +906,7 @@
           )
         ) : null,
         h("div", { className: "grid gap-4 sm:grid-cols-3" },
-          h(FieldLabel, { htmlFor: "seat-reasoning", required: true, control: h("select", { id: "seat-reasoning", className: FIELD_CLASS, value: values.reasoning, onChange: function (event) { set("reasoning", event.target.value); } }, ["low", "medium", "high"].map(function (reasoning) { return h("option", { key: reasoning, value: reasoning }, reasoning); })) }, "Reasoning"),
+          h(FieldLabel, { htmlFor: "seat-reasoning", required: true, control: h("select", { id: "seat-reasoning", className: FIELD_CLASS, value: values.reasoning, onChange: function (event) { set("reasoning", event.target.value); } }, ["low", "medium", "high", "max"].map(function (reasoning) { return h("option", { key: reasoning, value: reasoning }, reasoning); })) }, "Reasoning"),
           h(FieldLabel, { htmlFor: "seat-role", required: true, control: h("input", { id: "seat-role", className: FIELD_CLASS, required: true, list: "seat-role-suggestions", value: values.role, onChange: function (event) { set("role", event.target.value); } }) }, "Role"),
           h(FieldLabel, { htmlFor: "seat-concurrency", required: true, control: h("input", { id: "seat-concurrency", className: FIELD_CLASS, required: true, min: 1, type: "number", value: values.max_concurrent, onChange: function (event) { set("max_concurrent", event.target.value); } }) }, "Max concurrent")
         ),

@@ -60,6 +60,7 @@ def stage_config(monkeypatch) -> FactoryConfig:
         name: Seat(name, profile=name, executor="codex", role=role)
         for name, role in (
             ("explorer", "researcher"),
+            ("author", "engineer"),
             ("dev-backend", "engineer"), ("verifier", "qa"),
             ("architect", "engineer"), ("operator", "general"),
         )

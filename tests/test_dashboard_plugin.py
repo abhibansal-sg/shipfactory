@@ -263,6 +263,27 @@ def test_bundle_registers_under_the_manifest_name() -> None:
     )
 
 
+def test_seat_dialog_exposes_every_supported_executor() -> None:
+    from shipfactory.config import EXECUTORS
+
+    bundle = (
+        Path(__file__).resolve().parents[1] / "dashboard" / "dist" / "index.js"
+    ).read_text()
+    selector = re.search(
+        r'id: "seat-executor".*?\}, \[(.*?)\]\.map\(function \(executor\)',
+        bundle,
+    )
+    assert selector, "seat executor select is missing from the dashboard bundle"
+    rendered = selector.group(1)
+    for executor in EXECUTORS:
+        assert f'"{executor}"' in rendered
+    reasoning = re.search(
+        r'id: "seat-reasoning".*?\}, \[(.*?)\]\.map\(function \(reasoning\)',
+        bundle,
+    )
+    assert reasoning and '"max"' in reasoning.group(1)
+
+
 def _seed_receipts_instance(home: Path) -> dict[str, int]:
     """Seed one instance with a rework attempt, run rows, and real run files."""
     store.init_db()
