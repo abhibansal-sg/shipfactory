@@ -616,12 +616,21 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   stays fatal. NB: the fix only reaches a process that reloads shipfactory — the
   running Hermes host serves the OLD check until it restarts; CLI decisions run
   fresh code immediately (finding #82, first-light-14).
+- OpenCode is a first-class executor family, not a model alias on another
+  harness. It runs headlessly with the prompt on stdin via `opencode run
+  --pure --format json --agent build --dir <workspace>`, selects a provider
+  model such as `zai-coding-plan/glm-5.2`, and maps the seat reasoning value
+  to OpenCode's model variant. Text comes from JSONL `text` events; usage is
+  summed across `step_finish.part.tokens` records. `--pure` excludes ambient
+  plugins, and Factory deliberately omits `--auto` so an unexpected permission
+  request fails closed instead of widening the worker boundary (finding #83,
+  self-build GLM seat preparation).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#82 so far). When you fix one: commit message
+- Findings get numbers (#22–#83 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

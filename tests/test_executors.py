@@ -139,3 +139,47 @@ def test_grok_is_a_distinct_provider_family_for_cross_provider_review():
     reviewer = {"provider": "grok", "executor": "grok"}
     assert _run_provider_family(builder, "builder") == ("codex", None)
     assert _run_provider_family(reviewer, "reviewer") == ("grok", None)
+
+
+def test_opencode_command_usage_and_text(tmp_path):
+    seat = SimpleNamespace(
+        profile="author", model="zai-coding-plan/glm-5.2", reasoning="max",
+    )
+    executor = get_executor("opencode")
+
+    cmd = executor.build_cmd(seat, "prompt arrives on stdin", str(tmp_path))
+
+    assert cmd[:3] == ["opencode", "run", "--pure"]
+    assert ["--format", "json"] == cmd[3:5]
+    assert "--agent" in cmd and "build" in cmd
+    assert "--dir" in cmd and str(tmp_path) in cmd
+    assert "--model" in cmd and "zai-coding-plan/glm-5.2" in cmd
+    assert "--variant" in cmd and "max" in cmd
+    assert "--auto" not in cmd
+
+    log = "\n".join([
+        '{"type":"step_start","part":{"type":"step-start"}}',
+        '{"type":"text","part":{"type":"text","text":"working"}}',
+        '{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":20,"output":3,"cache":{"read":4}}}}',
+        '{"type":"text","part":{"type":"text","text":"SHIPFACTORY_RESULT: done GLM-SEAT-OK"}}',
+        '{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":10,"output":2}}}',
+    ])
+    assert executor.extract_text(log).splitlines()[-1] == (
+        "SHIPFACTORY_RESULT: done GLM-SEAT-OK"
+    )
+    assert executor.parse_usage(log) == {
+        "tokens_in": 30, "tokens_out": 5, "tokens_total": 35,
+    }
+    assert executor.extract_text("startup failed") == "startup failed"
+    assert executor.parse_usage("startup failed") == {
+        "tokens_in": None, "tokens_out": None, "tokens_total": None,
+    }
+
+
+def test_opencode_is_a_distinct_provider_family_for_cross_provider_review():
+    from shipfactory.recipes.advancer import _run_provider_family
+
+    builder = {"provider": "grok", "executor": "grok"}
+    reviewer = {"provider": "opencode", "executor": "opencode"}
+    assert _run_provider_family(builder, "builder") == ("grok", None)
+    assert _run_provider_family(reviewer, "reviewer") == ("opencode", None)

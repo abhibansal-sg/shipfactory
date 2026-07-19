@@ -80,7 +80,8 @@ def test_startup_guard_loads_the_published_library_under_the_count_only_regime(m
     config = FactoryConfig(
         "test",
         {name: {} for name in (  # type: ignore[arg-type]
-            "explorer", "dev-backend", "verifier", "architect", "operator",
+            "explorer", "author", "dev-backend", "verifier", "architect",
+            "operator",
         )},
         {},
         {
