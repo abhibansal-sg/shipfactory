@@ -63,6 +63,11 @@ def stage_config(monkeypatch) -> FactoryConfig:
             ("author", "engineer"),
             ("dev-backend", "engineer"), ("verifier", "qa"),
             ("architect", "engineer"), ("operator", "general"),
+            # dev-pipeline@13 step-granular seats.
+            ("spec-author", "engineer"), ("plan-author", "engineer"),
+            ("story-author", "engineer"), ("builder", "engineer"),
+            ("spec-reviewer", "qa"), ("plan-reviewer", "qa"),
+            ("correctness-reviewer", "qa"), ("adversarial-reviewer", "engineer"),
         )
     }
     cfg = FactoryConfig(

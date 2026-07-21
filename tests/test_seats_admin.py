@@ -52,9 +52,14 @@ def test_mismatch_is_visible_and_update_resynchronizes_hermes_model(hermetic_her
 def test_home_isolation_and_validation(hermetic_hermes_home: Path):
     _profile(hermetic_hermes_home, "builder")
     assert list_profiles() == ["default", "builder"]
+    # A profile that does not exist is rejected only for a hermes seat, whose
+    # `hermes -p <profile>` argv genuinely needs it. A non-hermes seat's name
+    # is a dispatch label decoupled from the profiles directory.
     with pytest.raises(FactoryConfigError, match="does not exist"):
-        create_seat("bad", "outside", "codex", "gpt", "low", "engineer", 1)
+        create_seat("bad", "outside", "hermes", "gpt", "low", "engineer", 1)
     with pytest.raises(FactoryConfigError, match="positive"):
         create_seat("bad", "builder", "codex", "gpt", "low", "engineer", 0)
+    # A codex seat with no matching profile is now valid (the decoupling).
+    create_seat("decoupled", "spec-author", "codex", "gpt", "low", "author", 1)
     create_seat("isolated", "builder", "codex", "gpt", "low", "custom-role", 1)
     assert (hermetic_hermes_home / "shipfactory" / "seats.yaml").exists()

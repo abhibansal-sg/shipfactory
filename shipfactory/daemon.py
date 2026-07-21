@@ -350,9 +350,59 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                 logger.exception("Factory could not requeue capacity-deferred task %s", task.id)
             return None
 
+    def _rescue_nonspawnable_seats(conn, cfg, dispatched, spawn_fn, board):
+        """Claim + spawn ready tasks Hermes bucketed nonspawnable for a ShipFactory seat.
+
+        Defined inline so it captures the tick's ``spawn_fn`` closure; a free
+        function would ``NameError`` on every spawn and the per-task guard would
+        swallow it silently (the decoupling would no-op while tests pass).
+        """
+        from hermes_cli import kanban_db
+        # Per-assignee in-progress count for the count-cap (max_concurrent);
+        # mirrors dispatch_once's own per-profile counter.
+        running_by = {
+            row["assignee"]: int(row["n"])
+            for row in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status='running' AND assignee IS NOT NULL GROUP BY assignee"
+            )
+        }
+        for task_id in list(dispatched.skipped_nonspawnable):
+            try:
+                task = kanban_db.get_task(conn, task_id)
+                if task is None or task.status != "ready":
+                    continue  # review-column tasks (claim differently) and non-ready are not ours
+                assignee = (task.assignee or "").strip()
+                seat = cfg.seats.get(assignee)
+                if seat is None:
+                    continue  # genuine terminal lane (unknown assignee) — leave gated
+                if seat.executor == "hermes":
+                    continue  # carve-out: hermes -p <assignee> genuinely needs the profile
+                if running_by.get(assignee, 0) >= seat.max_concurrent:
+                    continue  # count-cap
+                claimed = kanban_db.claim_task(conn, task_id, ttl_seconds=None)
+                if claimed is None:
+                    continue  # lost race / no longer ready
+                workspace = kanban_db.resolve_workspace(claimed, board=board)
+                kanban_db.set_workspace_path(conn, task_id, str(workspace))
+                if spawn_fn(claimed, str(workspace), board=board) is not None:
+                    running_by[assignee] = running_by.get(assignee, 0) + 1
+            except Exception:
+                logger.exception("Factory could not rescue nonspawnable task %s", task_id)
+
     dispatched = dispatch_once(
         conn, spawn_fn=queue_safe_spawn, board=board, **dispatch_kwargs,
     )
+    # Decoupling (seat name != Hermes profile): Hermes' dispatcher buckets a
+    # ready task as `nonspawnable` when its assignee is not a profile directory.
+    # Our step-granular seats (spec-author, *-reviewer, ...) are ShipFactory
+    # seats, not profiles, so they land here. Hermes appends to this bucket
+    # BEFORE it would claim the task, so we are the sole claimant — no race.
+    # We claim + resolve workspace + spawn through our own spawn_fn, exactly
+    # as dispatch_once does for profile-backed tasks. Hermes-executor seats are
+    # carved out (their `hermes -p <assignee>` argv genuinely needs the profile).
+    if cfg is not None and hasattr(conn, "execute") and getattr(dispatched, "skipped_nonspawnable", None):
+        _rescue_nonspawnable_seats(conn, cfg, dispatched, queue_safe_spawn, board)
     if capacity_deferred:
         dispatched.spawned = [
             item for item in dispatched.spawned if item[0] not in capacity_deferred

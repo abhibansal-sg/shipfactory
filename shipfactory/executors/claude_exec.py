@@ -12,6 +12,7 @@ class ClaudeExecutor(Executor):
     """Run Claude headlessly with a stream-JSON transcript."""
 
     name = "claude"
+    CONFIG_KEYS = frozenset({"skip_permissions", "max_turns", "chrome"})
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build Paperclip's noninteractive Claude argv."""

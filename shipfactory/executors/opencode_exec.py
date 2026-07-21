@@ -17,6 +17,7 @@ class OpenCodeExecutor(Executor):
     """Run OpenCode headlessly with its raw JSON event stream."""
 
     name = "opencode"
+    CONFIG_KEYS = frozenset({"skip_permissions"})
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build a non-interactive ``opencode run`` invocation.

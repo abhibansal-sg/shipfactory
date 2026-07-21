@@ -9,6 +9,7 @@ class HermesExecutor(Executor):
     """Represent Hermes-native execution for registry and telemetry purposes."""
 
     name = "hermes"
+    CONFIG_KEYS = frozenset()
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Return the equivalent native worker argv (normally not launched here)."""

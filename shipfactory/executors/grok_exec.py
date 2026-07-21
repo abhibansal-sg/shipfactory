@@ -42,6 +42,7 @@ class GrokExecutor(Executor):
     """Run the grok CLI single-turn, reading its prompt from stdin."""
 
     name = "grok"
+    CONFIG_KEYS = frozenset({"permission_mode"})
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build the headless ``grok --prompt-file /dev/stdin`` argv.
