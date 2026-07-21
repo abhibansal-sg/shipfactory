@@ -126,14 +126,20 @@ def test_seat_endpoints_create_update_and_reject_missing_profile(hermetic_hermes
     (hermetic_hermes_home / "profiles" / "builder").mkdir(parents=True)
     client = _client()
     assert client.get("/api/plugins/shipfactory/profiles").json() == ["default", "builder"]
-    invalid = client.post("/api/plugins/shipfactory/seats", json={"name": "bad", "profile": "missing", "executor": "codex", "model": "gpt", "role": "engineer"})
+    # A missing profile is rejected only for a hermes seat (its `hermes -p`
+    # argv needs it). A non-hermes seat is decoupled from the profiles dir.
+    invalid = client.post("/api/plugins/shipfactory/seats", json={"name": "bad", "profile": "missing", "executor": "hermes", "model": "gpt", "role": "engineer"})
     assert invalid.status_code == 400 and "does not exist" in invalid.json()["detail"]
+    decoupled = client.post("/api/plugins/shipfactory/seats", json={"name": "spec-author", "executor": "codex", "model": "gpt", "role": "author"})
+    assert decoupled.status_code == 201 and decoupled.json()["name"] == "spec-author"
     created = client.post("/api/plugins/shipfactory/seats", json={"name": "builder", "profile": "builder", "executor": "hermes", "model": "claude-sonnet-5", "role": "engineer", "provider_config": {"provider": "proxy", "base_url": "http://proxy", "model": "claude-sonnet-5"}})
     assert created.status_code == 201 and created.json()["name"] == "builder"
     updated = client.put("/api/plugins/shipfactory/seats/builder", json={"max_concurrent": 2})
     assert updated.status_code == 200 and updated.json()["max_concurrent"] == 2
-    detail = client.get("/api/plugins/shipfactory/seats").json()[0]
-    assert detail["profile_model"] == "claude-sonnet-5" and detail["model_mismatch"] is False
+    rows = {row["name"]: row for row in client.get("/api/plugins/shipfactory/seats").json()}
+    assert rows["builder"]["profile_model"] == "claude-sonnet-5" and rows["builder"]["model_mismatch"] is False
+    # The decoupled codex seat has no profile and reports no profile_model.
+    assert rows["spec-author"]["profile"] is None and rows["spec-author"]["profile_model"] is None
 
 
 def test_waiting_gate_returns_complete_inert_operator_review_card(hermetic_hermes_home: Path):

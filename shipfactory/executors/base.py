@@ -87,8 +87,15 @@ def token_usage(tokens_in: int | None = None, tokens_out: int | None = None) -> 
     }
 
 
+# Config keys any executor accepts, in addition to its own CONFIG_KEYS.
+COMMON_KEYS = frozenset({"command", "extra_args", "env", "timeout_sec"})
+
+
 def profile_instruction(seat: "Seat", filename: str) -> str:
     """Read a profile instruction file, tolerating a minimal test install."""
+    if not seat.profile:
+        # A profile-less (non-hermes) seat has no identity directory to read.
+        return ""
     try:
         from hermes_cli.profiles import get_profile_dir
 

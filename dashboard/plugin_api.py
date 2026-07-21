@@ -90,6 +90,8 @@ class SeatWrite(BaseModel):
     role: str | None = None
     max_concurrent: int | None = Field(default=None, ge=1)
     provider_config: dict[str, object] | None = None
+    config: dict[str, object] | None = None
+    skills: list[str] | None = None
 
 
 def _latest_steps(db: Any, instance_id: str | None = None) -> list[dict[str, Any]]:
@@ -704,12 +706,16 @@ def profiles() -> list[str]:
 @router.post("/seats", status_code=201)
 def create_seat(seat: SeatWrite) -> dict[str, Any]:
     """Create through the same writer used by ``hermes shipfactory seat-create``."""
-    if None in (seat.name, seat.profile, seat.executor, seat.model, seat.role):
-        raise HTTPException(status_code=422, detail="name, profile, executor, model, and role are required")
+    # A profile is required only for a hermes seat; a non-hermes seat's name is
+    # a dispatch label decoupled from the profiles directory.
+    required = (seat.name, seat.executor, seat.model, seat.role)
+    if None in required or (seat.executor == "hermes" and seat.profile is None):
+        raise HTTPException(status_code=422, detail="name, executor, model, and role are required (profile required for hermes)")
     try:
         from shipfactory.seats_admin import create_seat as create
         return create(seat.name, seat.profile, seat.executor, seat.model, seat.reasoning or "", seat.role,
-                      seat.max_concurrent or 1, seat.provider_config)
+                      seat.max_concurrent or 1, seat.provider_config,
+                      config=seat.config, skills=seat.skills)
     except (ValueError, TypeError) as exc:
         raise _request_error(exc) from exc
 
@@ -719,7 +725,8 @@ def update_seat(name: str, seat: SeatWrite) -> dict[str, Any]:
     try:
         from shipfactory.seats_admin import update_seat as update
         return update(name, seat.profile, seat.executor, seat.model, seat.reasoning, seat.role,
-                      seat.max_concurrent, seat.provider_config)
+                      seat.max_concurrent, seat.provider_config,
+                      config=seat.config, skills=seat.skills)
     except (ValueError, TypeError) as exc:
         raise _request_error(exc) from exc
 

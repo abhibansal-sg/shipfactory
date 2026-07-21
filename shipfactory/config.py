@@ -5,13 +5,13 @@ from __future__ import annotations
 import ast
 import json
 import os
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-AGENT_ROLES = frozenset({"ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"})
 EXECUTORS = frozenset({"hermes", "codex", "claude", "grok", "opencode"})
 SELECTOR_DEFAULTS = {
     "enabled": True,
@@ -53,13 +53,20 @@ class Seat:
     """Configuration for one named Factory seat."""
 
     name: str
-    profile: str
     executor: str
+    # Hermes identity-file source ONLY; required iff executor == "hermes".
+    # A non-hermes seat's name is a dispatch label, explicitly NOT a profile.
+    profile: str | None = None
     model: str = ""
     reasoning: str = ""
     reports_to: str | None = None
     role: str = "general"
     max_concurrent: int = 1
+    # Skills to stage for the worker. Delivery is deferred; empty == no-op.
+    skills: tuple[str, ...] = ()
+    # Adapter-owned config blob (Paperclip's adapterConfig). Each executor
+    # owns the schema for its keys; model/reasoning stay top-level (finding #12).
+    config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -134,6 +141,26 @@ def _default_path() -> Path:
     return Path(home) / "shipfactory" / "seats.yaml"
 
 
+_SEAT_FIELDS = {f.name for f in fields(Seat)}
+
+
+def _normalize_seat(name: str, values: dict | None) -> Seat:
+    """Build a Seat, tolerating (and warning on) unknown forward-compat keys.
+
+    An old binary must never crash on a seats.yaml that a newer binary wrote:
+    unknown keys are dropped with a warning rather than raising, and ``skills``
+    is coerced to a tuple so the frozen dataclass stays hashable.
+    """
+    data = dict(values or {})
+    skills = data.get("skills")
+    if isinstance(skills, list):
+        data["skills"] = tuple(skills)
+    for key in sorted(set(data) - _SEAT_FIELDS):
+        warnings.warn(f"seat {name!r}: ignoring unknown key {key!r}", stacklevel=2)
+        data.pop(key)
+    return Seat(name=name, **data)
+
+
 def load_seats(path=None) -> FactoryConfig:
     """Load and validate a Factory configuration from YAML."""
     source = Path(path) if path is not None else _default_path()
@@ -145,7 +172,7 @@ def load_seats(path=None) -> FactoryConfig:
     if not isinstance(seats_raw, dict):
         raise FactoryConfigError("seats must be a mapping")
     try:
-        seats = {name: Seat(name=name, **(values or {})) for name, values in seats_raw.items()}
+        seats = {name: _normalize_seat(name, values) for name, values in seats_raw.items()}
     except (TypeError, ValueError) as exc:
         raise FactoryConfigError(f"invalid seat: {exc}") from exc
     recipes = raw.get("recipes", {}) or {}
@@ -180,16 +207,22 @@ def validate(cfg) -> None:
     for name, seat in cfg.seats.items():
         if not name or seat.name != name:
             raise FactoryConfigError(f"seat name mismatch: {name!r}")
-        if not seat.profile:
-            raise FactoryConfigError(f"seat {name!r}: profile is required")
-        try:
-            from hermes_cli.profiles import profile_exists
-        except ImportError:
-            profile_exists = None
-        if profile_exists is not None and not profile_exists(seat.profile):
-            raise FactoryConfigError(f"seat {name!r}: profile {seat.profile!r} does not exist")
         if seat.executor not in EXECUTORS:
             raise FactoryConfigError(f"seat {name!r}: unknown executor {seat.executor!r}")
+        # Only a hermes seat needs a real Hermes profile (its identity + the
+        # `hermes -p <profile>` argv). A non-hermes seat's name is a dispatch
+        # label decoupled from the profiles directory (rescue_nonspawnable_seats).
+        if seat.executor == "hermes":
+            if not seat.profile:
+                raise FactoryConfigError(f"seat {name!r}: profile is required for a hermes seat")
+            try:
+                from hermes_cli.profiles import profile_exists
+            except ImportError:
+                profile_exists = None
+            if profile_exists is not None and not profile_exists(seat.profile):
+                raise FactoryConfigError(f"seat {name!r}: profile {seat.profile!r} does not exist")
+        from shipfactory.executors import validate_seat_config
+        validate_seat_config(seat.executor, seat.config)
         # Roles are operator-defined job titles.  The dashboard suggests the
         # common titles but does not turn the seat contract into a closed enum.
         if not isinstance(seat.role, str) or not seat.role.strip():

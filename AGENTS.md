@@ -625,12 +625,34 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   plugins, and Factory deliberately omits `--auto` so an unexpected permission
   request fails closed instead of widening the worker boundary (finding #83,
   self-build GLM seat preparation).
+- A ShipFactory seat name is NOT a Hermes profile name. Hermes'
+  `dispatch_once` buckets a ready task `nonspawnable` when its assignee is not
+  a `~/.hermes/profiles/<name>/` directory (via `profile_exists`), so a
+  step-granular seat like `spec-author` never spawned and the first self-build
+  stalled. Fix (finding #84): `daemon.tick` runs `rescue_nonspawnable_seats`
+  after `dispatch_once` — for a ready task Hermes bucketed whose assignee is a
+  ShipFactory non-hermes seat, we claim + `resolve_workspace` +
+  `set_workspace_path` + spawn through our own `spawn_fn`. It is race-free
+  (Hermes appends to `skipped_nonspawnable` BEFORE it would `claim_task`, so we
+  are the sole claimant), respects `max_concurrent`, and carves out
+  hermes-executor seats (whose `hermes -p <assignee>` argv genuinely needs the
+  profile) and unknown assignees (stay gated). Zero Hermes core modification.
+- Seat data model (finding #84, Paperclip-derived): a seat is `executor`
+  (adapter) + an adapter-owned `config` blob whose keys each executor validates
+  via its `CONFIG_KEYS` (so a knob the harness ignores is a load error, not a
+  silent lie) + top-level `model`/`reasoning` (finding #12 invariant, never
+  buried) + a forward-compat `skills` tuple (delivery deferred). `profile` is
+  required only for a hermes seat. `_normalize_seat` drops unknown YAML keys
+  with a warning (rollback-safe). Migration is a no-op: existing seats load
+  byte-identical with `config={}`. Deferred: `reports_to`/`validate_acyclic`
+  removal (6 live consumers) and the `config`→argv translation (emit a flag
+  only when the key is explicitly present, to keep `config={}` byte-identical).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#83 so far). When you fix one: commit message
+- Findings get numbers (#22–#84 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

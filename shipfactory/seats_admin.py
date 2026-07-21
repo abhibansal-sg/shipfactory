@@ -67,19 +67,25 @@ def _write_mapping(path: Path, document: dict[str, Any], header: str = "") -> No
     path.write_text(header + rendered, encoding="utf-8")
 
 
-def _validate_fields(name: str, profile: str, executor: str, model: str, max_concurrent: int) -> None:
+def _validate_fields(name: str, profile: str, executor: str, model: str, max_concurrent: int,
+                     config: dict[str, Any] | None = None) -> None:
     if not isinstance(name, str) or not name.strip():
         raise FactoryConfigError("seat name is required")
-    if not isinstance(profile, str) or profile not in list_profiles():
-        raise FactoryConfigError(f"profile {profile!r} does not exist")
     if executor not in EXECUTORS:
         raise FactoryConfigError(
             f"unknown executor {executor!r}; expected one of {', '.join(sorted(EXECUTORS))}"
         )
+    # A profile is required (and must exist) only for a hermes seat; a
+    # non-hermes seat's name is a dispatch label decoupled from profiles.
+    if executor == "hermes":
+        if not isinstance(profile, str) or profile not in list_profiles():
+            raise FactoryConfigError(f"profile {profile!r} does not exist")
     if not isinstance(model, str) or not model.strip():
         raise FactoryConfigError("model is required")
     if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or max_concurrent < 1:
         raise FactoryConfigError("max_concurrent must be a positive integer")
+    from shipfactory.executors import validate_seat_config
+    validate_seat_config(executor, config or {})
 
 
 def _provider_document(provider_config: dict[str, Any], model: str) -> dict[str, Any]:
@@ -159,7 +165,9 @@ def _write_seat(name: str, values: dict[str, Any], *, create: bool, provider_con
         raise FactoryConfigError(f"seat {name!r} does not exist")
     current = dict(seats.get(name) or {})
     record = {**current, **{key: value for key, value in values.items() if value is not None}}
-    _validate_fields(name, str(record.get("profile", "")), str(record.get("executor", "")), str(record.get("model", "")), record.get("max_concurrent"))
+    _validate_fields(name, str(record.get("profile", "")), str(record.get("executor", "")),
+                     str(record.get("model", "")), record.get("max_concurrent"),
+                     record.get("config"))
     if record["executor"] == "hermes":
         _ensure_profile_model(record["profile"], record["model"], provider_config)
     elif provider_config is not None:
@@ -171,21 +179,24 @@ def _write_seat(name: str, values: dict[str, Any], *, create: bool, provider_con
 
 
 def create_seat(name: str, profile: str, executor: str, model: str, reasoning: str,
-                role: str, max_concurrent: int, provider_config: dict[str, Any] | None = None) -> dict[str, Any]:
+                role: str, max_concurrent: int, provider_config: dict[str, Any] | None = None,
+                *, config: dict[str, Any] | None = None, skills: list[str] | None = None) -> dict[str, Any]:
     """Create a seat and, for Hermes seats, its explicit profile model config."""
     return _write_seat(name, {
         "profile": profile, "executor": executor, "model": model,
         "reasoning": reasoning, "role": role, "max_concurrent": max_concurrent,
+        "config": config, "skills": skills,
     }, create=True, provider_config=provider_config)
 
 
 def update_seat(name: str, profile: str | None = None, executor: str | None = None,
                 model: str | None = None, reasoning: str | None = None, role: str | None = None,
-                max_concurrent: int | None = None, provider_config: dict[str, Any] | None = None) -> dict[str, Any]:
+                max_concurrent: int | None = None, provider_config: dict[str, Any] | None = None,
+                *, config: dict[str, Any] | None = None, skills: list[str] | None = None) -> dict[str, Any]:
     """Update an existing employment contract through the same invariant checks."""
     return _write_seat(name, {
         "profile": profile, "executor": executor, "model": model, "reasoning": reasoning,
-        "role": role, "max_concurrent": max_concurrent,
+        "role": role, "max_concurrent": max_concurrent, "config": config, "skills": skills,
     }, create=False, provider_config=provider_config)
 
 
@@ -222,10 +233,10 @@ def seat_details() -> list[dict[str, Any]]:
     from shipfactory.config import load_seats
     rows: list[dict[str, Any]] = []
     for seat in load_seats().seats.values():
-        configured = profile_model(seat.profile)
+        configured = profile_model(seat.profile) if seat.profile else None
         rows.append(vars(seat) | {
             "profile_model": configured,
-            "provider_config": profile_provider_config(seat.profile),
+            "provider_config": profile_provider_config(seat.profile) if seat.profile else None,
             "model_mismatch": bool(configured and seat.model and configured != seat.model),
         })
     return rows

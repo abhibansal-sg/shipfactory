@@ -12,6 +12,9 @@ class CodexExecutor(Executor):
     """Run Codex in a workspace-write sandbox with JSON event output."""
 
     name = "codex"
+    # Adapter-owned config keys (translation to argv is deferred to a later
+    # change; declaring them here lets validation accept/reject per-adapter).
+    CONFIG_KEYS = frozenset({"bypass_approvals", "fast_mode", "search"})
 
     def build_cmd(self, seat, prompt: str, workspace: str) -> list[str]:
         """Build the Paperclip-style ``codex exec --json`` argv."""
