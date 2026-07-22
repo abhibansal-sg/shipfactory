@@ -704,6 +704,19 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   cut from live repo HEAD, which only coincides with the pinned instance
   base while nothing lands mid-flight; concurrent landings broke that
   coincidence (dashboard-r1).
+- Rework lineage correctness (finding #97 + #96 sealing-side): recipe
+  worktrees are cut from live repo HEAD by workspace resolution, which only
+  coincides with the flight's pinned/advanced base while nothing lands
+  mid-flight. `spawn._align_recipe_workspace_base` now detaches a recipe
+  task's worktree onto its instance's current base before enforcement/worker
+  start (reachable base aligns or fails the spawn; unreachable base — e.g. a
+  fixture instantiated against another repo — warns and proceeds, since
+  SEALING remains the lineage enforcement). Sealing's strict plan-base check
+  gained the same `base_reaches` chain rule as input resolution, so a plan
+  sealed at the pre-advance base stays authoritative across sealed rework
+  pivots. Together these unblock the entire build-rework path (review- and
+  verification-triggered), which had deadlocked at sealing on its first two
+  real exercises (dashboard-r2 post-commit mutation, r3 plan-base mismatch).
 - A test_failed verification routes a production-rework cone back to the
   change-set producer (finding #95) instead of parking. It mirrors a review
   request_changes: `_verification_rework_target` picks the verification
@@ -736,6 +749,6 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#96 so far). When you fix one: commit message
+- Findings get numbers (#22–#97 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

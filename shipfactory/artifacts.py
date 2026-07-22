@@ -67,6 +67,36 @@ def artifact_set_hash(artifacts: Iterable[dict[str, Any]]) -> str:
     return hashlib.sha256("|".join(pairs).encode()).hexdigest()
 
 
+def base_reaches(db: Any, instance_id: str, base: Any, current: str) -> bool:
+    """Whether *base* reaches *current* via this instance's sealed rework pivots.
+
+    Each production rework durably records a sealed change-set whose
+    base->head edge is the pivot the instance base advanced along
+    (finding #96). Bounded walk, cycle-guarded; a base with no bridge in
+    THIS instance never reaches — fail-closed for foreign lineages.
+    """
+    edges = {
+        row["base_sha"]: row["head_sha"]
+        for row in db.execute(
+            "SELECT base_sha, head_sha FROM artifacts WHERE instance_id=? "
+            "AND kind='change-set' AND state='sealed' "
+            "AND base_sha IS NOT NULL AND head_sha IS NOT NULL",
+            (instance_id,),
+        ).fetchall()
+    }
+    cursor, seen = base, set()
+    for _ in range(32):
+        if cursor in seen:
+            break
+        seen.add(cursor)
+        cursor = edges.get(cursor)
+        if cursor is None:
+            break
+        if cursor == current:
+            return True
+    return False
+
+
 def artifact_is_stale(artifact: dict[str, Any], instance: dict[str, Any],
                       db: Any = None) -> bool:
     """Return whether a sealed artifact is bound to a base outside the lineage.
@@ -90,26 +120,7 @@ def artifact_is_stale(artifact: dict[str, Any], instance: dict[str, Any],
         return False
     if db is None or not instance.get("id"):
         return True
-    edges = {
-        row["base_sha"]: row["head_sha"]
-        for row in db.execute(
-            "SELECT base_sha, head_sha FROM artifacts WHERE instance_id=? "
-            "AND kind='change-set' AND state='sealed' "
-            "AND base_sha IS NOT NULL AND head_sha IS NOT NULL",
-            (instance["id"],),
-        ).fetchall()
-    }
-    cursor, seen = base, set()
-    for _ in range(32):
-        if cursor in seen:
-            break
-        seen.add(cursor)
-        cursor = edges.get(cursor)
-        if cursor is None:
-            break
-        if cursor == current:
-            return False
-    return True
+    return not base_reaches(db, instance["id"], base, current)
 
 
 def _schema_version(schema: str) -> int:
@@ -1380,7 +1391,16 @@ def _validate_change_set_context(
         trusted_base = str(instance["base_sha"] or "")
     plan = artifact_document(plans[0])
     if plan["base_sha"] != trusted_base:
-        raise ArtifactValidationError("change-set approved plan base differs from instance base")
+        # A production rework advances the instance base past the plan's
+        # sealing base; the plan stays authoritative when its base bridges
+        # to the current base via this instance's sealed pivots (finding
+        # #96 sealing-side — the strict check deadlocked every rework).
+        with store._connect() as chain_db:
+            bridged = base_reaches(
+                chain_db, instance_id, plan["base_sha"], trusted_base,
+            )
+        if not bridged:
+            raise ArtifactValidationError("change-set approved plan base differs from instance base")
     allowed_paths: list[str] = []
     for node in plan["nodes"]:
         for path in node["allowed_paths"]:

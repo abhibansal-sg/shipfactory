@@ -456,6 +456,63 @@ def _enforce_readonly_workspace(root: Path) -> str:
     return _READONLY_ENFORCEMENT_LEVEL
 
 
+def _align_recipe_workspace_base(task_id: str, root: Path) -> None:
+    """Detach a recipe task's worktree onto its instance's current base.
+
+    Hermes cuts task worktrees from the repository's live HEAD; a recipe
+    flight is pinned to its instance base_sha (which legitimately advances on
+    production rework). A worker building on the wrong parent produces a
+    candidate the sealing layer must refuse (finding #97: dashboard-r2/r3
+    rework deadlocks). Non-recipe tasks and non-git workspaces are untouched.
+    """
+    store = _store_module()
+    connect = getattr(store, "_connect", None)
+    if connect is None:
+        return  # store stub without internals (test harness): nothing to align
+    with connect() as db:
+        row = db.execute(
+            "SELECT i.base_sha FROM recipe_steps s "
+            "JOIN recipe_instances i ON i.id = s.instance_id "
+            "WHERE s.kanban_task_id=? ORDER BY s.activation DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    base = str(row["base_sha"]) if row and row["base_sha"] else ""
+    if not base:
+        return
+    git = ["git", "-C", str(root)]
+    probe = subprocess.run(
+        [*git, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15,
+    )
+    if probe.returncode != 0:
+        return  # not a git worktree: nothing to align
+    if probe.stdout.strip() == base:
+        return
+    exists = subprocess.run(
+        [*git, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if exists.returncode != 0:
+        # A base from another repository (test fixtures instantiate against
+        # the dev repo's HEAD) or otherwise unreachable: alignment is
+        # best-effort correction, not a gate — sealing remains the lineage
+        # enforcement downstream. Warn loudly and let the worker proceed.
+        logger.warning(
+            "recipe workspace %s cannot align: instance base %s is not a "
+            "reachable commit; proceeding on worktree HEAD (sealing guards lineage)",
+            root, base[:12],
+        )
+        return
+    aligned = subprocess.run(
+        [*git, "checkout", "--detach", "--force", base],
+        capture_output=True, text=True, timeout=60,
+    )
+    if aligned.returncode != 0:
+        raise RuntimeError(
+            f"recipe workspace alignment to {base[:12]} failed: "
+            f"{aligned.stderr.strip()[:200]}"
+        )
+
+
 def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     """Spawn the configured harness for a claimed kanban task, or skip unknown seats.
 
@@ -479,6 +536,11 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     executor = get_executor(seat.executor)
     root = Path(workspace)
     root.mkdir(parents=True, exist_ok=True)
+    # Recipe worktrees are cut from live repo HEAD by workspace resolution,
+    # which only coincides with the flight's pinned/advanced base while
+    # nothing lands mid-flight. Align BEFORE any enforcement or worker start;
+    # a failure here propagates so the claim is released (finding #97).
+    _align_recipe_workspace_base(str(task_id), root)
     logs = _shipfactory_home() / "runs"
     logs.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')

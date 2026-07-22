@@ -755,3 +755,57 @@ def test_finding_95_infrastructure_failures_keep_parking(
         "blocked", "protected_baseline_test_failed",
     )
     assert _instance("f95infra")["status"] == "blocked"
+
+
+def test_finding_97_recipe_worktree_aligns_to_instance_base(tmp_path):
+    """A recipe task's worktree cut from live HEAD is detached onto the
+    instance's current base before the worker starts; non-recipe tasks and
+    missing bases are untouched; an unreachable base fails the spawn loudly."""
+    import os
+    import subprocess as sp
+    from shipfactory.spawn import _align_recipe_workspace_base
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q"], cwd=repo, check=True)
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@x", "PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    sp.run(["git", "add", "-A"], cwd=repo, check=True)
+    sp.run(["git", "commit", "-qm", "base"], cwd=repo, env=env, check=True)
+    base = sp.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "f.txt").write_text("newer\n", encoding="utf-8")
+    sp.run(["git", "commit", "-aqm", "newer"], cwd=repo, env=env, check=True)
+    head = sp.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+    wt = tmp_path / "wt"
+    sp.run(["git", "worktree", "add", "-q", "--detach", str(wt), head], cwd=repo, check=True)
+
+    store.init_db()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_instances(id, board, recipe_id, recipe_version, recipe_hash, "
+            "parameters_json, collector_task_id, status, base_sha, created_at, updated_at) "
+            "VALUES('f97','test','r',1,'h','{}','t_c','running',?,datetime('now'),datetime('now'))",
+            (base,),
+        )
+        db.execute(
+            "INSERT INTO recipe_steps(instance_id, step_id, activation, primitive, state, "
+            "kanban_task_id, created_at, updated_at) "
+            "VALUES('f97','build',2,'agent_task','running','t_f97',datetime('now'),datetime('now'))",
+        )
+
+    _align_recipe_workspace_base("t_f97", wt)
+    assert sp.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip() == base
+
+    # Idempotent on a second call; unknown task untouched.
+    _align_recipe_workspace_base("t_f97", wt)
+    _align_recipe_workspace_base("t_unknown", wt)
+    assert sp.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip() == base
+
+    # Unreachable base (foreign repo / fixture default): best-effort skip —
+    # the worker proceeds on worktree HEAD and sealing guards lineage.
+    with store._connect() as db:
+        db.execute("UPDATE recipe_instances SET base_sha=? WHERE id='f97'", ("e" * 40,))
+    _align_recipe_workspace_base("t_f97", wt)
+    assert sp.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip() == base
