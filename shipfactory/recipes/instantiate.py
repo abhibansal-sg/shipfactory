@@ -51,6 +51,65 @@ def _base_sha(value: str | None) -> str:
     return resolved
 
 
+def _connection_board_name(path: Path, kanban_db: Any) -> str | None:
+    """Return the stock board name encoded by a kanban database path, if any."""
+    if path == Path(kanban_db.kanban_db_path("default")).expanduser().resolve():
+        return "default"
+    if path.name == "kanban.db" and path.parent.parent.name == "boards":
+        return path.parent.name
+    return None
+
+
+def _validate_board_connection(conn: Any, board: str, kanban_db: Any) -> None:
+    """Reject an existing stock board whose connection points at another board.
+
+    A requested board file that does not yet exist is intentionally tolerated:
+    established callers use ``board`` as a label over in-memory, legacy, and
+    custom connections, so that mismatch cannot be detected at instantiation.
+    """
+    requested = Path(kanban_db.kanban_db_path(board)).expanduser()
+    if not requested.exists():
+        return
+    requested = requested.resolve()
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    main = next((row[2] for row in rows if row[1] == "main"), "")
+    if not main:
+        return
+    connection_path = Path(main).expanduser().resolve()
+    connection_board = _connection_board_name(connection_path, kanban_db)
+    # Custom and legacy paths have no durable board identity.  Their
+    # connection remains authoritative, preserving the established convention.
+    if connection_board is None or connection_path == requested:
+        return
+    raise ValueError(
+        "board/connection mismatch: requested board "
+        f"{board!r}, connection board {connection_board!r}"
+    )
+
+
+def _notify_parameter_name(value: Any, parameters: dict[str, Any]) -> str:
+    if isinstance(value, str):
+        names = [name for name in re.findall(r"\$\{([^}]+)\}", value) if name in parameters]
+        if names:
+            return names[0]
+    return "target"
+
+
+def _validate_notify_targets(recipe: Recipe, parameters: dict[str, Any]) -> None:
+    """Validate rendered notify routing structurally, without recipient lookup."""
+    for step in recipe.document["steps"]:
+        if step["primitive"] != "notify":
+            continue
+        raw_target = step["params"]["target"]
+        target = _render(raw_target, parameters)
+        channel, separator, name = target.partition(":") if isinstance(target, str) else ("", "", "")
+        if not separator or not channel or not name:
+            parameter = _notify_parameter_name(raw_target, parameters)
+            raise ValueError(
+                f"invalid notify target {target!r} carried by parameter {parameter!r}"
+            )
+
+
 def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None, parent_tasks: list[str] | None = None, instance_id: str | None = None, base_sha: str | None = None) -> dict[str, Any]:
     """Persist one pinned instance and its collector; the advancer creates work.
 
@@ -59,6 +118,8 @@ def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, 
     """
     from hermes_cli import kanban_db
     bound = bind_parameters(recipe, parameters, skip_steps)
+    _validate_board_connection(conn, board, kanban_db)
+    _validate_notify_targets(recipe, bound)
     base_sha = _base_sha(base_sha)
     instance_id = instance_id or str(uuid.uuid4())
     collector_key = f"recipe/{instance_id}/{recipe.hash}/collector"

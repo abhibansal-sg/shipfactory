@@ -50,13 +50,13 @@ steps:
     title: Primary notification
     needs: []
     optional: false
-    params: {{target: test, message: "Run ${{request}}"}}
+    params: {{target: test:dashboard, message: "Run ${{request}}"}}
   - id: extra
     primitive: notify
     title: Optional notification
     needs: [{first_step}]
     optional: true
-    params: {{target: test, message: Optional}}
+    params: {{target: test:dashboard, message: Optional}}
 """
 
 
@@ -73,7 +73,7 @@ def _configure_library(tmp_path: Path, monkeypatch) -> Path:
         "enabled": True,
         "library_path": str(library),
         "bare_task_recipe": "route-a@1",
-        "notify_target": "test",
+        "notify_target": "test:dashboard",
         "board_day_token_ceiling": 100000,
         "dispatcher_max_in_progress": 2,
         "execution_profiles": {},

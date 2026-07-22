@@ -75,7 +75,7 @@ steps:
     title: Note
     needs: []
     optional: false
-    params: {target: test, message: test}
+    params: {target: test:story, message: test}
 """, encoding="utf-8")
     recipe = load_library(library).get("story-fixture@1")
     # instantiate only needs the real kanban API for collector creation; use a

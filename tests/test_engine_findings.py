@@ -497,6 +497,92 @@ def test_finding_11_instantiation_anchors_tasks_to_explicit_board(
         conn.close()
 
 
+def _notify_recipe(path: Path, *, recipe_id: str, target: str = "${notify_target}"):
+    return _write_recipe(
+        path,
+        recipe_id=recipe_id,
+        parameters="{notify_target: {type: string, required: false, default: telegram:home}}",
+        steps=f"""  - id: notify
+    primitive: notify
+    title: Notify
+    needs: []
+    optional: false
+    params: {{target: "{target}", message: notify test}}
+""",
+    )
+
+
+def _instantiation_side_effects(conn) -> tuple[int, int, int]:
+    tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    with store._connect() as db:
+        instances = db.execute("SELECT COUNT(*) FROM recipe_instances").fetchone()[0]
+        steps = db.execute("SELECT COUNT(*) FROM recipe_steps").fetchone()[0]
+    return tasks, instances, steps
+
+
+def test_finding_91_cross_wired_existing_boards_refuse_before_side_effects(
+    tmp_path, hermetic_hermes_home
+):
+    """An existing requested board cannot use another existing board's connection."""
+    from hermes_cli import kanban_db
+
+    kanban_db.create_board("board-a")
+    kanban_db.create_board("board-b")
+    conn_a = kanban_db.connect(board="board-a")
+    try:
+        store.init_db()
+        recipe = _worker_recipe(tmp_path / "library", recipe_id="cross-wired")
+        with pytest.raises(ValueError, match=r"requested board 'board-b'.*connection board 'board-a'"):
+            instantiate(conn_a, board="board-b", recipe=recipe, parameters={}, instance_id="cross-wired")
+        assert _instantiation_side_effects(conn_a) == (0, 0, 0)
+    finally:
+        conn_a.close()
+
+
+def test_finding_91_matching_and_absent_board_labels_remain_compatible(
+    tmp_path, kanban_conn, hermetic_hermes_home
+):
+    """Matching stock paths work; absent board labels keep their connection authority."""
+    from hermes_cli import kanban_db
+
+    kanban_db.create_board("matching")
+    matching = kanban_db.connect(board="matching")
+    try:
+        store.init_db()
+        recipe = _worker_recipe(tmp_path / "matching-library", recipe_id="matching")
+        result = instantiate(matching, board="matching", recipe=recipe, parameters={}, instance_id="matching")
+        assert result["instance_id"] == "matching"
+        assert _instantiation_side_effects(matching) == (1, 1, 1)
+    finally:
+        matching.close()
+
+    recipe = _worker_recipe(tmp_path / "absent-library", recipe_id="absent-label")
+    result = instantiate(kanban_conn, board="not-created", recipe=recipe, parameters={}, instance_id="absent-label")
+    assert result["instance_id"] == "absent-label"
+
+
+def test_finding_92_notify_target_validation_is_fail_fast_and_structural(tmp_path, kanban_conn):
+    store.init_db()
+    invalid = _notify_recipe(tmp_path / "invalid-library", recipe_id="invalid-notify")
+    with pytest.raises(ValueError, match=r"'telegram'.*'notify_target'"):
+        instantiate(
+            kanban_conn, board="test", recipe=invalid,
+            parameters={"notify_target": "telegram"}, instance_id="invalid-notify",
+        )
+    assert _instantiation_side_effects(kanban_conn) == (0, 0, 0)
+
+    valid = _notify_recipe(tmp_path / "valid-library", recipe_id="valid-notify")
+    result = instantiate(
+        kanban_conn, board="test", recipe=valid,
+        parameters={"notify_target": "telegram:home"}, instance_id="valid-notify",
+    )
+    assert result["instance_id"] == "valid-notify"
+
+    no_notify = _worker_recipe(tmp_path / "no-notify-library", recipe_id="no-notify")
+    result = instantiate(kanban_conn, board="test", recipe=no_notify, parameters={}, instance_id="no-notify")
+    assert result["instance_id"] == "no-notify"
+
+
 def _v2_verify_recipe(path: Path, *, build_cap: int = 3):
     path.mkdir()
     (path / "verified@1.yaml").write_text(

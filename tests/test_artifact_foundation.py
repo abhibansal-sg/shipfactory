@@ -332,7 +332,7 @@ def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
     inputs: []
     outputs: [{kind: exploration, schema: shipfactory.exploration/v1, path: .shipfactory-output/exploration.json}]
     surprise: true
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """, "unknown step keys"),
         ("""  - id: left
     primitive: notify
@@ -341,7 +341,7 @@ def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
     optional: false
     inputs: []
     outputs: []
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
   - id: right
     primitive: notify
     title: Right
@@ -349,7 +349,7 @@ def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
     optional: false
     inputs: []
     outputs: []
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """, "dependency cycle"),
         ("""  - id: consume
     primitive: notify
@@ -358,7 +358,7 @@ def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
     optional: false
     inputs: [{from: missing, kind: exploration, required: true}]
     outputs: []
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """, "nonexistent producer"),
         ("""  - id: explore
     primitive: notify
@@ -367,7 +367,7 @@ def test_v2_loader_rejects_non_normative_access_modes(tmp_path, access_mode):
     optional: false
     inputs: []
     outputs: [{kind: exploration, schema: shipfactory.exploration/v1, path: .shipfactory-output/../escape.json}]
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """, "output path"),
     ],
 )
@@ -445,7 +445,7 @@ def test_v2_stale_required_input_blocks_and_fresh_activation_recovers(
     inputs: []
     outputs:
       - {kind: exploration, schema: shipfactory.exploration/v1, path: .shipfactory-output/exploration.json}
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
   - id: consume
     primitive: notify
     title: Consume
@@ -453,7 +453,7 @@ def test_v2_stale_required_input_blocks_and_fresh_activation_recovers(
     optional: false
     inputs: [{from: explore, kind: exploration, required: true}]
     outputs: []
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """))
     repo, base_x, tree_x = _repo(tmp_path / "stale-work")
     instantiate(
@@ -539,7 +539,7 @@ def test_v2_missing_required_input_blocks_activation(tmp_path, kanban_conn):
     optional: false
     inputs: []
     outputs: [{kind: exploration, schema: shipfactory.exploration/v1, path: .shipfactory-output/exploration.json}]
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
   - id: consume
     primitive: notify
     title: Consume
@@ -547,7 +547,7 @@ def test_v2_missing_required_input_blocks_activation(tmp_path, kanban_conn):
     optional: false
     inputs: [{from: explore, kind: exploration, required: true}]
     outputs: []
-    params: {target: x, message: y}
+    params: {target: test:x, message: y}
 """))
     instantiate(kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="missing")
     with store._connect() as db:
