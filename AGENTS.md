@@ -691,6 +691,19 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   every bootstrap/seed/app script, and scripts exec
   `"${SHIPFACTORY_PYTHON:-python3}"`. A pre-flight boot test must use the
   daemon's REAL env (PATH included), not the operator shell's.
+- Input staleness must respect the instance's own base-advance chain. A
+  production rework legitimately advances instance base_sha to the rejected
+  candidate's head — which stranded every upstream input (spec, plan) sealed
+  at the pre-advance base and DEADLOCKED the cone on the first-ever
+  correctness-review build rejection (finding #96). Fix: `artifact_is_stale`
+  walks the instance-local chain of sealed change-set base->head edges
+  (bounded, cycle-guarded); a base that reaches the current base via sealed
+  pivots is fresh, a base with no bridge in THIS instance stays stale —
+  fail-closed for foreign lineages (e.g. a worktree cut from a moved main)
+  is preserved. Related open gap (#97 candidate): agent-task worktrees are
+  cut from live repo HEAD, which only coincides with the pinned instance
+  base while nothing lands mid-flight; concurrent landings broke that
+  coincidence (dashboard-r1).
 - A test_failed verification routes a production-rework cone back to the
   change-set producer (finding #95) instead of parking. It mirrors a review
   request_changes: `_verification_rework_target` picks the verification
@@ -723,6 +736,6 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#95 so far). When you fix one: commit message
+- Findings get numbers (#22–#96 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

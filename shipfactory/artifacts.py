@@ -67,12 +67,49 @@ def artifact_set_hash(artifacts: Iterable[dict[str, Any]]) -> str:
     return hashlib.sha256("|".join(pairs).encode()).hexdigest()
 
 
-def artifact_is_stale(artifact: dict[str, Any], instance: dict[str, Any]) -> bool:
-    """Return whether a sealed artifact is bound to an older instance base."""
+def artifact_is_stale(artifact: dict[str, Any], instance: dict[str, Any],
+                      db: Any = None) -> bool:
+    """Return whether a sealed artifact is bound to a base outside the lineage.
+
+    Strict equality with the instance base is the fast path. A production
+    rework legitimately ADVANCES the instance base to the rejected candidate's
+    head (so the rework builds on top), which used to strand every upstream
+    input (spec, plan) sealed at the pre-advance base and deadlock the cone
+    (finding #96, dashboard-recipes-journey-r2). Each advance is durably
+    recorded as a sealed change-set artifact whose base->head edge is the
+    pivot, so with a ``db`` we accept an artifact whose base reaches the
+    current base by walking that instance-local chain. A base with no sealed
+    bridge in THIS instance (e.g. a workspace cut from a moved main) remains
+    stale — fail-closed for foreign lineages is preserved.
+    """
     current = instance.get("current_base_sha") or instance.get("base_sha")
     if not isinstance(current, str) or not current:
         raise ValueError("instance current base_sha is required")
-    return artifact.get("base_sha") != current
+    base = artifact.get("base_sha")
+    if base == current:
+        return False
+    if db is None or not instance.get("id"):
+        return True
+    edges = {
+        row["base_sha"]: row["head_sha"]
+        for row in db.execute(
+            "SELECT base_sha, head_sha FROM artifacts WHERE instance_id=? "
+            "AND kind='change-set' AND state='sealed' "
+            "AND base_sha IS NOT NULL AND head_sha IS NOT NULL",
+            (instance["id"],),
+        ).fetchall()
+    }
+    cursor, seen = base, set()
+    for _ in range(32):
+        if cursor in seen:
+            break
+        seen.add(cursor)
+        cursor = edges.get(cursor)
+        if cursor is None:
+            break
+        if cursor == current:
+            return False
+    return True
 
 
 def _schema_version(schema: str) -> int:
@@ -2221,7 +2258,7 @@ def input_artifacts(db: Any, instance_id: str,
             continue
         artifact = dict(row)
         try:
-            stale = artifact_is_stale(artifact, instance)
+            stale = artifact_is_stale(artifact, instance, db=db)
         except ValueError as exc:
             stale = True
             stale_error = str(exc)

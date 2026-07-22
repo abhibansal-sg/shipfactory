@@ -632,3 +632,46 @@ def test_reaper_seals_after_exit_before_journaling_completion(tmp_path, monkeypa
 
     assert spawn.reap_finished()[0]["result"] == "done"
     assert calls == ["seal", "transition"]
+
+
+def test_finding_96_advance_chain_bridges_staleness(tmp_path):
+    """Finding #96: after a production rework advances the instance base to the
+    rejected candidate's head, upstream inputs sealed at the pre-advance base
+    stay valid via the sealed change-set bridge; a base with no bridge in this
+    instance remains stale (fail-closed for foreign lineages)."""
+    import sqlite3
+    from shipfactory.artifacts import artifact_is_stale
+
+    old, pivot, foreign = "a" * 40, "b" * 40, "d" * 40
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE artifacts(instance_id TEXT, kind TEXT, state TEXT, "
+        "base_sha TEXT, head_sha TEXT)"
+    )
+    db.execute(
+        "INSERT INTO artifacts VALUES('inst','change-set','sealed',?,?)",
+        (old, pivot),
+    )
+    instance = {"id": "inst", "base_sha": pivot}
+    spec = {"base_sha": old}
+
+    assert artifact_is_stale(spec, instance) is True          # no db: strict
+    assert artifact_is_stale(spec, instance, db=db) is False  # bridged
+    assert artifact_is_stale({"base_sha": pivot}, instance, db=db) is False
+    assert artifact_is_stale({"base_sha": foreign}, instance, db=db) is True
+
+    # Multi-hop chain: old -> pivot -> newest.
+    newest = "c" * 40
+    db.execute(
+        "INSERT INTO artifacts VALUES('inst','change-set','sealed',?,?)",
+        (pivot, newest),
+    )
+    assert artifact_is_stale(spec, {"id": "inst", "base_sha": newest}, db=db) is False
+    # Cycle guard: a malicious/corrupt self-edge terminates without reaching.
+    db.execute(
+        "INSERT INTO artifacts VALUES('inst','change-set','sealed',?,?)",
+        (foreign, foreign),
+    )
+    assert artifact_is_stale({"base_sha": foreign},
+                             {"id": "inst", "base_sha": newest}, db=db) is True
