@@ -647,12 +647,33 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   byte-identical with `config={}`. Deferred: `reports_to`/`validate_acyclic`
   removal (6 live consumers) and the `config`→argv translation (emit a flag
   only when the key is explicitly present, to keep `config={}` byte-identical).
+- The nonspawnable rescue must release its claim on spawn failure. A
+  transient sqlite `disk I/O error` (stale-WAL class) inside the spawn path
+  stranded a claimed task as phantom-running with no run row — the daemon saw
+  "running", Hermes saw nothing. Fix (finding #85): wrap
+  `resolve_workspace`/spawn in try/except and `reclaim_task(conn, task_id,
+  reason=...)` on any failure, so the next tick retries instead of stalling.
+- The codex sandbox (`codex exec -s workspace-write`) DENIES binding TCP
+  ports (verified: `socket.bind` → `PermissionError`). A builder therefore can
+  never pass server-binding tests (`test_environment_sessions` etc.), and a
+  step contract demanding "full suite green" from inside the sandbox is
+  unsatisfiable — the worker retries forever and blocks. Rule (finding #86):
+  builders run focused, non-binding tests only; the full-suite gate belongs to
+  deterministic verify-runtime, which runs OUTSIDE the worker sandbox.
+- A verification app script must serve `GET /.shipfactory/identity` returning
+  `{"instance_id": $SHIPFACTORY_INSTANCE_ID, "head_sha": $SHIPFACTORY_HEAD_SHA}`
+  (env injected by `environments.py` app-session start). The commit-binding
+  probe (`verification.py` `_probe_live_identity`) hits that path and fails
+  closed on 404 — `environment_identity_mismatch` — so a health-only app like
+  the first `sf-app.sh` blocks every runtime verification. Boot-testing
+  `/healthz` is NOT enough; boot-test the identity route too (finding #87,
+  self-build-r7c).
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#84 so far). When you fix one: commit message
+- Findings get numbers (#22–#87 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

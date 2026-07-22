@@ -8,6 +8,7 @@ export HERMES_HOME
 mkdir -p "$HERMES_HOME"
 exec python - "$1" <<'PY'
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,16 @@ app = FastAPI()
 @app.get("/healthz")
 def healthz() -> dict:
     return {"ok": True}
+
+@app.get("/.shipfactory/identity")
+def identity() -> dict:
+    # Commit-binding probe: verification confirms the running app serves the
+    # exact candidate revision. Values are injected by the Factory app-session
+    # parent, never inferred (environments.py request_app_start).
+    return {
+        "instance_id": os.environ["SHIPFACTORY_INSTANCE_ID"],
+        "head_sha": os.environ["SHIPFACTORY_HEAD_SHA"],
+    }
 
 app.include_router(module.router, prefix="/api/plugins/shipfactory")
 uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
