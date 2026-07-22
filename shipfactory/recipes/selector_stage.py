@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from shipfactory import store
+from shipfactory import telemetry
 from shipfactory.config import load_seats, selector_config
 from .instantiate import instantiate
 from .loader import RecipeError, load_library
@@ -20,8 +21,31 @@ from .selector import (
 logger = logging.getLogger(__name__)
 
 
+_GATED_TELEMETRY_SEEN: set[tuple[str, str, str]] = set()
+
+
 def _empty() -> dict[str, int]:
     return {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
+
+
+def _record_gated_stage(reason: str, *, board: str, company: str) -> None:
+    """Best-effort, process-deduplicated breadcrumb for a declined gate."""
+    key = (reason, board, company)
+    if key in _GATED_TELEMETRY_SEEN:
+        return
+    _GATED_TELEMETRY_SEEN.add(key)
+    try:
+        telemetry.append_jsonl({
+            "event": "selector_stage_gated",
+            "reason": reason,
+            "board": board,
+            "company": company,
+        })
+    except Exception:
+        logger.warning(
+            "failed to record selector-stage gate %s for board %s and company %s",
+            reason, board, company, exc_info=True,
+        )
 
 
 def _selection_row(selection_id: str) -> dict[str, Any]:
@@ -178,7 +202,14 @@ def run_stage(conn: Any, board: str) -> dict[str, int]:
     cfg = load_seats()
     recipes = cfg.recipes or {}
     settings = selector_config(recipes)
-    if not recipes.get("enabled") or not settings["enabled"] or board != cfg.company:
+    if not recipes.get("enabled"):
+        _record_gated_stage("recipes_disabled", board=board, company=cfg.company)
+        return result
+    if not settings["enabled"]:
+        _record_gated_stage("selector_disabled", board=board, company=cfg.company)
+        return result
+    if board != cfg.company:
+        _record_gated_stage("board_company_mismatch", board=board, company=cfg.company)
         return result
     seats = set(cfg.seats)
     profiles = set(recipes["execution_profiles"])

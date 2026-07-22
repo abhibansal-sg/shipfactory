@@ -11,7 +11,8 @@ from shipfactory import store
 from shipfactory.config import FactoryConfig, Seat, selector_config
 from shipfactory.recipes import selector_stage
 from shipfactory.recipes.advancer import reconcile
-from shipfactory.recipes.selector import lease_source_task
+from shipfactory.recipes.loader import RecipeError, load_library
+from shipfactory.recipes.selector import RECIPE_SELECTOR_PROMPT, lease_source_task, validate_selection
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -209,6 +210,169 @@ def test_selector_stage_parks_no_recipe_match(
     assert result["parked"] == 1 and result["instantiated"] == 0
     assert "no_recipe_match" in _blocked_reason(kanban_conn, source)
     assert _selection_row(source)["outcome"] == "no_recipe_match"
+
+
+def test_selector_recipe_alias_normalizes_before_validation(stage_config):
+    node = _node("alias")
+    node["ranked_candidates"] = [{
+        "recipe": "dev-pipeline@1", "rank": 2, "reason": "best fit", "ignored": True,
+    }, {
+        "id": "dev-pipeline@1", "recipe": "missing-recipe@1", "score": 0.8,
+        "reason": "explicit id wins",
+    }]
+    library = load_library(
+        stage_config.recipes["library_path"], seats=set(stage_config.seats),
+        profiles=set(stage_config.recipes["execution_profiles"]),
+        verification_profiles=set(stage_config.recipes["verification_profiles"]),
+    )
+
+    nodes = validate_selection(
+        _selection(node), library, seats=set(stage_config.seats),
+        profiles=set(stage_config.recipes["execution_profiles"]),
+    )
+
+    assert nodes[0]["ranked_candidates"] == [{
+        "id": "dev-pipeline@1", "score": 0.5, "reason": "best fit",
+    }, {
+        "id": "dev-pipeline@1", "score": 0.8, "reason": "explicit id wins",
+    }]
+
+
+def test_selector_rank_derives_exact_reciprocal_score(stage_config):
+    node = _node("rank")
+    node["ranked_candidates"] = [{"id": "dev-pipeline@1", "rank": 3, "reason": "fit"}]
+    library = load_library(
+        stage_config.recipes["library_path"], seats=set(stage_config.seats),
+        profiles=set(stage_config.recipes["execution_profiles"]),
+        verification_profiles=set(stage_config.recipes["verification_profiles"]),
+    )
+
+    nodes = validate_selection(
+        _selection(node), library, seats=set(stage_config.seats),
+        profiles=set(stage_config.recipes["execution_profiles"]),
+    )
+
+    assert nodes[0]["ranked_candidates"][0]["score"] == 1 / 3
+
+
+def test_selector_invalid_candidate_after_aliasing_is_rejected(stage_config):
+    node = _node("invalid")
+    node["ranked_candidates"] = [{"recipe": "dev-pipeline@1", "rank": 1}]
+    library = load_library(
+        stage_config.recipes["library_path"], seats=set(stage_config.seats),
+        profiles=set(stage_config.recipes["execution_profiles"]),
+        verification_profiles=set(stage_config.recipes["verification_profiles"]),
+    )
+
+    with pytest.raises(RecipeError, match="invalid ranked candidate"):
+        validate_selection(
+            _selection(node), library, seats=set(stage_config.seats),
+            profiles=set(stage_config.recipes["execution_profiles"]),
+        )
+
+
+def test_selector_unknown_normalized_recipe_parks_no_recipe_match(
+    kanban_conn, stage_config, fake_aux,
+):
+    source = _source(kanban_conn)
+    node = _node("unknown", chosen="missing-recipe@1")
+    node["ranked_candidates"] = [{
+        "recipe": "missing-recipe@1", "rank": 1, "reason": "best fit",
+    }]
+    selection_id = lease_source_task(source, "test")
+    assert selection_id
+    with store._connect() as db:
+        db.execute(
+            "UPDATE triage_selections SET ranked_json=?,lease_until=? WHERE id=?",
+            (json.dumps(_selection(node)), "2000-01-01T00:00:00+00:00", selection_id),
+        )
+
+    result = selector_stage.run_stage(kanban_conn, "test")
+
+    assert result["parked"] == 1 and result["instantiated"] == 0
+    assert "no_recipe_match" in _blocked_reason(kanban_conn, source)
+    assert _selection_row(source)["outcome"] == "no_recipe_match"
+    assert fake_aux.calls == []
+
+
+def test_selector_prompt_states_canonical_ranked_candidate_schema():
+    assert "exactly the keys id, score, and reason" in RECIPE_SELECTOR_PROMPT
+    assert '{"id":"dev-pipeline@14","score":1.0,"reason":"best fit"}' in RECIPE_SELECTOR_PROMPT
+
+
+def test_selector_gated_telemetry_records_all_declined_gate_reasons(
+    kanban_conn, stage_config, fake_aux, monkeypatch,
+):
+    records: list[dict] = []
+    monkeypatch.setattr(selector_stage, "_GATED_TELEMETRY_SEEN", set())
+    monkeypatch.setattr(selector_stage.telemetry, "append_jsonl", records.append)
+
+    stage_config.recipes["enabled"] = False
+    assert selector_stage.run_stage(kanban_conn, "test") == {
+        "leased": 0, "instantiated": 0, "parked": 0, "skipped": 0,
+    }
+
+    stage_config.recipes["enabled"] = True
+    stage_config.recipes["selector"]["enabled"] = False
+    assert selector_stage.run_stage(kanban_conn, "test") == {
+        "leased": 0, "instantiated": 0, "parked": 0, "skipped": 0,
+    }
+
+    stage_config.recipes["selector"]["enabled"] = True
+    assert selector_stage.run_stage(kanban_conn, "other-board") == {
+        "leased": 0, "instantiated": 0, "parked": 0, "skipped": 0,
+    }
+
+    assert records == [
+        {"event": "selector_stage_gated", "reason": "recipes_disabled", "board": "test", "company": "test"},
+        {"event": "selector_stage_gated", "reason": "selector_disabled", "board": "test", "company": "test"},
+        {"event": "selector_stage_gated", "reason": "board_company_mismatch", "board": "other-board", "company": "test"},
+    ]
+    assert fake_aux.calls == []
+
+
+def test_selector_gated_telemetry_is_emitted_once_per_reason_and_board_pair(
+    kanban_conn, stage_config, fake_aux, monkeypatch,
+):
+    records: list[dict] = []
+    monkeypatch.setattr(selector_stage, "_GATED_TELEMETRY_SEEN", set())
+    monkeypatch.setattr(selector_stage.telemetry, "append_jsonl", records.append)
+
+    for _ in range(2):
+        assert selector_stage.run_stage(kanban_conn, "other-board")["leased"] == 0
+    assert selector_stage.run_stage(kanban_conn, "another-board")["leased"] == 0
+
+    assert records == [
+        {"event": "selector_stage_gated", "reason": "board_company_mismatch", "board": "other-board", "company": "test"},
+        {"event": "selector_stage_gated", "reason": "board_company_mismatch", "board": "another-board", "company": "test"},
+    ]
+    assert fake_aux.calls == []
+
+
+def test_selector_gated_telemetry_failure_is_best_effort(
+    kanban_conn, stage_config, fake_aux, monkeypatch, caplog,
+):
+    calls = 0
+
+    def fail_append(_record: dict) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("telemetry unavailable")
+
+    monkeypatch.setattr(selector_stage, "_GATED_TELEMETRY_SEEN", set())
+    monkeypatch.setattr(selector_stage.telemetry, "append_jsonl", fail_append)
+    stage_config.recipes["selector"]["enabled"] = False
+
+    assert selector_stage.run_stage(kanban_conn, "test") == {
+        "leased": 0, "instantiated": 0, "parked": 0, "skipped": 0,
+    }
+    assert selector_stage.run_stage(kanban_conn, "test") == {
+        "leased": 0, "instantiated": 0, "parked": 0, "skipped": 0,
+    }
+
+    assert calls == 1
+    assert "failed to record selector-stage gate selector_disabled" in caplog.text
+    assert fake_aux.calls == []
 
 
 def test_selector_stage_skips_lease_contention(
