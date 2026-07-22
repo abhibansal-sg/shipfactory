@@ -639,3 +639,26 @@ def test_evidence_bundle_rejects_item_symlink_escaping_root(tmp_path):
     p.symlink_to(outside)                              # in-root name, real target outside
     with pytest.raises(verify.EvidenceInvariantError, match="path is invalid"):
         verify.verify_evidence_bundle(bundle["id"])
+
+
+def test_commit_binding_tolerates_factory_output_dir_only(tmp_path):
+    """Finding #88: every worker worktree carries untracked .shipfactory-output/
+    by design; the clean-check must carve out exactly that directory and stay
+    fail-closed for everything else."""
+    repo, head, tree = _repo(tmp_path)
+    verify.assert_commit_binding(repo, head, tree)     # pristine passes
+
+    output = repo / ".shipfactory-output"
+    (output / ".worker-home").mkdir(parents=True)
+    (output / "change-set.json").write_text("{}", encoding="utf-8")
+    verify.assert_commit_binding(repo, head, tree)     # factory scratch tolerated
+
+    cousin = repo / ".shipfactory-output-evil"
+    cousin.write_text("smuggle", encoding="utf-8")     # prefix cousin is NOT the dir
+    with pytest.raises(verify.CommitBindingError, match="workspace is not clean"):
+        verify.assert_commit_binding(repo, head, tree)
+    cousin.unlink()
+
+    (repo / "tracked.txt").write_text("mutated\n", encoding="utf-8")
+    with pytest.raises(verify.CommitBindingError, match="workspace is not clean"):
+        verify.assert_commit_binding(repo, head, tree)

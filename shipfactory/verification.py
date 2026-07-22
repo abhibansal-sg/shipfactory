@@ -430,7 +430,20 @@ def surface_paths_from_documents(*documents: Any) -> list[str]:
 
 def _repository_identity(workspace: Path) -> tuple[str, str, str]:
     status = _git(workspace, "status", "--porcelain")
-    if status:
+    # Every worker worktree carries an untracked `.shipfactory-output/` by
+    # design (spawn creates it; the artifact contract writes into it), and the
+    # sealing layer already excludes it from the canonical diff and dirty-path
+    # collection. Carve out exactly that directory here too; any other dirt
+    # still fails closed (finding #88). Untracked content there cannot reach
+    # the sealed tree (diff excludes it) nor the tree binding (write-tree
+    # reads the index only).
+    residual = []
+    for line in status.splitlines():
+        path = line[3:].strip('"')
+        if path == ".shipfactory-output" or path.startswith(".shipfactory-output/"):
+            continue
+        residual.append(line)
+    if residual:
         raise CommitBindingError("workspace is not clean")
     head = _git(workspace, "rev-parse", "HEAD").lower()
     tree = _git(workspace, "write-tree").lower()

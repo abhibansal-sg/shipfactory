@@ -668,12 +668,25 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   the first `sf-app.sh` blocks every runtime verification. Boot-testing
   `/healthz` is NOT enough; boot-test the identity route too (finding #87,
   self-build-r7c).
+- The verification clean-check must carve out `.shipfactory-output/`. Every
+  worker worktree carries that untracked directory BY DESIGN (spawn creates
+  it; the artifact contract writes into it), and the sealing layer already
+  excludes it from the canonical diff + dirty-path collection — but
+  `verification.py _repository_identity` did a raw `git status --porcelain`,
+  so every runtime verification of a worker-built candidate failed
+  "workspace is not clean". Fix (finding #88): filter exactly that directory
+  from the status lines; any other dirt (including prefix cousins like
+  `.shipfactory-output-x`) still fails closed, and the tree binding is
+  unaffected (`write-tree` reads the index only). NB: #87 masked #88 — the
+  identity probe ran BEFORE the clean-check, so r7c never reached it;
+  sequential harness bugs unmask one at a time, so after fixing one,
+  pre-flight the NEXT gate locally instead of discovering it by flight.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#87 so far). When you fix one: commit message
+- Findings get numbers (#22–#88 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
