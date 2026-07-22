@@ -145,6 +145,9 @@ Task sizing targets one seat-context-comfortable agent_task: about 0-3 files
 touched. At 4-6 files, prefer splitting the node. At 7+ files, split it or
 record a specific justification in assumptions. Never send unresolved
 [NEEDS CLARIFICATION: <specific question>] markers into instantiated work.
+
+Each ranked_candidates entry must use exactly the keys id, score, and reason.
+For example: {"id":"dev-pipeline@14","score":1.0,"reason":"best fit"}.
 """
 
 
@@ -589,7 +592,22 @@ def validate_selection(selection: object, library, *, seats: set[str], profiles:
         if len(clarification_markers) > 3:
             raise RecipeError("selector output exceeds 3 clarification markers")
         ids.add(node["id"])
+        normalized_candidates: list[object] = []
         for candidate in node["ranked_candidates"]:
+            if isinstance(candidate, dict):
+                normalized = {
+                    "id": candidate.get("id", candidate.get("recipe")),
+                    "score": candidate.get("score"),
+                    "reason": candidate.get("reason"),
+                }
+                if "score" not in candidate:
+                    rank = candidate.get("rank")
+                    if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+                        normalized["score"] = 1 / rank
+                candidate = normalized
+            normalized_candidates.append(candidate)
+        node["ranked_candidates"] = normalized_candidates
+        for candidate in normalized_candidates:
             if not isinstance(candidate, dict) or set(candidate) != {"id", "score", "reason"} or not isinstance(candidate["id"], str) or not isinstance(candidate["score"], (int, float)) or not isinstance(candidate["reason"], str): raise RecipeError("invalid ranked candidate")
         chosen = node["chosen"]
         if chosen is None:
