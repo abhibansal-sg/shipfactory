@@ -32,19 +32,20 @@ seats:
   dev:
     profile: dev
     executor: codex
-    reports_to: lead
+    reports_to: missing
     role: engineer
     max_concurrent: 2
 hierarchy_gates:
   landers: [lead]
   verdicts: [lead]
 """)
-    cfg = load_seats()
-    assert cfg.company == "demo" and cfg.seats["dev"].reports_to == "lead"
+    with pytest.warns(UserWarning, match="reports_to"):
+        cfg = load_seats()
+    assert cfg.company == "demo" and not hasattr(cfg.seats["dev"], "reports_to")
     assert cfg.seats["lead"].max_concurrent == 1
 
 
-def test_cycle_rejected(tmp_path, monkeypatch):
+def test_unknown_hierarchy_gate_seat_rejected(tmp_path, monkeypatch):
     _profiles(monkeypatch)
     path = tmp_path / "seats.yaml"
     path.write_text("""company: demo
@@ -53,14 +54,14 @@ seats:
     profile: lead
     executor: hermes
     role: ceo
-    reports_to: dev
   dev:
     profile: dev
     executor: codex
     role: engineer
-    reports_to: lead
+hierarchy_gates:
+  landers: [unknown]
 """)
-    with pytest.raises((FactoryConfigError, ValueError), match="cycle"):
+    with pytest.raises(FactoryConfigError, match="unknown seat"):
         load_seats(path)
 
 

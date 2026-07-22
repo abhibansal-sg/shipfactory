@@ -43,13 +43,7 @@ def test_tick_uses_recovery_ladder_and_kanban_cli(monkeypatch):
     store = types.ModuleType("shipfactory.store")
     store.due_monitors = lambda now: [{"task_id": "T1", "recovery_policy": "wake_owner", "scheduled_by": "seat", "notes": "ping", "max_attempts": 3}]
     store.advance_monitor = lambda task_id, now, close=False: calls.append(("advance", task_id, now, close))
-    config = types.ModuleType("shipfactory.config")
-    config.load_seats = lambda: SimpleNamespace(company="demo")
-    hierarchy = types.ModuleType("shipfactory.hierarchy")
-    hierarchy.escalation_target = lambda cfg, seat: "manager"
     monkeypatch.setitem(sys.modules, "shipfactory.store", store)
-    monkeypatch.setitem(sys.modules, "shipfactory.config", config)
-    monkeypatch.setitem(sys.modules, "shipfactory.hierarchy", hierarchy)
 
     def run(command, **kwargs):
         calls.append(command)
@@ -105,6 +99,23 @@ def test_max_attempts_closes_monitor(tmp_path, monkeypatch):
     assert store.due_monitors("9999-12-31T00:00:00+00:00") == []
 
 
+def test_recovery_task_remains_assigned_to_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    store.add_monitor("T1", "2026-07-12T00:00:00+00:00", None, 5,
+                      "create_recovery_task", "ping", "seat", 60)
+    monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
+        "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
+    })
+    calls = []
+    monkeypatch.setattr(watchdog, "_run_kanban", lambda board, args, **kwargs: calls.append(args))
+
+    assert watchdog.tick("demo", "2026-07-12T00:00:00Z") == [
+        {"task_id": "T1", "action": "create_recovery_task"}
+    ]
+    recovery = next(args for args in calls if any(str(value).startswith("Recovery:") for value in args))
+    assert recovery[-2:] == ["--assignee", "seat"]
+
+
 def test_terminal_escalation_happens_at_most_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     store.add_monitor("T1", "2026-07-12T00:00:00+00:00", None, 5,
@@ -112,15 +123,11 @@ def test_terminal_escalation_happens_at_most_once(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "_task", lambda task_id, board: {
         "id": task_id, "title": "Task", "assignee": "seat", "status": "ready",
     })
-    monkeypatch.setitem(sys.modules, "shipfactory.config", types.SimpleNamespace(
-        load_seats=lambda: SimpleNamespace(company="demo")
-    ))
-    monkeypatch.setitem(sys.modules, "shipfactory.hierarchy", types.SimpleNamespace(
-        escalation_target=lambda cfg, seat: None
-    ))
     calls = []
     monkeypatch.setattr(watchdog, "_run_kanban", lambda board, args, **kwargs: calls.append(args))
 
     assert watchdog.tick("demo", "2026-07-12T00:00:00Z")[0]["action"] == "escalate_to_board"
     assert watchdog.tick("demo", "2026-07-12T01:00:00Z") == []
     assert sum(any(str(value).startswith("Escalation:") for value in args) for args in calls) == 1
+    escalation = next(args for args in calls if any(str(value).startswith("Escalation:") for value in args))
+    assert "--assignee" not in escalation

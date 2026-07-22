@@ -25,7 +25,6 @@ def test_cli_subprocess_verbs_against_real_factory_state(tmp_path):
         (tmp_path / "profiles" / profile).mkdir(parents=True)
 
     seats = _run(tmp_path, "seats")
-    org = _run(tmp_path, "org")
     policy = _run(tmp_path, "policy", "show", "no-task")
     costs = _run(tmp_path, "costs")
     runs = _run(tmp_path, "runs")
@@ -33,10 +32,9 @@ def test_cli_subprocess_verbs_against_real_factory_state(tmp_path):
     resume = _run(tmp_path, "resume", "verifier")
     daemon = _run(tmp_path, "daemon", "--once")
 
-    assert seats.returncode == org.returncode == policy.returncode == costs.returncode == runs.returncode == 0
+    assert seats.returncode == policy.returncode == costs.returncode == runs.returncode == 0
     assert pause.returncode == resume.returncode == daemon.returncode == 0
     assert '"name": "verifier"' in seats.stdout
-    assert "release" in org.stdout
     assert policy.stdout.strip() == ""
     assert costs.stdout.strip() == "[]"
     assert runs.stdout.strip() == "[]"

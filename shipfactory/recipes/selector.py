@@ -536,7 +536,7 @@ def run_selection(task, library, *, seats: dict[str, object], max_tokens: int = 
     roster = [
         {"name": name, **{
             field: getattr(seat, field)
-            for field in ("profile", "role", "reports_to")
+            for field in ("profile", "role")
             if getattr(seat, field, None) is not None
         }}
         for name, seat in sorted(seats.items())

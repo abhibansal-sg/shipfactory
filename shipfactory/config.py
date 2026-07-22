@@ -59,7 +59,6 @@ class Seat:
     profile: str | None = None
     model: str = ""
     reasoning: str = ""
-    reports_to: str | None = None
     role: str = "general"
     max_concurrent: int = 1
     # Skills to stage for the worker. Delivery is deferred; empty == no-op.
@@ -229,13 +228,6 @@ def validate(cfg) -> None:
             raise FactoryConfigError(f"seat {name!r}: role is required")
         if not isinstance(seat.max_concurrent, int) or isinstance(seat.max_concurrent, bool) or seat.max_concurrent < 1:
             raise FactoryConfigError(f"seat {name!r}: max_concurrent must be a positive integer")
-        if seat.reports_to and seat.reports_to not in cfg.seats:
-            raise FactoryConfigError(f"seat {name!r}: reports_to {seat.reports_to!r} is unknown")
-    from .hierarchy import validate_acyclic
-    try:
-        validate_acyclic(cfg)
-    except (KeyError, ValueError) as exc:
-        raise FactoryConfigError(str(exc)) from exc
     for gate in ("landers", "verdicts"):
         values = cfg.hierarchy_gates.get(gate, [])
         if not isinstance(values, list):

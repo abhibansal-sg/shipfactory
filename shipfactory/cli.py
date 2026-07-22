@@ -22,21 +22,18 @@ seats:
     executor: claude
     model: sonnet-5
     reasoning: adaptive
-    reports_to: architect
     role: qa
     max_concurrent: 2
   architect:
     profile: architect
     executor: codex
     model: gpt-5.6
-    reports_to: release
     role: engineer
   dev-backend:
     profile: dev-backend
     executor: codex
     model: gpt-5.6
     reasoning: medium
-    reports_to: architect
     role: engineer
 hierarchy_gates:
   landers: [release]
@@ -116,23 +113,6 @@ def _provider_config_from_args(args: argparse.Namespace) -> dict[str, Any] | Non
     if not all(value is not None for value in supplied):
         raise ValueError("--provider, --base-url, and --provider-model must be supplied together")
     return {"provider": args.provider, "base_url": args.base_url, "model": args.provider_model}
-
-
-def _org(_args: argparse.Namespace) -> str:
-    from shipfactory.config import load_seats
-    cfg = load_seats()
-    children: dict[str | None, list[str]] = {}
-    for name, seat in cfg.seats.items():
-        children.setdefault(seat.reports_to, []).append(name)
-    lines: list[str] = []
-    def walk(name: str, prefix: str = "") -> None:
-        lines.append(prefix + name)
-        names = sorted(children.get(name, []))
-        for index, child in enumerate(names):
-            walk(child, prefix + ("└── " if index == len(names) - 1 else "├── "))
-    for root in sorted(children.get(None, [])):
-        walk(root)
-    return _emit("\n".join(lines))
 
 
 def _daemon(args: argparse.Namespace) -> Any:
@@ -378,7 +358,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p = _handler(verbs, "seat-update", "update a Factory employment contract", _seat_update)
     p.add_argument("name"); p.add_argument("--profile"); p.add_argument("--executor", choices=("hermes", "codex", "claude", "grok", "opencode")); p.add_argument("--model"); p.add_argument("--reasoning"); p.add_argument("--role"); p.add_argument("--max-concurrent", type=int); p.add_argument("--provider"); p.add_argument("--base-url"); p.add_argument("--provider-model")
     _handler(verbs, "seat-list", "list seats with profile model resolution", _seat_list)
-    _handler(verbs, "org", "print the reporting tree", _org)
     p = _handler(verbs, "daemon", "run dispatch and watchdog ticks", _daemon)
     p.add_argument("--board", action="append"); p.add_argument("--boards", action="append"); p.add_argument("--once", action="store_true"); p.add_argument("--interval", type=float, default=5.0); p.add_argument("--sync-interval", type=float); p.add_argument("--require-recipes", action="store_true")
     p = _handler(verbs, "verdict", "record a policy-stage verdict", _verdict)

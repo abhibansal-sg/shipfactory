@@ -78,7 +78,7 @@ def test_dashboard_plugin_routes_are_readable_and_queue_decisions(monkeypatch):
     _seed()
     import shipfactory.config
 
-    seat = SimpleNamespace(name="builder", profile="standard", executor="codex", model="gpt", reasoning="", reports_to=None, role="engineer", max_concurrent=1)
+    seat = SimpleNamespace(name="builder", profile="standard", executor="codex", model="gpt", reasoning="", role="engineer", max_concurrent=1)
     monkeypatch.setattr(shipfactory.config, "load_seats", lambda: SimpleNamespace(seats={"builder": seat}))
     client = _client()
 

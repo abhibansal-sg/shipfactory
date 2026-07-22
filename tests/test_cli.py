@@ -10,7 +10,7 @@ import types
 from shipfactory import cli
 
 
-VERBS = {"init", "seats", "seat-create", "seat-update", "seat-list", "org", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
+VERBS = {"init", "seats", "seat-create", "seat-update", "seat-list", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,6 +31,7 @@ def test_init_writes_skeleton_and_initializes_store(tmp_path, monkeypatch):
     cli.main(["init"])
     text = (tmp_path / "shipfactory" / "seats.yaml").read_text()
     assert "company: straits-lab-eng" in text and "verifier:" in text
+    assert "hierarchy_gates:" in text and "reports_to:" not in text
     assert called == [True]
 
 

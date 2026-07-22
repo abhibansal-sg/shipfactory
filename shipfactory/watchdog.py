@@ -295,22 +295,15 @@ def _route_recovery(row: dict[str, Any], board: str, now: str) -> dict[str, Any]
             _run_kanban(board, ["assign", task_id, "--assignee", str(owner)])
         action = "wake_owner"
     else:
-        cfg = _module("shipfactory.config").load_seats()
-        hierarchy = _module("shipfactory.hierarchy")
         seat = str(owner or task.get("assignee") or "")
-        target = hierarchy.escalation_target(cfg, seat) if seat else None
         if policy in {"create_recovery_task", "create_recovery_issue"}:
-            assignee = target or seat or None
             args = ["create", "--title", f"Recovery: {task.get('title', task_id)}", "--body", notes]
-            if assignee:
-                args += ["--assignee", str(assignee)]
+            if seat:
+                args += ["--assignee", seat]
             _run_kanban(board, args)
             action = "create_recovery_task"
         else:
-            assignee = target or None
             args = ["create", "--title", f"Escalation: {task.get('title', task_id)}", "--body", notes]
-            if assignee:
-                args += ["--assignee", str(assignee)]
             _run_kanban(board, args)
             action = "escalate_to_board"
     close = policy == RECOVERY_LADDER[-1] or attempts + 1 >= max_attempts
