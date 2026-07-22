@@ -6,7 +6,10 @@ set -eu
 HERMES_HOME="${TMPDIR:-/tmp}/sf-verify-app-$$"
 export HERMES_HOME
 mkdir -p "$HERMES_HOME"
-exec python - "$1" <<'PY'
+# SHIPFACTORY_PYTHON is the daemon's own interpreter (finding #89) — the
+# canonical venv with fastapi/uvicorn. Bare `python` on ambient PATH is a
+# gamble that already crashed one flight.
+exec "${SHIPFACTORY_PYTHON:-python3}" - "$1" <<'PY'
 import importlib.util
 import os
 import sys

@@ -15,6 +15,7 @@ import hashlib
 import os
 import signal
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -515,6 +516,10 @@ def _spawn_phase(
     resolved = [str(record["scripts"][argv[0]]), *argv[1:]]
     log_file = open(record["log_path"], "ab")
     env = dict(os.environ)
+    # The daemon runs inside the canonical venv; hand scripts that exact
+    # interpreter so they never gamble on the ambient PATH resolving a
+    # `python` with the right dependencies (finding #89).
+    env["SHIPFACTORY_PYTHON"] = sys.executable
     enforcement_level = _apply_network_policy(env, record["network_policy"])
     try:
         proc = subprocess.Popen(
@@ -846,6 +851,7 @@ def _try_bind_and_spawn(aid: str, cfg: dict[str, Any]) -> bool:
     resolved = [str(scripts[app_config["start_argv"][0]]), *argv[1:]]
     env = dict(os.environ)
     env["PORT"] = str(port)
+    env["SHIPFACTORY_PYTHON"] = sys.executable  # finding #89: no PATH gamble
     # These reserved values are durable request fields supplied only by the
     # Factory parent. They are never inferred from the attacker-visible
     # request key or inherited from ambient operator state.

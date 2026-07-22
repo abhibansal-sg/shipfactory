@@ -681,12 +681,22 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   identity probe ran BEFORE the clean-check, so r7c never reached it;
   sequential harness bugs unmask one at a time, so after fixing one,
   pre-flight the NEXT gate locally instead of discovering it by flight.
+- Environment scripts must not gamble on ambient PATH for their
+  interpreter. `_spawn_phase`/app-start pass `env=dict(os.environ)`, so a
+  script's bare `exec python` resolves against whatever PATH the daemon
+  happened to inherit — one daemon restart without the venv on PATH crashed
+  the app session with `exec: python: not found` (macOS ships no bare
+  `python`). Fix (finding #89): the engine exports
+  `SHIPFACTORY_PYTHON=sys.executable` (the daemon IS the canonical venv) to
+  every bootstrap/seed/app script, and scripts exec
+  `"${SHIPFACTORY_PYTHON:-python3}"`. A pre-flight boot test must use the
+  daemon's REAL env (PATH included), not the operator shell's.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#88 so far). When you fix one: commit message
+- Findings get numbers (#22–#89 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
