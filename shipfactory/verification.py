@@ -821,6 +821,34 @@ class _ProcessTreeTracker:
         if not self.ready.wait(timeout=2):
             raise VerificationError("process-tree supervisor failed to start")
 
+    _GAP = object()
+
+    def _environ_retry(self, candidate: Any) -> Any:
+        """Retry a failed environ read against a liveness check.
+
+        Returns the environ dict when the bridge recovers, ``None`` when the
+        process is dead/zombie/unreadable-by-policy (safely ignorable — a dead
+        process cannot be a live detached descendant), or ``_GAP`` when the
+        process is demonstrably alive yet its environment stays unreadable —
+        the only outcome that is a genuine supervision gap. psutil binds
+        Process identity to (pid, create_time), so a recycled pid does not
+        masquerade as the original.
+        """
+        for _ in range(3):
+            try:
+                if (not candidate.is_running()
+                        or candidate.status() == self._psutil.STATUS_ZOMBIE):
+                    return None
+            except (self._psutil.Error, OSError):
+                return None
+            try:
+                return candidate.environ()
+            except (RuntimeError, SystemError):
+                sleep(0.05)
+            except (self._psutil.Error, OSError, PermissionError):
+                return None
+        return self._GAP
+
     def _scan(self) -> None:
         from shipfactory import spawn
         try:
@@ -842,10 +870,18 @@ class _ProcessTreeTracker:
                     if candidate.environ().get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope:
                         descendants.append(candidate)
                 except (RuntimeError, SystemError):
-                    # psutil's macOS proc_environ bridge can fail transiently
-                    # after a process exits. Do not abort the runner, but mark
-                    # the scope scan incomplete so the case fails closed.
-                    self.available = False
+                    # psutil's macOS proc_environ bridge fails this way when a
+                    # process exits or turns zombie mid-read — routine on a
+                    # busy machine, and latching available=False on every exit
+                    # blip failed green suites (finding #90). Retry against a
+                    # liveness check: only a demonstrably alive process whose
+                    # environment stays unreadable is a real supervision gap.
+                    environ = self._environ_retry(candidate)
+                    if environ is self._GAP:
+                        self.available = False
+                    elif (environ is not None
+                          and environ.get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope):
+                        descendants.append(candidate)
                     continue
                 except (self._psutil.Error, OSError, PermissionError):
                     continue

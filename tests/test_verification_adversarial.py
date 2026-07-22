@@ -1627,7 +1627,9 @@ def test_production_browser_sidecar_that_ignores_sigterm_is_forcibly_reaped(
 
 
 def test_process_scope_enumeration_system_error_fails_closed():
-    """A transient macOS proc_environ failure cannot be labelled complete."""
+    """An ALIVE process whose environ stays unreadable cannot be labelled
+    complete. (Finding #90 refined the latch with a liveness check — a dead
+    candidate is ignorable — so the stub models a live process.)"""
 
     class FakePsutilError(Exception):
         pass
@@ -1639,11 +1641,18 @@ def test_process_scope_enumeration_system_error_fails_closed():
     class BrokenCandidate:
         pid = 987_654
 
+        def is_running(self):
+            return True
+
+        def status(self):
+            return "running"
+
         def environ(self):
             raise SystemError("proc_environ returned a result with an exception set")
 
     class FakePsutil:
         Error = FakePsutilError
+        STATUS_ZOMBIE = "zombie"
 
         def Process(self, pid):
             return RootProcess()

@@ -691,12 +691,22 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   every bootstrap/seed/app script, and scripts exec
   `"${SHIPFACTORY_PYTHON:-python3}"`. A pre-flight boot test must use the
   daemon's REAL env (PATH included), not the operator shell's.
+- The process-tree supervisor must not latch a supervision gap on an exit
+  blip. `_ProcessTreeTracker` sweeps EVERY process (10ms cadence) reading
+  environs to find setsid-detached descendants by nonce; on macOS psutil's
+  proc_environ bridge raises RuntimeError when an UNRELATED process exits
+  mid-read, and one blip permanently latched `available=False` —
+  `test_infrastructure_error` on a 558-green suite (4/4 attempts, r7f).
+  Fix (finding #90): retry against a liveness check — dead/zombie/vanished
+  candidates are safely ignorable (a dead process cannot be a live detached
+  descendant); only a demonstrably ALIVE process whose environ stays
+  unreadable is a genuine gap. Fail-closed posture preserved.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#89 so far). When you fix one: commit message
+- Findings get numbers (#22–#90 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

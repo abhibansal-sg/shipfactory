@@ -662,3 +662,40 @@ def test_commit_binding_tolerates_factory_output_dir_only(tmp_path):
     (repo / "tracked.txt").write_text("mutated\n", encoding="utf-8")
     with pytest.raises(verify.CommitBindingError, match="workspace is not clean"):
         verify.assert_commit_binding(repo, head, tree)
+
+
+def test_process_tree_environ_blip_is_not_a_supervision_gap():
+    """Finding #90: a process exiting mid-environ-read (macOS bridge RuntimeError)
+    must not fail the case; only an alive process with an unreadable
+    environment is a genuine gap."""
+    import psutil
+
+    tracker = object.__new__(verify._ProcessTreeTracker)
+    tracker._psutil = psutil
+
+    class Candidate:
+        def __init__(self, running=True, status=psutil.STATUS_RUNNING, environs=()):
+            self._running, self._status = running, status
+            self._environs = list(environs)
+        def is_running(self):
+            return self._running
+        def status(self):
+            return self._status
+        def environ(self):
+            outcome = self._environs.pop(0) if self._environs else RuntimeError("bridge")
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    # Dead or zombie: safely ignorable, never a gap.
+    assert tracker._environ_retry(Candidate(running=False)) is None
+    assert tracker._environ_retry(Candidate(status=psutil.STATUS_ZOMBIE)) is None
+    # Vanished between checks: ignorable.
+    assert tracker._environ_retry(
+        Candidate(environs=[psutil.NoSuchProcess(1234)])) is None
+    # Transient blip that recovers: the environ is returned and usable.
+    recovered = tracker._environ_retry(
+        Candidate(environs=[RuntimeError("bridge"), {"SHIPFACTORY_SUPERVISION_SCOPE": "s"}]))
+    assert recovered == {"SHIPFACTORY_SUPERVISION_SCOPE": "s"}
+    # Demonstrably alive yet persistently unreadable: the one real gap.
+    assert tracker._environ_retry(Candidate()) is verify._ProcessTreeTracker._GAP
