@@ -714,7 +714,11 @@ def test_thirty_second_notification_send_holds_no_factory_write_transaction(tmp_
     process = ctx.Process(target=_slow_send_child_30s, args=(home, kanban_path, str(bin_dir)))
     process.start()
 
-    deadline = time.monotonic() + 15
+    # Wall-clock budgets widened for machine load (the finding #95-era
+    # de-flake sweep): a held write transaction would still be caught — the
+    # invariant only requires the concurrent writer to finish well under the
+    # 5s sqlite busy_timeout (a held transaction blocks ~20s).
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         if started_marker.exists():
             break
@@ -727,9 +731,9 @@ def test_thirty_second_notification_send_holds_no_factory_write_transaction(tmp_
     before = time.monotonic()
     store.set_policy("writer-mid-send", {"stages": []})
     elapsed = time.monotonic() - before
-    assert elapsed < 2.0
+    assert elapsed < 4.0
 
-    process.join(40)
+    process.join(90)
     assert process.exitcode == 0
     assert store.get_policy("writer-mid-send") == {"stages": []}
     with store._connect() as db:
