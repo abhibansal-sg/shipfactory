@@ -115,6 +115,68 @@ def test_recipes_endpoint_lists_schema_and_optional_steps(tmp_path, monkeypatch)
     assert recipe["parameters"]["effort"]["type"] == "integer"
     assert recipe["parameters"]["lane"]["values"] == ["standard", "expedited"]
     assert recipe["optional_steps"] == [{"id": "extra", "title": "Optional notification"}]
+    assert recipe["budgets"] == {
+        "max_activations": 4,
+        "step_activation_caps": None,
+    }
+    assert recipe["steps"] == [
+        {
+            "id": "first", "title": "Primary notification", "primitive": "notify",
+            "seat": None, "needs": [], "optional": False, "instructions": None,
+        },
+        {
+            "id": "extra", "title": "Optional notification", "primitive": "notify",
+            "seat": None, "needs": ["first"], "optional": True, "instructions": None,
+        },
+    ]
+
+
+def test_recipes_endpoint_exposes_dev_pipeline_14_step_instructions(tmp_path, monkeypatch):
+    library = tmp_path / "recipes"
+    library.mkdir()
+    root = Path(__file__).resolve().parents[1]
+    (library / "dev-pipeline@14.yaml").write_text(
+        (root / "recipes" / "dev-pipeline@14.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    seats = {
+        name: object() for name in {
+            "adversarial-reviewer", "builder", "correctness-reviewer", "explorer",
+            "plan-author", "plan-reviewer", "spec-author", "spec-reviewer", "story-author",
+            "operator",
+        }
+    }
+    import shipfactory.config
+
+    monkeypatch.setattr(
+        shipfactory.config,
+        "load_seats",
+        lambda: SimpleNamespace(seats=seats, recipes={
+            "enabled": True, "library_path": str(library),
+            "execution_profiles": {"build": {}, "planning": {}, "review": {}},
+        }),
+    )
+
+    response = _client().get("/api/plugins/shipfactory/recipes")
+
+    assert response.status_code == 200
+    recipe = response.json()[0]
+    assert recipe["id"] == "dev-pipeline" and recipe["version"] == 14
+    assert recipe["budgets"] == {
+        "max_activations": 27,
+        "step_activation_caps": {
+            "explore": 2, "spec-draft": 3, "spec-attack": 2, "plan-draft": 3,
+            "plan-attack": 2, "build": 3, "correctness-review": 3,
+            "adversarial-review": 3, "review-story": 2,
+        },
+    }
+    assert [step["id"] for step in recipe["steps"]][:3] == [
+        "explore", "spec-draft", "spec-attack",
+    ]
+    explore = recipe["steps"][0]
+    assert explore["seat"] == "explorer"
+    assert explore["execution_profile"] == "planning"
+    assert explore["instructions"].startswith("Explore ${request} read-only.")
 
 
 def test_instances_endpoint_instantiates_and_rejects_invalid_parameters(

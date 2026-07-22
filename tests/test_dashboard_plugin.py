@@ -442,3 +442,62 @@ def test_instances_fold_latest_steps_in_recipe_order_with_overlay_columns(hermet
     assert json.loads(audit["verdict_json"])["outcome"] == "request_changes"
     assert audit["rejected_by_step_id"] is None
     assert [step["step_id"] for step in detail["steps"]] == ["build", "build", "audit"]
+
+
+def _bundle_component(bundle: str, name: str, next_name: str) -> str:
+    start = bundle.index(f"function {name}")
+    end = bundle.index(f"function {next_name}", start)
+    return bundle[start:end]
+
+
+def test_recipes_and_compact_journey_bundle_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bundle = (root / "dashboard" / "dist" / "index.js").read_text()
+    harness = (root / "dashboard" / "conformance-harness.js").read_text()
+
+    assert "function useRecipesResource" in bundle
+    assert 'usePollingResource("/recipes", refreshKey)' in bundle
+    assert "function RecipesView" in bundle
+    assert "function RecipeCard" in bundle
+    assert "function RecipeStepDetail" in bundle
+    registry = re.search(r"var VIEW_REGISTRY = \[(.*?)\n  \];", bundle, re.S)
+    assert registry
+    assert ["instances", "recipes"] == re.findall(
+        r'id: "(instances|recipes)"', registry.group(1)
+    )
+
+    recipes = _bundle_component(bundle, "RecipesView", "SeatDialog")
+    assert "Object.keys(groups).sort()" in recipes
+    assert "Number(right.version) - Number(left.version)" in recipes
+    assert 'description: "Published recipe contracts, read-only."' in recipes
+    card = _bundle_component(bundle, "RecipeCard", "RecipesView")
+    assert "recipe.status === \"active\" ? \"text-primary\"" in card
+    assert "step.title" in card and "step.primitive" in card and "step.seat" in card
+    detail = _bundle_component(bundle, "RecipeStepDetail", "RecipeCard")
+    assert "step.instructions" in detail and "step.needs" in detail
+    assert "step.execution_profile" in detail and "step_activation_caps" in detail
+    assert not re.search(r"\b(POST|PUT|PATCH|DELETE)\b", recipes + card + detail)
+
+    instances = _bundle_component(bundle, "InstancesView", "RecipeStepDetail")
+    assert "Recipe progress and current workflow state." in instances
+    assert "item.latest_steps" in instances and "rejected_by_step_id" in instances
+    assert "loadDetail(item.id)" in instances
+    assert "BudgetProgress" not in instances
+    collapsed = instances.split("h(InstanceDrawer", 1)[0]
+    assert all(label not in collapsed for label in ["Budget", "Activations", "Created", "Updated"])
+    drawer = _bundle_component(bundle, "InstanceDrawer", "InstancesView")
+    assert "BudgetProgress" not in drawer and "detail.tokens" not in drawer
+    assert "detail.activation_count" not in drawer
+
+    journey = _bundle_component(bundle, "JourneyCard", "JourneyView")
+    assert "BudgetProgress" not in journey
+    assert "instance.tokens" not in journey
+    assert "tokens_total" not in journey
+    receipts = _bundle_component(bundle, "ReceiptLine", "JourneyAttempt")
+    assert "tokens_total" not in receipts
+    costs = _bundle_component(bundle, "CostsView", "parseJsonArray")
+    assert 'title: "Costs"' in costs and '"/costs?by=day&since_days=30"' in costs
+
+    seat = _bundle_component(bundle, "SeatCard", "SeatsView")
+    assert "Reports to" not in seat and "reports_to" not in seat
+    assert "reports_to" not in harness

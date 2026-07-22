@@ -107,12 +107,21 @@ const recipes = [
       release_lane: { type: "enum", required: true, default: "standard", values: ["standard", "urgent"] },
       approval_due_at: { type: "datetime", required: false, default: null },
     },
+    budgets: { max_activations: 12, step_activation_caps: { explore: 2, build: 3 } },
+    steps: [
+      { id: "explore", title: "Explore the request", primitive: "agent_task", seat: "architect", needs: [], optional: false, execution_profile: "planning", instructions: "Inspect the request and produce a bounded exploration." },
+      { id: "build", title: "Build the change", primitive: "agent_task", seat: "builder", needs: ["explore"], optional: false, execution_profile: "build", instructions: "Implement the approved plan." },
+    ],
     optional_steps: [{ id: "announce", title: "Announce the release" }],
   },
   {
     id: "release-train", version: 2, status: "active",
     description: "Coordinate a bounded release train across verified changes.",
     parameters: { request: { type: "string", required: true, default: null } },
+    budgets: { max_activations: 8, step_activation_caps: { coordinate: 2 } },
+    steps: [
+      { id: "coordinate", title: "Coordinate release", primitive: "agent_task", seat: "architect", needs: [], optional: false, execution_profile: "planning", instructions: "Coordinate the verified release train." },
+    ],
     optional_steps: [],
   },
 ];
@@ -181,9 +190,9 @@ const waiting = [
 ];
 
 const seats = [
-  { name: "architect", role: "cto", profile: "architect", executor: "codex", model: "gpt-5.4", profile_model: "gpt-5.4", reasoning: "high", reports_to: "operator", max_concurrent: 2, paused: false },
-  { name: "builder", role: "engineer", profile: "dev-backend-codex", executor: "hermes", model: "claude-sonnet-5", profile_model: "claude-sonnet-5", provider_config: { provider: "hermes-anthropic-proxy", base_url: "http://127.0.0.1:18808", model: "claude-sonnet-5" }, reasoning: "medium", reports_to: "architect", max_concurrent: 3, paused: false },
-  { name: "verifier", role: "qa", profile: "verifier", executor: "claude", model: "opus-4.6", profile_model: "claude-sonnet-5", model_mismatch: true, reasoning: "high", reports_to: "operator", max_concurrent: 1, paused: true },
+  { name: "architect", role: "cto", profile: "architect", executor: "codex", model: "gpt-5.4", profile_model: "gpt-5.4", reasoning: "high", max_concurrent: 2, paused: false },
+  { name: "builder", role: "engineer", profile: "dev-backend-codex", executor: "hermes", model: "claude-sonnet-5", profile_model: "claude-sonnet-5", provider_config: { provider: "hermes-anthropic-proxy", base_url: "http://127.0.0.1:18808", model: "claude-sonnet-5" }, reasoning: "medium", max_concurrent: 3, paused: false },
+  { name: "verifier", role: "qa", profile: "verifier", executor: "claude", model: "opus-4.6", profile_model: "claude-sonnet-5", model_mismatch: true, reasoning: "high", max_concurrent: 1, paused: true },
 ];
 
 const dailyCosts = [
