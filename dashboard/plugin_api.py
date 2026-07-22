@@ -306,12 +306,33 @@ def list_recipes() -> list[dict[str, Any]]:
     items = []
     for recipe in library.recipes.values():
         document = recipe.document
+        budgets = document["budgets"]
+        steps = []
+        for step in document["steps"]:
+            params = step.get("params", {})
+            item = {
+                "id": step["id"],
+                "title": step["title"],
+                "primitive": step["primitive"],
+                "seat": params.get("seat"),
+                "needs": step["needs"],
+                "optional": step["optional"],
+                "instructions": params.get("instructions"),
+            }
+            if "execution_profile" in params:
+                item["execution_profile"] = params["execution_profile"]
+            steps.append(item)
         items.append({
             "id": document["id"],
             "version": document["version"],
             "status": document["status"],
             "description": document["description"],
             "parameters": document["parameters"],
+            "budgets": {
+                "max_activations": budgets.get("max_activations"),
+                "step_activation_caps": budgets.get("step_activation_caps"),
+            },
+            "steps": steps,
             "optional_steps": [
                 {"id": step["id"], "title": step["title"]}
                 for step in document["steps"] if step["optional"]

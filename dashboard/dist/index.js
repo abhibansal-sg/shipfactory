@@ -413,6 +413,12 @@
     return { data: data, loading: loading, error: error, loadedAt: loadedAt, reload: function () { return load(false); }, setData: setData };
   }
 
+  // Keep recipe retrieval behind a small read-only resource boundary so a
+  // future editor can add its own mutations without restructuring views.
+  function useRecipesResource(refreshKey) {
+    return usePollingResource("/recipes", refreshKey);
+  }
+
   function useReportViewMeta(props, resource, boards) {
     useEffect(function () {
       if (!resource.loadedAt || !props.onMeta) return;
@@ -724,12 +730,7 @@
             h("div", null, h("span", { className: "text-text-tertiary" }, "Updated"), h(Ago, { value: detail.updated_at }))
           ),
           h(InstanceControls, { detail: detail, recipes: props.recipes, recipesError: props.recipesError, onChanged: props.onChanged }),
-          h(BudgetProgress, { tokens: detail.tokens }),
           h(ReviewStoryCard, { story: detail.review_story }),
-          h("div", { className: "flex items-center justify-between border-l-2 border-primary bg-primary/10 p-3 text-sm" },
-            h("span", { className: "text-text-secondary" }, "Activations"),
-            h("strong", { className: "font-mono-ui" }, formatNumber(detail.activation_count) + " / " + (detail.budgets && detail.budgets.max_activations != null ? formatNumber(detail.budgets.max_activations) : "unbounded"))
-          ),
           h("section", { className: "flex flex-col gap-2" },
             h(SectionHeading, { title: "Steps", description: "Every activation in recipe order.", meta: (detail.steps || []).length + " rows" }),
             (detail.steps || []).length === 0 ? h(EmptyState, { title: "No steps", description: "This instance has not created a step activation yet." }) :
@@ -780,13 +781,14 @@
 
   function InstancesView(props) {
     var resource = usePollingResource("/instances", props.refreshKey);
-    var recipesResource = usePollingResource("/recipes", props.refreshKey);
-    var _a = useState(null), selectedId = _a[0], setSelectedId = _a[1];
-    var _b = useState(null), detail = _b[0], setDetail = _b[1];
-    var _c = useState(false), detailLoading = _c[0], setDetailLoading = _c[1];
-    var _d = useState(""), detailError = _d[0], setDetailError = _d[1];
-    var _e = useState(""), dialog = _e[0], setDialog = _e[1];
-    var _f = useState(null), toast = _f[0], setToast = _f[1];
+    var recipesResource = useRecipesResource(props.refreshKey);
+    var _a = useState(null), expandedId = _a[0], setExpandedId = _a[1];
+    var _b = useState(null), selectedId = _b[0], setSelectedId = _b[1];
+    var _c = useState(null), detail = _c[0], setDetail = _c[1];
+    var _d = useState(false), detailLoading = _d[0], setDetailLoading = _d[1];
+    var _e = useState(""), detailError = _e[0], setDetailError = _e[1];
+    var _f = useState(""), dialog = _f[0], setDialog = _f[1];
+    var _g = useState(null), toast = _g[0], setToast = _g[1];
     var instances = resource.data || [];
     useReportViewMeta(props, resource, instances.map(function (item) { return item.board; }));
 
@@ -799,8 +801,21 @@
       }).finally(function () { setDetailLoading(false); });
     }
 
-    function openFromKey(event, id) {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); loadDetail(id); }
+    function activeStep(item) {
+      var states = ["ready", "running", "waiting", "blocked"];
+      return (item.latest_steps || []).find(function (step) {
+        return states.indexOf(normalizedState(step.state)) >= 0;
+      }) || null;
+    }
+
+    function stepLabel(item, step) {
+      var recipe = (recipesResource.data || []).find(function (candidate) {
+        return recipeKey(candidate) === item.recipe;
+      });
+      var definition = recipe && (recipe.steps || []).find(function (candidate) {
+        return candidate.id === step.step_id;
+      });
+      return definition && definition.title || step.step_id;
     }
 
     function writeComplete(message) {
@@ -814,7 +829,7 @@
     }
 
     return h("section", { className: "factory-view flex min-w-0 flex-col gap-4" },
-      h(ViewHeading, { title: "Instances", description: "Recipe progress, activations, and budget consumption.", action: h("div", { className: "flex flex-wrap gap-2" },
+      h(ViewHeading, { title: "Instances", description: "Recipe progress and current workflow state.", action: h("div", { className: "flex flex-wrap gap-2" },
         h(Button, { type: "button", size: "sm", onClick: function () { setDialog("run"); } }, "Run recipe"),
         h(Button, { type: "button", size: "sm", outlined: true, onClick: function () { setDialog("triage"); } }, "New triage task")
       ) }),
@@ -823,31 +838,32 @@
       resource.loading && resource.data === null ? h(LoadingState, { label: "Loading recipe instances…" }) :
       resource.error && resource.data === null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) :
       instances.length === 0 ? h(EmptyState, { title: "No recipe instances yet", description: "Instances appear after a task is matched to an active recipe." }) :
-      h("div", { className: "overflow-x-auto border border-border bg-card" },
-        h("table", { className: "factory-instance-table w-full font-mondwest normal-case text-sm" },
-          h("thead", null, h("tr", { className: "border-b border-border text-xs text-muted-foreground" },
-            h("th", { className: "px-3 py-2 text-left font-medium" }, "Recipe / instance"), h("th", { className: "px-3 py-2 text-left font-medium" }, "Board"), h("th", { className: "px-3 py-2 text-left font-medium" }, "State"), h("th", { className: "px-3 py-2 text-left font-medium" }, "Steps"),
-            h("th", { className: "px-3 py-2 text-left font-medium" }, "Budget"), h("th", { className: "px-3 py-2 text-left font-medium" }, "Activations"), h("th", { className: "px-3 py-2 text-left font-medium" }, "Created"), h("th", { className: "px-3 py-2 text-left font-medium" }, "Updated")
-          )),
-          h("tbody", null, instances.map(function (item) {
-            return h("tr", {
-              key: item.id, tabIndex: 0, role: "button",
-              className: "border-b border-border/50 transition-colors hover:bg-secondary/20",
-              onClick: function () { loadDetail(item.id); },
-              onKeyDown: function (event) { openFromKey(event, item.id); },
-            },
-              h("td", { className: "px-3 py-2" }, h("div", { className: "font-medium text-foreground" }, item.recipe), h("span", { className: "mt-1 block font-mono-ui text-xs text-text-tertiary" }, item.id)),
-              h("td", { className: "px-3 py-2" }, item.board),
-              h("td", { className: "px-3 py-2" }, h(StatePill, { value: item.status })),
-              h("td", { className: "px-3 py-2" }, h(StepStateSummary, { states: item.step_states })),
-              h("td", { className: "factory-budget-cell px-3 py-2" }, h(BudgetProgress, { tokens: item.tokens })),
-              h("td", { className: "px-3 py-2 font-mono-ui text-xs" }, formatNumber(item.activation_count) + " / " + (item.budgets && item.budgets.max_activations != null ? formatNumber(item.budgets.max_activations) : "∞")),
-              h("td", { className: "px-3 py-2" }, h(Ago, { value: item.created_at })),
-              h("td", { className: "px-3 py-2" }, h(Ago, { value: item.updated_at }))
-            );
-          }))
-        )
-      ),
+      h("div", { className: "factory-instance-list border border-border bg-card" }, instances.map(function (item) {
+        var expanded = expandedId === item.id;
+        var current = activeStep(item);
+        return h("article", { key: item.id, className: "border-b border-border/50 last:border-b-0" },
+          h("button", {
+            type: "button", className: "flex w-full flex-wrap items-center gap-3 p-3 text-left transition-colors hover:bg-secondary/20",
+            "aria-expanded": expanded, onClick: function () { setExpandedId(expanded ? null : item.id); },
+          },
+            h("span", { className: "min-w-0 flex-1" }, h("strong", { className: "block truncate font-medium text-foreground" }, item.recipe || item.id), h("span", { className: "block font-mono-ui text-xs text-text-tertiary" }, item.id)),
+            h(StatePill, { value: item.status }),
+            h("span", { className: "text-xs text-text-secondary" }, current ? stepLabel(item, current) : "No active step")
+          ),
+          expanded ? h("div", { className: "border-t border-border bg-background/20 p-3" },
+            h("ol", { className: "grid gap-2", "aria-label": "Latest step state" }, (item.latest_steps || []).map(function (step) {
+              return h("li", { key: step.step_id }, h("button", {
+                type: "button", className: "flex w-full flex-wrap items-center gap-2 border border-border bg-card p-2 text-left text-xs hover:bg-secondary/20",
+                onClick: function () { loadDetail(item.id); },
+              },
+                h("strong", { className: "font-mono-ui text-foreground" }, stepLabel(item, step)),
+                h(StatePill, { value: step.state }),
+                step.rejected_by_step_id ? h(MonoChip, { title: "Rework provenance" }, "rework ← " + step.rejected_by_step_id + (step.rejected_by_activation != null ? " #" + step.rejected_by_activation : "")) : null
+              ));
+            }))
+          ) : null
+        );
+      })),
       h(InstanceDrawer, {
         open: !!selectedId, detail: detail, loading: detailLoading, error: detailError,
         recipes: recipesResource.data || [], recipesError: recipesResource.error,
@@ -857,6 +873,70 @@
       }),
       h(RunRecipeDialog, { open: dialog === "run", recipes: recipesResource.data || [], recipesError: recipesResource.error, board: props.status && props.status.board, onClose: function () { setDialog(""); }, onCreated: function (result) { writeComplete("Started " + result.recipe + " as " + result.instance_id + "."); } }),
       h(TriageDialog, { open: dialog === "triage", daemon: props.status, board: props.status && props.status.board, onClose: function () { setDialog(""); }, onCreated: function (result) { writeComplete("Created triage task " + result.task_id + " on " + result.board + "."); } })
+    );
+  }
+
+  function RecipeStepDetail(props) {
+    var step = props.step;
+    var caps = props.recipe.budgets && props.recipe.budgets.step_activation_caps;
+    var cap = caps && caps[step.id];
+    return h("section", { className: "border border-border bg-background/20 p-3 text-sm" },
+      h("div", { className: "flex flex-wrap items-center gap-2" }, h("strong", { className: "font-mono-ui" }, step.id), h(MonoChip, null, step.primitive)),
+      h("dl", { className: "mt-3 grid gap-2 text-xs" },
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Instructions"), h("dd", { className: "mt-1 whitespace-pre-wrap text-text-secondary" }, step.instructions || "No instructions declared.")),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Needs"), h("dd", null, (step.needs || []).length ? step.needs.join(", ") : "None")),
+        step.execution_profile ? h("div", null, h("dt", { className: "text-text-tertiary" }, "Execution profile"), h("dd", null, step.execution_profile)) : null,
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Activation cap"), h("dd", null, cap == null ? "Not capped" : cap))
+      )
+    );
+  }
+
+  function RecipeCard(props) {
+    var recipe = props.recipe;
+    var expanded = props.expanded;
+    return h("article", { className: "border border-border bg-card" },
+      h("button", { type: "button", className: "flex w-full flex-wrap items-center gap-3 p-3 text-left hover:bg-secondary/20", "aria-expanded": expanded, onClick: props.onToggle },
+        h("strong", { className: "font-mono-ui text-sm " + (recipe.status === "active" ? "text-primary" : "text-foreground") }, recipeKey(recipe)),
+        h(StatePill, { value: recipe.status }),
+        h("span", { className: "min-w-0 flex-1 truncate text-xs text-text-secondary" }, recipe.description)
+      ),
+      expanded ? h("div", { className: "border-t border-border p-3" },
+        h("ol", { className: "grid gap-2", "aria-label": "Recipe step chain" }, (recipe.steps || []).map(function (step) {
+          return h("li", { key: step.id },
+            h("button", { type: "button", className: "flex w-full flex-wrap items-center gap-2 border border-border bg-background/20 p-2 text-left text-xs hover:bg-secondary/20", onClick: function () { props.onSelectStep(step); } },
+              h("strong", { className: "font-mono-ui" }, step.id), h("span", null, step.title), h(MonoChip, null, step.primitive), step.seat ? h(MonoChip, { title: "Seat" }, "@" + step.seat) : null
+            ),
+            props.selectedStep && props.selectedStep.id === step.id ? h("div", { className: "mt-2" }, h(RecipeStepDetail, { recipe: recipe, step: step })) : null
+          );
+        }))
+      ) : null
+    );
+  }
+
+  function RecipesView(props) {
+    var resource = useRecipesResource(props.refreshKey);
+    var _a = useState(null), selectedKey = _a[0], setSelectedKey = _a[1];
+    var _b = useState(null), selectedStep = _b[0], setSelectedStep = _b[1];
+    var recipes = resource.data || [];
+    useReportViewMeta(props, resource, []);
+    var groups = {};
+    recipes.forEach(function (recipe) { (groups[recipe.id] || (groups[recipe.id] = [])).push(recipe); });
+    return h("section", { className: "factory-view flex min-w-0 flex-col gap-4" },
+      h(ViewHeading, { title: "Recipes", description: "Published recipe contracts, read-only." }),
+      resource.loading && resource.data === null ? h(LoadingState, { label: "Loading recipes…" }) :
+      resource.error && resource.data === null ? h(ErrorState, { message: resource.error, onRetry: resource.reload }) :
+      recipes.length === 0 ? h(EmptyState, { title: "No recipes configured", description: "Published recipe versions will appear here." }) :
+      h("div", { className: "grid gap-4" }, Object.keys(groups).sort().map(function (id) {
+        var versions = groups[id].slice().sort(function (left, right) { return Number(right.version) - Number(left.version); });
+        return h("section", { key: id, className: "grid gap-2" },
+          h("h2", { className: "font-mondwest normal-case text-sm font-medium text-foreground" }, id),
+          versions.map(function (recipe) {
+            var key = recipeKey(recipe);
+            return h(RecipeCard, { key: key, recipe: recipe, expanded: selectedKey === key, selectedStep: selectedKey === key ? selectedStep : null,
+              onToggle: function () { setSelectedKey(selectedKey === key ? null : key); setSelectedStep(null); }, onSelectStep: setSelectedStep });
+          })
+        );
+      }))
     );
   }
 
@@ -938,7 +1018,6 @@
         h("dl", { className: "grid gap-2 text-xs" },
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Profile"), h("dd", { className: "font-mono-ui text-right text-foreground" }, seat.profile || "—")),
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Profile model"), h("dd", { className: "font-mono-ui text-right text-foreground" }, seat.profile_model || "not explicit")),
-          h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Reports to"), h("dd", { className: "text-right text-foreground" }, seat.reports_to || "—")),
           h("div", { className: "flex items-baseline justify-between gap-3" }, h("dt", { className: "text-text-tertiary" }, "Concurrency"), h("dd", { className: "font-mono-ui text-right text-foreground" }, formatNumber(seat.max_concurrent)))
         ),
         h("div", { className: "flex justify-end border-t border-border pt-3" }, h(Button, { type: "button", size: "sm", ghost: true, onClick: function () { props.onEdit(seat); } }, "Edit seat"))
@@ -1105,7 +1184,6 @@
         h(MonoChip, { title: "Seat" }, receipt.seat || "unassigned"),
         h(MonoChip, { title: "Executor and provider lane" }, lane),
         h(MonoChip, { title: "Resolved model" }, receipt.resolved_model || receipt.model || "model unknown"),
-        h("span", { className: "font-mono-ui tabular-nums text-text-secondary", title: "Total tokens" }, formatNumber(receipt.tokens_total) + " tok"),
         receipt.duration_s != null ? h("span", { className: "font-mono-ui tabular-nums text-text-secondary", title: "Run duration" }, formatDuration(receipt.duration_s)) : null,
         receipt.exit_code != null
           ? h(StatePill, { value: Number(receipt.exit_code) === 0 ? "done" : "failed", title: "Exit code" }, "exit " + receipt.exit_code)
@@ -1305,7 +1383,6 @@
           )
         ),
         instance.blocked_reason ? h("p", { className: "border border-destructive/30 bg-destructive/10 p-3 text-xs leading-relaxed text-destructive" }, instance.blocked_reason) : null,
-        h(BudgetProgress, { tokens: instance.tokens }),
         steps.length === 0 ? h("p", { className: "text-xs text-text-tertiary" }, "No step activations yet.") :
         h("ol", { className: "factory-journey-steps", "aria-label": "Journey steps in recipe order" }, steps.map(function (step) {
           return h(JourneyStepRow, {
@@ -1356,6 +1433,7 @@
     { id: "journey", label: "Journeys", component: JourneyView },
     { id: "waiting", label: "Waiting gates", component: WaitingView },
     { id: "instances", label: "Instances", component: InstancesView },
+    { id: "recipes", label: "Recipes", component: RecipesView },
     { id: "seats", label: "Seats", component: SeatsView },
     { id: "costs", label: "Costs", component: CostsView },
   ];
