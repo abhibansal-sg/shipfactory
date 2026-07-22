@@ -341,7 +341,7 @@ def _review_verdict_contract(recipe: dict[str, Any], step_def: dict[str, Any]) -
         "repository location. Keep the verdict JSON on one physical line."
     )
 
-def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_def: dict[str, Any], step: dict[str, Any], parameters: dict[str, Any], parents: list[str], db: Any = None) -> str | None:
+def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_def: dict[str, Any], step: dict[str, Any], parameters: dict[str, Any], parents: list[str], db: Any = None, body_suffix: str = "") -> str | None:
     """Perform one idempotent primitive mutation and return its task id if any."""
     from hermes_cli import kanban_db
     primitive, params = step_def["primitive"], step_def["params"]
@@ -382,6 +382,10 @@ def activate(conn: Any, instance: dict[str, Any], recipe: dict[str, Any], step_d
         body += "\n".join(lines)
     if primitive == "review_gate" and recipe.get("schema") == "shipfactory.recipe/v2":
         body += _review_verdict_contract(recipe, step_def)
+    if body_suffix:
+        # Rejection context from a step with no kanban task to inherit
+        # (verification rework feedback, finding #95).
+        body += body_suffix
     if primitive in {"agent_task", "review_gate"}:
         # board= must be explicit: create_task's default_workdir inheritance
         # falls back to get_current_board() (the GLOBAL current board), which

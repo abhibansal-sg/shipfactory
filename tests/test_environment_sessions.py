@@ -136,7 +136,9 @@ def _materialize(repo: Path, base_sha: str, cfg: dict, *, candidate_sha=None) ->
         repo_root=repo, workspace=repo, base_sha=base_sha, candidate_sha=candidate_sha, cfg=cfg,
     )
     assert row is not None
-    deadline = time.monotonic() + 10
+    # 60s wall-clock: the old 10s budget flaked under machine load (daemon +
+    # sealed-environment suites) and blocked factory verification runs.
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         if env.reap_materializations(cfg):
             break
@@ -601,10 +603,10 @@ def test_healthcheck_never_healthy_fails_and_releases_port(tmp_path):
 def test_stop_escalates_to_kill_after_shutdown_timeout(tmp_path):
     repo, cfg, env_row = _ready_env(tmp_path, app_start=_IGNORES_TERM)
     app = _request_app(env_row, "k1", cfg)
-    started = _wait_for_app_state(app["id"], cfg, {"starting", "healthy", "crashed"}, timeout=3)
+    started = _wait_for_app_state(app["id"], cfg, {"starting", "healthy", "crashed"}, timeout=15)
     assert app["id"] in env._APP_RUNNING
     assert env.request_stop(app["id"], cfg) is True
-    stopped = _wait_for_app_state(app["id"], cfg, {"stopped", "crashed"}, timeout=8)
+    stopped = _wait_for_app_state(app["id"], cfg, {"stopped", "crashed"}, timeout=30)
     assert stopped["state"] == "stopped"
 
 

@@ -495,3 +495,177 @@ def test_finding_11_instantiation_anchors_tasks_to_explicit_board(
         assert task.workspace_path != str(board_a)
     finally:
         conn.close()
+
+
+def _v2_verify_recipe(path: Path, *, build_cap: int = 3):
+    path.mkdir()
+    (path / "verified@1.yaml").write_text(
+        f"""schema: shipfactory.recipe/v2
+id: verified
+version: 1
+status: active
+description: finding 95 regression fixture
+intent_tags: [test]
+supersedes: null
+verdict_contract: shipfactory.verdict/v2
+parameters: {{}}
+budgets:
+  max_activations: 12
+  step_activation_caps:
+    build: {build_cap}
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build
+    needs: []
+    optional: false
+    inputs: []
+    outputs:
+      - {{kind: change-set, schema: shipfactory.change-set/v1, path: .shipfactory-output/change-set.json}}
+    params: {{seat: dev-backend, instructions: build it, execution_profile: standard, workspace: worktree, access_mode: workspace_write, environment: source}}
+  - id: verify
+    primitive: verification
+    title: Verify
+    needs: [build]
+    optional: false
+    inputs:
+      - {{from: build, kind: change-set, required: true}}
+    outputs:
+      - {{kind: evidence-bundle, schema: shipfactory.evidence/v1, path: .shipfactory-output/evidence-manifest.json}}
+    params:
+      manifest: .shipfactory/verification.yaml
+      profile: browser-standard
+      environment: app
+""",
+        encoding="utf-8",
+    )
+    return load_library(
+        path, verification_profiles={"browser-standard"},
+    ).get("verified@1")
+
+
+def _simulate_failed_verification(instance_id: str, tmp_path: Path, *,
+                                  reason: str = "test_failed") -> None:
+    log = tmp_path / "pytest-tail.log"
+    log.write_text(
+        "FAILED tests/test_alpha.py::test_broken - AssertionError\n"
+        "2 failed, 500 passed in 100.00s\n",
+        encoding="utf-8",
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='running_verification' "
+            "WHERE instance_id=? AND step_id='verify' AND activation=1",
+            (instance_id,),
+        )
+        db.execute(
+            "INSERT INTO evidence_bundles(id, instance_id, step_id, activation, "
+            "input_revision_hash, base_sha, head_sha, tree_sha, manifest_relpath, "
+            "manifest_blob_sha, state, invalid_reason, redaction_state, created_at, "
+            "environment_identity_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"bundle-{instance_id}", instance_id, "verify", 1,
+             "rev", "a" * 40, "b" * 40, "c" * 40, ".shipfactory/verification.yaml",
+             "d" * 40, "blocked", reason, "not_required", store._now(), "{}"),
+        )
+        db.execute(
+            "INSERT INTO evidence_items(id, bundle_id, case_id, kind, path, sha256, "
+            "size_bytes, producer, metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (f"item-{instance_id}", f"bundle-{instance_id}", "protected-pytest", "log",
+             str(log), "0" * 64, log.stat().st_size, "runner", "{}"),
+        )
+
+
+def test_finding_95_test_failed_verification_reworks_build_with_feedback(
+    tmp_path, kanban_conn, monkeypatch,
+):
+    """A deterministic verification failure routes a rework cone to the builder
+    with the failing oracle lines in the new task body, instead of parking."""
+    from hermes_cli import kanban_db
+    from shipfactory import verification
+
+    store.init_db()
+    monkeypatch.setattr(verification, "verify_evidence_bundle", lambda *a, **k: None)
+    recipe = _v2_verify_recipe(tmp_path / "library")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="f95",
+    )
+    reconcile(kanban_conn, "f95", profiles=PROFILES)
+    build = _step("f95", "build")
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result="built")
+    _simulate_failed_verification("f95", tmp_path)
+
+    reconcile(kanban_conn, "f95", profiles=PROFILES)
+
+    verify = _step("f95", "verify")
+    rework = _step("f95", "build")
+    assert rework["activation"] == 2
+    assert rework["rejected_by_step_id"] == "verify"
+    assert rework["rejected_by_activation"] == 1
+    assert _instance("f95")["status"] == "running"
+    with store._connect() as db:
+        old_verify = db.execute(
+            "SELECT state, blocked_reason FROM recipe_steps "
+            "WHERE instance_id='f95' AND step_id='verify' AND activation=1",
+        ).fetchone()
+    assert (old_verify["state"], old_verify["blocked_reason"]) == ("blocked", "changes_requested")
+    task = kanban_db.get_task(kanban_conn, rework["kanban_task_id"])
+    assert "Verification failure feedback" in task.body
+    assert "FAILED tests/test_alpha.py::test_broken" in task.body
+    assert "2 failed, 500 passed" in task.body
+
+
+def test_finding_95_exhausted_build_cap_parks_for_the_operator(
+    tmp_path, kanban_conn, monkeypatch,
+):
+    """When the change-set producer's activation cap is spent, a test_failed
+    verification parks exactly as before finding #95."""
+    from hermes_cli import kanban_db
+    from shipfactory import verification
+
+    store.init_db()
+    monkeypatch.setattr(verification, "verify_evidence_bundle", lambda *a, **k: None)
+    recipe = _v2_verify_recipe(tmp_path / "library", build_cap=1)
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="f95cap",
+    )
+    reconcile(kanban_conn, "f95cap", profiles=PROFILES)
+    build = _step("f95cap", "build")
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result="built")
+    _simulate_failed_verification("f95cap", tmp_path)
+
+    reconcile(kanban_conn, "f95cap", profiles=PROFILES)
+
+    assert _step("f95cap", "build")["activation"] == 1
+    verify = _step("f95cap", "verify")
+    assert (verify["state"], verify["blocked_reason"]) == ("blocked", "test_failed")
+    assert _instance("f95cap")["status"] == "blocked"
+
+
+def test_finding_95_infrastructure_failures_keep_parking(
+    tmp_path, kanban_conn, monkeypatch,
+):
+    """Only deterministic candidate defects rework; infra/baseline failures park."""
+    from shipfactory import verification
+    from hermes_cli import kanban_db
+
+    store.init_db()
+    monkeypatch.setattr(verification, "verify_evidence_bundle", lambda *a, **k: None)
+    recipe = _v2_verify_recipe(tmp_path / "library")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="f95infra",
+    )
+    reconcile(kanban_conn, "f95infra", profiles=PROFILES)
+    build = _step("f95infra", "build")
+    assert kanban_db.complete_task(kanban_conn, build["kanban_task_id"], result="built")
+    _simulate_failed_verification(
+        "f95infra", tmp_path, reason="protected_baseline_test_failed",
+    )
+
+    reconcile(kanban_conn, "f95infra", profiles=PROFILES)
+
+    assert _step("f95infra", "build")["activation"] == 1
+    verify = _step("f95infra", "verify")
+    assert (verify["state"], verify["blocked_reason"]) == (
+        "blocked", "protected_baseline_test_failed",
+    )
+    assert _instance("f95infra")["status"] == "blocked"

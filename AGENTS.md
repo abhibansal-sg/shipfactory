@@ -691,6 +691,22 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   every bootstrap/seed/app script, and scripts exec
   `"${SHIPFACTORY_PYTHON:-python3}"`. A pre-flight boot test must use the
   daemon's REAL env (PATH included), not the operator shell's.
+- A test_failed verification routes a production-rework cone back to the
+  change-set producer (finding #95) instead of parking. It mirrors a review
+  request_changes: `_verification_rework_target` picks the verification
+  step's unique change-set producer, bounded by that step's activation cap
+  (cap exhausted → park for the operator, the pre-#95 behavior); ONLY
+  `test_failed` routes — infrastructure/environment/baseline failures keep
+  parking (a broken baseline is not the candidate's fault). Because a
+  verification step has no kanban task to inherit (unlike review gates,
+  finding #26), the failing oracle lines from the sealed evidence log ride
+  the rework build task's body (`_verification_failure_context`,
+  `activate(body_suffix=...)`). Companion de-flake: the
+  planning-adversarial reap loops and environment-session materialize
+  helper had 4s/10s fixed budgets that flaked under load and repeatedly
+  blocked live verification runs (r3 act1: candidate flaked; act2:
+  baseline flaked) — all are wall-clock deadlines now (60s), instant on
+  the happy path.
 - The process-tree supervisor must not latch a supervision gap on an exit
   blip. `_ProcessTreeTracker` sweeps EVERY process (10ms cadence) reading
   environs to find setsid-detached descendants by nonce; on macOS psutil's
@@ -707,6 +723,6 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#90 so far). When you fix one: commit message
+- Findings get numbers (#22–#95 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

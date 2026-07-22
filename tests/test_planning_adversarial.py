@@ -1064,14 +1064,18 @@ def test_readonly_explorer_write_attempt_is_denied_by_the_filesystem(
             task = kanban_db.get_task(conn, explore_task_id)
             workspace_path = Path(task.workspace_path)
 
+            import time
             outcome = None
-            for _ in range(200):
+            # Wall-clock deadline, not an iteration count: under machine load
+            # (daemon ticking, a sealed-environment suite running) the old 4s
+            # budget flaked and repeatedly blocked factory verification runs.
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
                 finished = reap_finished()
                 if finished:
                     outcome = finished[0]
                     break
-                import time
-                time.sleep(0.02)
+                time.sleep(0.05)
             assert outcome is not None, "the malicious harness never exited"
 
             assert (workspace_path / "README.md").read_bytes() == original_readme
@@ -1295,14 +1299,17 @@ def test_chmod_bypass_before_writing_succeeds_and_is_honestly_labeled_advisory(
         task = kanban_db.get_task(conn, explore_task_id)
         workspace_path = Path(task.workspace_path)
 
+        import time
         outcome = None
-        for _ in range(200):
+        # Wall-clock deadline (see the readonly-denial test above): the old 4s
+        # iteration budget flaked under load and blocked factory verification.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
             finished = reap_finished()
             if finished:
                 outcome = finished[0]
                 break
-            import time
-            time.sleep(0.02)
+            time.sleep(0.05)
         assert outcome is not None, "the malicious harness never exited"
 
         with store._connect() as db:

@@ -805,6 +805,84 @@ def _rejecting_gate_task(db: Any, conn: Any, instance_id: str, recipe: dict[str,
     return None
 
 
+def _verification_rework_target(
+    db: Any, instance: dict[str, Any], recipe: dict[str, Any],
+    defs: dict[str, Any], step: dict[str, Any],
+) -> str | None:
+    """Cap-bounded rework routing for a test_failed verification (finding #95).
+
+    Returns the verification step's unique change-set producer when another
+    activation of it fits under its declared activation cap, else ``None`` —
+    which parks the instance for the operator, exactly the pre-#95 behavior.
+    Only deterministic candidate defects route here; infrastructure and
+    environment failures keep their existing blocked semantics.
+    """
+    producers = [
+        item["from"] for item in defs[step["step_id"]].get("inputs", [])
+        if item.get("kind") == "change-set"
+    ]
+    if len(producers) != 1:
+        return None
+    producer = producers[0]
+    caps = (recipe.get("budgets") or {}).get("step_activation_caps") or {}
+    cap = caps.get(producer)
+    row = db.execute(
+        "SELECT MAX(activation) AS activation FROM recipe_steps WHERE instance_id=? AND step_id=?",
+        (instance["id"], producer),
+    ).fetchone()
+    current = int(row["activation"]) if row and row["activation"] is not None else 0
+    if cap is not None and current + 1 > int(cap):
+        return None
+    return producer
+
+
+def _verification_failure_context(db: Any, step: dict[str, Any], defs: dict[str, Any]) -> str:
+    """Failing-oracle excerpt for a rework activation rejected by verification.
+
+    Reviews hand the rework worker their verdict through the gate's kanban
+    task (finding #26); a verification step has no kanban task, so the sealed
+    evidence log's failure lines ride the rework task body instead
+    (finding #95). Read-only over sealed items; bounded excerpt.
+    """
+    from pathlib import Path
+    keys = step.keys() if hasattr(step, "keys") else []
+    rejecting = step["rejected_by_step_id"] if "rejected_by_step_id" in keys else None
+    if not rejecting or defs.get(rejecting, {}).get("primitive") != "verification":
+        return ""
+    bundle = db.execute(
+        "SELECT id FROM evidence_bundles WHERE instance_id=? AND step_id=? AND activation=?",
+        (step["instance_id"], rejecting,
+         int(step["rejected_by_activation"] or 0)),
+    ).fetchone()
+    if not bundle:
+        return ""
+    lines: list[str] = []
+    for item in db.execute(
+        "SELECT path FROM evidence_items WHERE bundle_id=? AND kind='log' ORDER BY id",
+        (bundle["id"],),
+    ).fetchall():
+        try:
+            text = Path(item["path"]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if (line.startswith("FAILED ")
+                    or (" failed" in line and " passed" in line)):
+                lines.append(line.strip())
+    if not lines:
+        return ""
+    seen: set[str] = set()
+    unique = [x for x in lines if not (x in seen or seen.add(x))][:80]
+    excerpt = "\n".join(unique)[:6000]
+    return (
+        "\n\n## Verification failure feedback\n"
+        f"The previous candidate was rejected by the deterministic {rejecting} "
+        "step. These oracle-verified failures are the defects your rework must "
+        "fix — they are ground truth, not reviewer opinion:\n\n"
+        f"```\n{excerpt}\n```"
+    )
+
+
 def _invalidate_cone(db: Any, instance: dict[str, Any], recipe: dict[str, Any], target: str, rejecting_step: str, source: str, *, rejecting_activation: int | None = None) -> None:
     """Insert (never overwrite) a new activation cone through a rejecting gate."""
     defs = {x["id"]: x for x in recipe["steps"]}
@@ -980,6 +1058,29 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                                      ).hexdigest(), store._now(), instance_id,
                                      step["step_id"], int(step["activation"])),
                                 )
+                            if (target == "blocked"
+                                    and bundle["invalid_reason"] == "test_failed"):
+                                # Finding #95: a deterministic test failure means
+                                # the CANDIDATE is defective — the same situation
+                                # as a review request_changes. Route a
+                                # production-rework cone back to the change-set
+                                # producer instead of parking, bounded by that
+                                # step's activation cap.
+                                rework = _verification_rework_target(
+                                    db, instance, recipe, defs, step,
+                                )
+                                if rework is not None:
+                                    _invalidate_cone(
+                                        db, instance, recipe, rework,
+                                        step["step_id"], f"evidence:{bundle['id']}",
+                                        rejecting_activation=int(step["activation"]),
+                                    )
+                                    changed |= _transition(
+                                        db, instance, dict(step), "blocked",
+                                        f"evidence:{bundle['id']}",
+                                        reason="changes_requested",
+                                    )
+                                    continue
                             changed |= _transition(
                                 db, instance, step, target, f"evidence:{bundle['id']}",
                                 reason=bundle["invalid_reason"],
@@ -1320,12 +1421,16 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         db.execute("UPDATE recipe_instances SET blocked_reason=? WHERE id=?", (fuse, instance_id))
                         continue
                 parents = [latest[parent]["kanban_task_id"] for parent in definition["needs"] if latest[parent]["kanban_task_id"]]
+                body_suffix = ""
                 if primitive == "agent_task" and int(step["activation"]) > 1:
                     # Finding #26: hand the rework worker the rejecting verdict.
                     gate_task = _rejecting_gate_task(db, conn, instance_id, recipe, sid)
                     if gate_task and gate_task not in parents:
                         parents.append(gate_task)
-                task = activate(conn, instance, recipe, definition, step, params, parents, db=db)
+                    # Finding #95: a verification rejecter has no kanban task —
+                    # its failing oracle output rides the rework body instead.
+                    body_suffix = _verification_failure_context(db, step, defs)
+                task = activate(conn, instance, recipe, definition, step, params, parents, db=db, body_suffix=body_suffix)
                 state = "running" if primitive in {"agent_task", "review_gate"} else "waiting"
                 changed |= _transition(db, instance, step, state, "activate", task=task)
                 if primitive in {"approval_gate", "wait_for_event"} and task:
