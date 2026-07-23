@@ -87,3 +87,28 @@ def test_rescue_respects_max_concurrent(board, monkeypatch):
     daemon.tick(board, board="decoupling")
 
     assert len(spawned) == 1  # second left unclaimed
+
+
+def test_rescue_releases_claim_when_spawn_fails(board, monkeypatch):
+    """Finding #85: a spawn failure inside the rescue must not strand the task.
+
+    A transient error (e.g. stale-WAL ``disk I/O error``) after ``claim_task``
+    used to leave the task claimed as a phantom ``running`` with no run row —
+    the daemon saw "running", Hermes saw nothing, and the flight stalled
+    forever. The rescue now releases the claim so the next tick retries.
+    """
+    spawned: list = []
+    _install(monkeypatch, spawned, {"spec-author": _seat("spec-author")})
+
+    def exploding_spawn(task, workspace, *, board=None):
+        raise RuntimeError("disk I/O error")
+    monkeypatch.setattr(
+        sys.modules["shipfactory.spawn"], "shipfactory_spawn", exploding_spawn)
+
+    task_id = kanban_db.create_task(board, title="spec", assignee="spec-author")
+
+    daemon.tick(board, board="decoupling")  # must not raise
+
+    task = kanban_db.get_task(board, task_id)
+    assert task is not None and task.status == "ready"  # claim released — retryable next tick
+    assert spawned == []

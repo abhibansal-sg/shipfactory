@@ -383,10 +383,21 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                 claimed = kanban_db.claim_task(conn, task_id, ttl_seconds=None)
                 if claimed is None:
                     continue  # lost race / no longer ready
-                workspace = kanban_db.resolve_workspace(claimed, board=board)
-                kanban_db.set_workspace_path(conn, task_id, str(workspace))
-                if spawn_fn(claimed, str(workspace), board=board) is not None:
-                    running_by[assignee] = running_by.get(assignee, 0) + 1
+                try:
+                    workspace = kanban_db.resolve_workspace(claimed, board=board)
+                    kanban_db.set_workspace_path(conn, task_id, str(workspace))
+                    if spawn_fn(claimed, str(workspace), board=board) is not None:
+                        running_by[assignee] = running_by.get(assignee, 0) + 1
+                except Exception:
+                    # A failed spawn (e.g. transient WAL disk I/O on the spawn's
+                    # own board connection) must not strand the task as a
+                    # claimed phantom-`running` with no worker: release the
+                    # claim so the next tick's rescue retries it (finding #85).
+                    logger.exception("Factory rescue spawn failed for %s; releasing claim", task_id)
+                    try:
+                        kanban_db.reclaim_task(conn, task_id, reason="rescue spawn failed; retry next tick")
+                    except Exception:
+                        logger.exception("Factory could not release rescue claim for %s", task_id)
             except Exception:
                 logger.exception("Factory could not rescue nonspawnable task %s", task_id)
 
