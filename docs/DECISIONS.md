@@ -13,13 +13,18 @@ closed unless explicitly reopened. Reference these before proposing structure.
   operator thinks in projects, the board is an implementation detail.
 - Boards with no mapping render under **unclassified** — visible, never
   blocking. Totality by default, not by force.
-- Mechanism: mapping table in ShipFactory's own store (`board_slug →
-  project_id`, `UNIQUE(board_slug)`; 1:1 enforced as policy with uniqueness on
-  the project side too). Zero Hermes core modification. If Hermes later ships
-  native project↔board linking, migrate the one table and delete ours.
-- Rejected alternatives: 1:N boards per project (no real scenario survived
-  scrutiny — recipe/priority/seats already cover the imagined splits);
-  upstream `project_id` on Hermes boards (breaks the no-core-mod law, blocks
-  on external review).
+- Mechanism (**revised, closed 2026-07-23**): reuse Hermes' native binding —
+  `hermes project bind-board <project> <board>` (stored on the project row in
+  `projects.db`). The factory READS this read-only to resolve a board's owning
+  project; it builds no mapping store of its own. Unbound board → shows as
+  **Unclassified**. A board bound by two projects (Hermes doesn't prevent it)
+  renders under the first and warns — no enforcement machinery built.
+  Zero Hermes core modification. Live: `shipfactory → factory-selfbuild1`
+  bound.
+- Rejected alternatives: ShipFactory-owned mapping table/config (superseded —
+  native binding is exactly 1:1 already); 1:N boards per project (no real
+  scenario survived scrutiny — recipe/priority/seats already cover the
+  imagined splits); upstream `project_id` on Hermes boards (breaks the
+  no-core-mod law, blocks on external review).
 - Surfacing: a **Projects tab** in the ShipFactory dashboard view — project →
   its flights (board level flattened away), plus the unclassified bucket.
