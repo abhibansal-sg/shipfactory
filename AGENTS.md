@@ -859,12 +859,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   base/head, not the mutable instance base (finding #113, SF-20). Verification-
   only recovery may advance the operational base to the sealed head; head/tree,
   producer workspace, change-set bytes, and complete diff remain exact.
+- Operator recovery counts are reason-scoped (finding #114, SF-20): one capped
+  activation release and one worker-blocked harness/artifact retry are distinct
+  audited brakes. A downstream agent task may receive the latter, but still only
+  as a fresh activation; neither path marks work complete or touches approval.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#113 so far). When you fix one: commit message
+- Findings get numbers (#22–#114 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

@@ -2214,7 +2214,8 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
-        prior_release_count = 0
+        prior_budget_release_count = 0
+        prior_worker_release_count = 0
         prior_admission_repair_count = 0
         budget_admission_repair = False
         if step is not None and str(step["blocked_reason"] or "").startswith(
@@ -2235,7 +2236,11 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
                 except (TypeError, ValueError):
                     continue
                 if prior_payload.get("step_id") == step_id:
-                    prior_release_count += 1
+                    prior_reason = str(prior_payload.get("blocked_reason") or "")
+                    if prior_reason.startswith("budget_exhausted:step_activation_cap:"):
+                        prior_budget_release_count += 1
+                    elif prior_reason == "worker_blocked":
+                        prior_worker_release_count += 1
             prior_admission_repair_count = int(db.execute(
                 "SELECT COUNT(*) FROM advance_events WHERE instance_id=? "
                 "AND source='operator_release' AND state='applied' "
@@ -2249,23 +2254,29 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
     primitive_allowed = bool(
         step and (
             step["primitive"] == "review_gate"
-            or (step["primitive"] == "agent_task" and cap_block)
+        or (step["primitive"] == "agent_task" and (
+            cap_block or step["blocked_reason"] == "worker_blocked"
+        ))
         )
     )
     if (not step or not primitive_allowed or step["state"] != "blocked"
             or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
     if (str(step["blocked_reason"] or "").startswith("budget_exhausted:")
-            and not budget_admission_repair and prior_release_count >= 1):
+            and not budget_admission_repair and prior_budget_release_count >= 1):
         raise ValueError("review activation-cap release cap exhausted for this step")
     if budget_admission_repair and prior_admission_repair_count >= 1:
         raise ValueError("review activation-cap repair already applied for this activation")
-    if step["blocked_reason"] == "worker_blocked" and prior_release_count >= 1:
+    if step["blocked_reason"] == "worker_blocked" and prior_worker_release_count >= 1:
         raise ValueError("worker-blocked review release cap exhausted for this step")
     return enqueue(
         instance_id,
         "operator_release",
-        {"step_id": step_id, "reason": str(reason).strip()},
+        {
+            "step_id": step_id,
+            "reason": str(reason).strip(),
+            "blocked_reason": str(step["blocked_reason"] or ""),
+        },
         expected_activation=int(step["activation"]), expected_state=step["state"],
     )
 
@@ -2619,7 +2630,9 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 )
                 primitive_allowed = (
                     step["primitive"] == "review_gate"
-                    or (step["primitive"] == "agent_task" and cap_block)
+                    or (step["primitive"] == "agent_task" and (
+                        cap_block or step["blocked_reason"] == "worker_blocked"
+                    ))
                 )
                 if (not primitive_allowed or step["state"] != "blocked"
                         or not _recoverable_review_reason(step["blocked_reason"])):
