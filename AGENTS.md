@@ -751,6 +751,18 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   candidates are safely ignorable (a dead process cannot be a live detached
   descendant); only a demonstrably ALIVE process whose environ stays
   unreadable is a genuine gap. Fail-closed posture preserved.
+- A pytest oracle must prove its selected interpreter can import pytest BEFORE
+  it runs candidate tests. A daemon restarted outside the canonical venv can
+  resolve bare `python` to a valid interpreter that lacks pytest; without the
+  preflight, the runner's `ModuleNotFoundError` was classified `test_failed`,
+  sent an LLM builder to repair already-green source, and blocked on the
+  truthful no-op. Fix (finding #99, SF-20): classify import/preflight failures
+  as `infrastructure_error`; provide an enqueue-only `retry-verification`
+  operator event that binds an exact successful producer run + sealed
+  change-set, abandons only the later blocked artifact-less rework activation,
+  and reruns deterministic verification. Change-set workspace and reviewer
+  independence resolve the exact sealed producer activation, never a newer
+  no-op activation. The retry cannot mark evidence passed or approve a gate.
 
 ## Conventions
 

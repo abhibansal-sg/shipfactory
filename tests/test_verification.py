@@ -171,6 +171,35 @@ def test_unknown_driver_fails_closed():
         verify.validate_verification_manifest(shell)
 
 
+def test_finding_99_missing_pytest_runtime_is_infrastructure_error(tmp_path):
+    """A trusted launcher without pytest is broken infrastructure, not a candidate defect."""
+    store.init_db()
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    interpreter = tmp_path / "python-without-pytest"
+    interpreter.write_text(
+        "#!/bin/sh\necho \"ModuleNotFoundError: No module named 'pytest'\" >&2\nexit 1\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    case = {
+        "id": "protected-pytest",
+        "argv": [str(interpreter), "-m", "pytest", "tests/", "-q"],
+        "oracle": {"type": "pytest_summary", "min_passed": 1},
+    }
+
+    result = verify._command_driver(
+        case, workspace,
+        {"HOME": str(home), "PATH": os.environ["PATH"], "TMPDIR": str(tmp_path)},
+        10,
+    )
+
+    assert result["classification"] == "infrastructure_error"
+    assert "pytest runtime preflight failed" in result["error"]
+
+
 def test_recipe_v2_accepts_only_the_non_model_verification_shape():
     step = {
         "id": "verify-runtime", "primitive": "verification", "title": "Verify",

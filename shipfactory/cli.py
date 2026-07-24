@@ -262,6 +262,17 @@ def _recipe(args: argparse.Namespace) -> Any:
         ))
     if command == "release":
         return _emit(_recipe_release(None, args.instance, args.step, args.reason))
+    if command == "retry-verification":
+        key = advancer.retry_verification(
+            args.instance, args.step, producer_step=args.producer_step,
+            producer_activation=args.producer_activation, reason=args.reason,
+        )
+        return _emit({
+            "instance_id": args.instance, "step_id": args.step,
+            "producer_step": args.producer_step,
+            "producer_activation": args.producer_activation,
+            "key": key, "status": "queued",
+        })
     conn = kanban_db.connect(board=getattr(args, "board", None))
     try:
         if command == "cancel":
@@ -380,6 +391,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     for name in ("approve", "reject"):
         q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--activation", type=int, required=True); q.add_argument("--revision-hash", required=True); q.add_argument("--evidence-bundle-hash", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-kind", default="operator"); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli"); q.add_argument("--board")
     q = subs.add_parser("release"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", required=True); q.add_argument("--board")
+    q = subs.add_parser("retry-verification"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--producer-step", required=True); q.add_argument("--producer-activation", type=int, required=True); q.add_argument("--reason", required=True); q.add_argument("--board")
     q = subs.add_parser("event"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("payload"); q.add_argument("--board")
     q = subs.add_parser("cancel"); q.add_argument("instance"); q.add_argument("--dry-run", action="store_true"); q.add_argument("--board")
     q = subs.add_parser("reroute"); q.add_argument("instance"); q.add_argument("recipe"); q.add_argument("--parameters", default="{}"); q.add_argument("--library", required=True); q.add_argument("--board")

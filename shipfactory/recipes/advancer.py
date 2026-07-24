@@ -259,16 +259,51 @@ def _review_stalled(db: Any, instance_id: str, step: dict[str, Any], count: int)
                 and int(previous["finding_count"]) >= 0 and count >= int(previous["finding_count"]))
 
 
-def _step_change_set_workspace(
-    conn: Any, latest: dict[str, dict[str, Any]], definition: dict[str, Any],
-) -> tuple[str | None, str | None]:
-    """Resolve a v2 step's declared change-set producer worktree and its owner task.
+def _sealed_change_set_producer(
+    db: Any, instance_id: str, definition: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve the exact step activation behind the newest declared sealed change-set."""
+    producers = [
+        item["from"] for item in definition.get("inputs", [])
+        if item.get("kind") == "change-set"
+    ]
+    if len(producers) != 1:
+        return None, None
+    artifact = db.execute(
+        "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? "
+        "AND kind='change-set' AND state='sealed' "
+        "ORDER BY activation DESC,sealed_at DESC LIMIT 1",
+        (instance_id, producers[0]),
+    ).fetchone()
+    if artifact is None:
+        return None, None
+    step = db.execute(
+        "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+        (instance_id, producers[0], int(artifact["activation"])),
+    ).fetchone()
+    return dict(artifact), dict(step) if step is not None else None
 
-    Shared by verification scheduling and review-approval binding so both
-    resolve "the candidate's own worktree" identically (finding #1,
-    verification adversarial lane).
+
+def _step_change_set_workspace(
+    conn: Any, db: Any, instance_id: str,
+    latest: dict[str, dict[str, Any]], definition: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve the sealed change-set's exact producer worktree and owner task.
+
+    A later no-op/blocked producer activation must not shadow the canonical
+    sealed candidate selected by artifact resolution (finding #99).
     """
     from hermes_cli import kanban_db
+    _artifact, exact_step = _sealed_change_set_producer(db, instance_id, definition)
+    if _artifact is not None:
+        if exact_step and exact_step.get("kanban_task_id"):
+            exact_task = kanban_db.get_task(conn, exact_step["kanban_task_id"])
+            exact_workspace = getattr(exact_task, "workspace_path", None)
+            if exact_workspace:
+                return exact_workspace, exact_step["kanban_task_id"]
+        # A sealed candidate exists, so falling through to a newer activation's
+        # workspace would verify different bytes. Missing owner data fails closed.
+        return None, None
     workspace = None
     owner_task_id = None
     fallback_workspace = None
@@ -491,7 +526,14 @@ def _review_approval_blocker(db: Any, instance_id: str,
             return "review_producer_ambiguous:" + ",".join(sorted(declared))
     if producer_id and defs.get(producer_id, {}).get("primitive") == "agent_task":
         current_steps = {row["step_id"]: row for row in _latest(db, instance_id)}
-        builder_step = current_steps.get(producer_id)
+        _change_artifact, exact_builder_step = _sealed_change_set_producer(
+            db, instance_id, definition,
+        )
+        builder_step = (
+            exact_builder_step
+            if change_set_producer_id is not None and exact_builder_step is not None
+            else current_steps.get(producer_id)
+        )
         review_step = current_steps.get(definition["id"])
         if builder_step is None:
             return "review_builder_run_missing:step"
@@ -501,7 +543,9 @@ def _review_approval_blocker(db: Any, instance_id: str,
             db, instance_id=instance_id, step_id=producer_id,
             activation=int(builder_step["activation"]), role="builder",
             expected_workspace=(
-                _step_change_set_workspace(conn, current_steps, definition)[0]
+                _step_change_set_workspace(
+                    conn, db, instance_id, current_steps, definition,
+                )[0]
                 if conn is not None and change_set_producer_id is not None else None
             ),
         )
@@ -1284,7 +1328,7 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
                         )
                         continue
                     workspace, workspace_owner_task_id = _step_change_set_workspace(
-                        conn, latest, definition,
+                        conn, db, instance_id, latest, definition,
                     )
                     if not workspace:
                         changed |= _transition(
@@ -1916,6 +1960,91 @@ def gate_decision(
     )
     return str(row["advance_event_key"])
 
+def retry_verification(
+    instance_id: str, step_id: str, *, producer_step: str,
+    producer_activation: int, reason: str,
+) -> str:
+    """Queue an audited deterministic retry against one exact sealed candidate.
+
+    This does not mark verification successful and cannot advance an approval
+    gate.  It only abandons a blocked, artifact-less rework activation and lets
+    the existing verification activation re-run the prior sealed bytes.
+    """
+    reason = str(reason).strip()
+    if not reason:
+        raise ValueError("verification retry requires an operator reason")
+    with store._connect() as db:
+        instance = _instance(db, instance_id)
+        if instance is None:
+            raise ValueError("unknown recipe instance")
+        recipe = recipe_for_instance(instance, db=db).document
+        definitions = {item["id"]: item for item in recipe["steps"]}
+        definition = definitions.get(step_id)
+        if not definition or definition.get("primitive") != "verification":
+            raise ValueError("retry target is not a verification step")
+        declared = [
+            item["from"] for item in definition.get("inputs", [])
+            if item.get("kind") == "change-set" and item.get("required", False)
+        ]
+        if declared != [producer_step]:
+            raise ValueError("producer does not match the verification change-set input")
+        verify_step = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1", (instance_id, step_id),
+        ).fetchone()
+        producer = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+            (instance_id, producer_step, int(producer_activation)),
+        ).fetchone()
+        artifact = db.execute(
+            "SELECT * FROM artifacts WHERE instance_id=? AND step_id=? AND activation=? "
+            "AND kind='change-set' AND state='sealed'",
+            (instance_id, producer_step, int(producer_activation)),
+        ).fetchone()
+        latest_producer = db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+            "ORDER BY activation DESC LIMIT 1", (instance_id, producer_step),
+        ).fetchone()
+        if verify_step is None or verify_step["state"] not in {"pending", "blocked", "failed"}:
+            raise ValueError("verification step is not retryable")
+        if producer is None or producer["state"] != "done" or artifact is None:
+            raise ValueError("selected producer is not a done step with a sealed change-set")
+        canonical_artifact, canonical_producer = _sealed_change_set_producer(
+            db, instance_id, definition,
+        )
+        if (canonical_artifact is None or canonical_producer is None
+                or canonical_artifact["id"] != artifact["id"]):
+            raise ValueError("selected producer is not the canonical sealed change-set")
+        producer_run_id = producer["producer_run_id"]
+        if producer_run_id is None or artifact["run_id"] != producer_run_id:
+            raise ValueError("sealed candidate is not bound to the producer run")
+        run = db.execute("SELECT * FROM runs WHERE id=?", (int(producer_run_id),)).fetchone()
+        if (run is None or run["task_id"] != producer["kanban_task_id"]
+                or int(run["recipe_activation"] or -1) != int(producer_activation)
+                or run["exit_code"] != 0 or run["result"] != "done"):
+            raise ValueError("selected producer run is not an exact successful durable run")
+        if (latest_producer is None
+                or int(latest_producer["activation"]) <= int(producer_activation)
+                or latest_producer["state"] != "blocked"
+                or latest_producer["rejected_by_step_id"] != step_id):
+            raise ValueError("latest producer is not a blocked verification rework")
+        payload = {
+            "step_id": step_id,
+            "producer_step": producer_step,
+            "producer_activation": int(producer_activation),
+            "producer_run_id": int(producer_run_id),
+            "artifact_id": artifact["id"],
+            "artifact_sha256": artifact["sha256"],
+            "head_sha": artifact["head_sha"],
+            "reason": reason,
+        }
+    return enqueue(
+        instance_id, "verification_retry", payload,
+        expected_activation=int(verify_step["activation"]),
+        expected_state=verify_step["state"],
+    )
+
+
 def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
     """Queue an audited release for a recoverable blocked review gate.
 
@@ -2143,6 +2272,81 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     _finish_event(db, row, "applied", "gate_rejected")
                     return
                 _finish_event(db, row, "discarded", "unknown_gate_decision")
+                return
+            if row["source"] == "verification_retry":
+                recipe = recipe_for_instance(instance, db=db).document
+                definitions = {item["id"]: item for item in recipe["steps"]}
+                definition = definitions.get(payload.get("step_id"))
+                producer_step_id = payload.get("producer_step")
+                producer_activation = int(payload.get("producer_activation", -1))
+                declared = [
+                    item["from"] for item in (definition or {}).get("inputs", [])
+                    if item.get("kind") == "change-set" and item.get("required", False)
+                ]
+                artifact = db.execute(
+                    "SELECT * FROM artifacts WHERE id=? AND instance_id=? AND step_id=? "
+                    "AND activation=? AND kind='change-set' AND state='sealed'",
+                    (payload.get("artifact_id"), instance["id"], producer_step_id,
+                     producer_activation),
+                ).fetchone()
+                producer = db.execute(
+                    "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+                    (instance["id"], producer_step_id, producer_activation),
+                ).fetchone()
+                latest_producer = db.execute(
+                    "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
+                    "ORDER BY activation DESC LIMIT 1",
+                    (instance["id"], producer_step_id),
+                ).fetchone()
+                run = db.execute(
+                    "SELECT * FROM runs WHERE id=?", (int(payload.get("producer_run_id", -1)),),
+                ).fetchone()
+                canonical_artifact, canonical_producer = _sealed_change_set_producer(
+                    db, instance["id"], definition or {},
+                )
+                valid = (
+                    step is not None and definition is not None
+                    and definition.get("primitive") == "verification"
+                    and declared == [producer_step_id]
+                    and artifact is not None and producer is not None and run is not None
+                    and canonical_artifact is not None and canonical_producer is not None
+                    and canonical_artifact["id"] == artifact["id"]
+                    and artifact["sha256"] == payload.get("artifact_sha256")
+                    and artifact["head_sha"] == payload.get("head_sha")
+                    and artifact["run_id"] == payload.get("producer_run_id")
+                    and producer["state"] == "done"
+                    and producer["producer_run_id"] == payload.get("producer_run_id")
+                    and run["task_id"] == producer["kanban_task_id"]
+                    and int(run["recipe_activation"] or -1) == producer_activation
+                    and run["exit_code"] == 0 and run["result"] == "done"
+                    and latest_producer is not None
+                    and int(latest_producer["activation"]) > producer_activation
+                    and latest_producer["state"] == "blocked"
+                    and latest_producer["rejected_by_step_id"] == step["step_id"]
+                )
+                if not valid:
+                    _finish_event(db, row, "discarded", "verification_retry_binding_changed")
+                    return
+                assert latest_producer is not None and definition is not None and step is not None
+                latest_producer_dict: dict[str, Any] = {
+                    str(key): latest_producer[key] for key in latest_producer.keys()
+                }
+                step_dict: dict[str, Any] = {str(key): step[key] for key in step.keys()}
+                _transition(
+                    db, instance, latest_producer_dict, "skipped",
+                    f"verification_retry:{row['key']}",
+                    reason=f"verification_retry_abandoned:{payload.get('reason', '')}"[:2000],
+                )
+                if step["state"] in {"blocked", "failed"}:
+                    _fresh_activation(
+                        db, instance, definition, step_dict,
+                        f"verification_retry:{row['key']}",
+                    )
+                db.execute(
+                    "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? "
+                    "WHERE id=?", (store._now(), instance["id"]),
+                )
+                _finish_event(db, row, "applied", "verification_retry_scheduled")
                 return
             if row["source"] == "operator_release":
                 if step is None:

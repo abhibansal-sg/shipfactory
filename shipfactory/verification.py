@@ -1171,6 +1171,41 @@ def _command_driver(
         command_env["PYTEST_ADDOPTS"] = " ".join(filter(None, [
             command_env.get("PYTEST_ADDOPTS", ""), "-p no:cacheprovider",
         ]))
+        try:
+            preflight = subprocess.run(
+                [command_argv[0], "-I", "-c", "import pytest"],
+                cwd=workspace, env=command_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            now = store._now()
+            store.record_run_end(
+                run_id, -1, None, None, monotonic() - started_monotonic,
+                "infrastructure_error",
+            )
+            return {
+                "classification": "infrastructure_error",
+                "error": f"pytest runtime preflight failed: {exc}",
+                "stdout": b"", "stderr": b"", "exit_code": None,
+                "started_at": started, "ended_at": now, "run_id": run_id,
+            }
+        if preflight.returncode != 0:
+            now = store._now()
+            store.record_run_end(
+                run_id, preflight.returncode, None, None,
+                monotonic() - started_monotonic, "infrastructure_error",
+            )
+            detail = (preflight.stderr or preflight.stdout).decode(
+                "utf-8", errors="replace",
+            ).strip()[:500]
+            return {
+                "classification": "infrastructure_error",
+                "error": "pytest runtime preflight failed" + (f": {detail}" if detail else ""),
+                "stdout": preflight.stdout, "stderr": preflight.stderr,
+                "exit_code": preflight.returncode,
+                "started_at": started, "ended_at": now, "run_id": run_id,
+            }
     else:
         command_argv = case["argv"]
     try:

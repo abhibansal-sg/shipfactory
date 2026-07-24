@@ -757,6 +757,100 @@ def test_finding_95_infrastructure_failures_keep_parking(
     assert _instance("f95infra")["status"] == "blocked"
 
 
+def test_finding_99_operator_retry_reuses_exact_sealed_producer_without_llm_rebuild(
+    tmp_path, kanban_conn, monkeypatch,
+):
+    """An audited retry skips only the empty rework and re-verifies its exact prior candidate."""
+    from shipfactory import verification
+    from shipfactory.recipes import advancer
+
+    store.init_db()
+    monkeypatch.setattr(verification, "verify_evidence_bundle", lambda *a, **k: None)
+    recipe = _v2_verify_recipe(tmp_path / "library")
+    instantiate(
+        kanban_conn, board="test", recipe=recipe, parameters={}, instance_id="f99",
+    )
+    reconcile(kanban_conn, "f99", profiles=PROFILES)
+    build1 = _step("f99", "build")
+    run_id = store.record_run_start(
+        build1["kanban_task_id"], "dev-backend", "codex", "gpt-test",
+        workspace_path=str(tmp_path / "candidate"), recipe_activation=1,
+    )
+    kanban_conn.execute(
+        "UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id=?",
+        (str(tmp_path / "candidate"), build1["kanban_task_id"]),
+    )
+    store.record_run_end(run_id, 0, 1, 1, 0.1, "done")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='done',producer_run_id=?,updated_at=? "
+            "WHERE instance_id='f99' AND step_id='build' AND activation=1",
+            (run_id, store._now()),
+        )
+        db.execute(
+            "INSERT INTO artifacts(id,instance_id,step_id,activation,run_id,kind,"
+            "schema_version,state,sha256,size_bytes,producer,base_sha,head_sha,repo_tree_sha,"
+            "created_at,sealed_at) VALUES(?,?,?,?,?,'change-set',1,'sealed',?,?,?, ?,?,?,?,?)",
+            ("artifact-f99", "f99", "build", 1, run_id, "a" * 64, 1, "factory",
+             "a" * 40, "b" * 40, "c" * 40, store._now(), store._now()),
+        )
+    _simulate_failed_verification("f99", tmp_path)
+    reconcile(kanban_conn, "f99", profiles=PROFILES)
+    build2 = _step("f99", "build")
+    verify2 = _step("f99", "verify")
+    assert (build2["activation"], verify2["activation"]) == (2, 2)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason='worker_blocked',updated_at=? "
+            "WHERE instance_id='f99' AND step_id='build' AND activation=2",
+            (store._now(),),
+        )
+        db.execute(
+            "UPDATE recipe_instances SET status='blocked',blocked_reason='worker_blocked',updated_at=? "
+            "WHERE id='f99'",
+            (store._now(),),
+        )
+
+    key = advancer.retry_verification(
+        "f99", "verify", producer_step="build", producer_activation=1,
+        reason="pytest runtime was unavailable; rerun the sealed candidate",
+    )
+    row = advancer._claim_event(owner="test-f99", board="test")
+    assert row and row["key"] == key
+    advancer._apply_claimed_event(kanban_conn, row)
+
+    assert (_step("f99", "build")["activation"], _step("f99", "build")["state"]) == (2, "skipped")
+    assert (_step("f99", "verify")["activation"], _step("f99", "verify")["state"]) == (2, "pending")
+    assert _instance("f99")["status"] == "running"
+    with store._connect() as db:
+        latest = {item["step_id"]: item for item in advancer._latest(db, "f99")}
+        verify_definition = next(item for item in recipe.document["steps"] if item["id"] == "verify")
+        workspace, owner = advancer._step_change_set_workspace(
+            kanban_conn, db, "f99", latest, verify_definition,
+        )
+        event = db.execute("SELECT state,outcome,payload_json FROM advance_events WHERE key=?", (key,)).fetchone()
+    assert (workspace, owner) == (str(tmp_path / "candidate"), build1["kanban_task_id"])
+    # Never fall through to the later no-op activation if the sealed producer's
+    # owner workspace disappears; that would verify different bytes.
+    kanban_conn.execute(
+        "UPDATE tasks SET workspace_path=NULL WHERE id=?", (build1["kanban_task_id"],),
+    )
+    build2 = _step("f99", "build")
+    kanban_conn.execute(
+        "UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id=?",
+        (str(tmp_path / "wrong-candidate"), build2["kanban_task_id"]),
+    )
+    with store._connect() as db:
+        latest = {item["step_id"]: item for item in advancer._latest(db, "f99")}
+        assert advancer._step_change_set_workspace(
+            kanban_conn, db, "f99", latest, verify_definition,
+        ) == (None, None)
+    assert (event["state"], event["outcome"]) == ("applied", "verification_retry_scheduled")
+    payload = json.loads(event["payload_json"])
+    assert payload["producer_run_id"] == run_id
+    assert payload["artifact_id"] == "artifact-f99"
+
+
 def test_finding_97_recipe_worktree_aligns_to_instance_base(tmp_path):
     """A recipe task's worktree cut from live HEAD is detached onto the
     instance's current base before the worker starts; non-recipe tasks and
