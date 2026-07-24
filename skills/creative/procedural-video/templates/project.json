@@ -1,0 +1,6 @@
+{
+  "canvas": {"width": 256, "height": 256, "fps": 12},
+  "seed": "replace-with-stable-project-seed",
+  "soundtrack": null,
+  "scenes": [{"id": "intro", "frames": 24, "background": [14, 21, 39], "accent": [52, 211, 153], "text": "TITLE", "particles": 24, "camera_pan": 0.08}]
+}

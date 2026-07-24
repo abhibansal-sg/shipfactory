@@ -1,0 +1,202 @@
+schema: shipfactory.recipe/v2
+id: creative-video
+version: 1
+status: active
+description: Governed local deterministic creative-video production; scene fan-out is internal to one motion-build worker.
+intent_tags: [creative-video, local-media]
+supersedes: null
+verdict_contract: shipfactory.verdict/v2
+parameters:
+  brief: {type: string, required: true, default: null}
+  reference_inputs: {type: string, required: false, default: null}
+  notify_target: {type: string, required: false, default: telegram:Abhinav}
+budgets:
+  max_activations: 12
+  step_activation_caps:
+    research: 1
+    treatment: 1
+    styleframes: 1
+    motion-build: 2
+    machine-verify: 1
+    vision-review: 2
+    adversarial-review: 1
+    master: 1
+steps:
+  - id: research
+    primitive: agent_task
+    title: Study references for the brief
+    needs: []
+    optional: false
+    inputs: []
+    outputs:
+      - {kind: reference-study, schema: shipfactory.reference-study/v1, path: .shipfactory-output/reference-study.json}
+    params:
+      seat: video-researcher
+      instructions: |
+        Research ${brief} using ${reference_inputs}. Policy binding: codex / gpt-5.6-terra / medium.
+        Produce the reference-study handoff only; record local/rights-safe reference observations.
+      execution_profile: planning
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: treatment
+    primitive: agent_task
+    title: Create treatment and timeline
+    needs: [research]
+    optional: false
+    inputs:
+      - {from: research, kind: reference-study, required: true}
+    outputs:
+      - {kind: treatment, schema: shipfactory.treatment/v1, path: .shipfactory-output/treatment.json}
+    params:
+      seat: video-creative-director
+      instructions: |
+        Turn the sealed research into a timed treatment. Policy binding: codex / gpt-5.6-sol / high; no fallback.
+        Declare intended scene rhythm, visual language, and local-asset constraints.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: styleframes
+    primitive: agent_task
+    title: Design styleframes
+    needs: [treatment]
+    optional: false
+    inputs:
+      - {from: treatment, kind: treatment, required: true}
+    outputs:
+      - {kind: styleframes, schema: shipfactory.styleframes/v1, path: .shipfactory-output/styleframes.json}
+    params:
+      seat: video-styleframe-designer
+      instructions: |
+        Produce square styleframes bound to the treatment. Policy binding: codex / gpt-5.6-sol / high; no fallback.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: motion-build
+    primitive: agent_task
+    title: Build all scene motion internally
+    needs: [styleframes]
+    optional: false
+    inputs:
+      - {from: treatment, kind: treatment, required: true}
+      - {from: styleframes, kind: styleframes, required: true}
+    outputs:
+      - {kind: scene-manifest, schema: shipfactory.scene-manifest/v1, path: .shipfactory-output/scene-manifest.json}
+      - {kind: draft-media, schema: shipfactory.draft-media/v1, path: .shipfactory-output/draft-media.json}
+    params:
+      seat: video-motion-designer
+      instructions: |
+        Build the draft with procedural-video. Policy binding: codex / gpt-5.6-sol / high; no fallback.
+        Render all scene fan-out inside this one worker; never create a top-level card per scene.
+        Emit a sealed scene manifest and hash-bound square draft-media descriptor.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: machine-verify
+    primitive: agent_task
+    title: Mechanically verify draft media
+    needs: [motion-build]
+    optional: false
+    inputs:
+      - {from: motion-build, kind: scene-manifest, required: true}
+      - {from: motion-build, kind: draft-media, required: true}
+    outputs:
+      - {kind: qc-report, schema: shipfactory.qc-report/v1, path: .shipfactory-output/qc-report.json}
+      - {kind: contact-sheet, schema: shipfactory.contact-sheet/v1, path: .shipfactory-output/contact-sheet.json}
+    params:
+      seat: video-machine-verifier
+      instructions: |
+        Run deterministic procedural-video QC: frame diffs, duplicates, contact sheets, and FFprobe. Policy binding: codex / gpt-5.6-luna / medium.
+        Do not perform subjective approval; emit only hash-bound QC and contact-sheet descriptors.
+      execution_profile: build
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: vision-review
+    primitive: review_gate
+    title: Review visual intent against evidence
+    needs: [machine-verify]
+    optional: false
+    inputs:
+      - {from: styleframes, kind: styleframes, required: true}
+      - {from: motion-build, kind: draft-media, required: true}
+      - {from: machine-verify, kind: qc-report, required: true}
+      - {from: machine-verify, kind: contact-sheet, required: true}
+    outputs:
+      - {kind: vision-verdict, schema: shipfactory.vision-verdict/v1, path: .shipfactory-output/vision-verdict.json}
+    params:
+      seat: video-vision-reviewer
+      instructions: |
+        Review sealed styleframes, draft, QC, and contact sheet. Policy binding: codex / gpt-5.6-sol / high; no fallback.
+        A rework verdict may target only upstream styleframes or motion-build, never this review, verification, or a downstream step.
+        Finish with the structured shipfactory.verdict/v2 sentinel.
+      execution_profile: review
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: adversarial-review
+    primitive: review_gate
+    title: Independently review correctness and evidence
+    needs: [vision-review]
+    optional: false
+    inputs:
+      - {from: motion-build, kind: scene-manifest, required: true}
+      - {from: motion-build, kind: draft-media, required: true}
+      - {from: machine-verify, kind: qc-report, required: true}
+      - {from: vision-review, kind: vision-verdict, required: true}
+    outputs:
+      - {kind: video-review-story, schema: shipfactory.video-review-story/v1, path: .shipfactory-output/video-review-story.json}
+    params:
+      seat: video-adversarial-reviewer
+      instructions: |
+        Independently audit sealed draft, QC, and vision evidence. Policy binding: claude / claude-opus-4-8 / high.
+        This is the required cross-provider final correctness/evidence review. Rework may target only upstream motion-build.
+        Finish with the structured shipfactory.verdict/v2 sentinel.
+      execution_profile: review
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: master
+    primitive: agent_task
+    title: Picture-lock and render master
+    needs: [adversarial-review]
+    optional: false
+    inputs:
+      - {from: motion-build, kind: draft-media, required: true}
+      - {from: machine-verify, kind: qc-report, required: true}
+      - {from: adversarial-review, kind: video-review-story, required: true}
+    outputs:
+      - {kind: master-media, schema: shipfactory.master-media/v1, path: .shipfactory-output/master-media.json}
+    params:
+      seat: video-render-engineer
+      instructions: |
+        Produce the picture-locked FFmpeg master and media descriptor from the reviewed draft. Policy binding: codex / gpt-5.6-terra / high.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: approval
+    primitive: approval_gate
+    title: Human operator approval of the master
+    needs: [master]
+    optional: false
+    inputs:
+      - {from: master, kind: master-media, required: true}
+      - {from: adversarial-review, kind: video-review-story, required: true}
+    outputs: []
+    params:
+      approvers: [operator]
+      instructions: Human operator approval only. Agents must never approve, release, or notify this gate.
+  - id: notify
+    primitive: notify
+    title: Notify after human approval
+    needs: [approval]
+    optional: false
+    inputs: []
+    outputs: []
+    params:
+      target: "${notify_target}"
+      message: "creative-video@1 master is human-approved with sealed review evidence. No deployment occurred."

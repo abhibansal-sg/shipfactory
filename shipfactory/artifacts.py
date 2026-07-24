@@ -27,6 +27,7 @@ from shipfactory.artifact_contracts import (
     REQUIRED_TOP_LEVEL,
     REVIEW_STORY_CHANGE_KEYS,
     TASK_SPEC_REQUIREMENT_KEYS,
+    VIDEO_ARTIFACT_SCHEMAS,
     find_unresolved_output_placeholder,
 )
 
@@ -499,6 +500,59 @@ def _validate_change_set(document: dict[str, Any]) -> None:
         seen.add(identity)
 
 
+_VIDEO_ARTIFACT_TYPES = frozenset({
+    "reference-study", "treatment", "styleframes", "scene-manifest", "draft-media",
+    "qc-report", "contact-sheet", "vision-verdict", "video-review-story", "master-media",
+})
+_VIDEO_MEDIA_TYPES = frozenset({"styleframes", "draft-media", "contact-sheet", "master-media"})
+
+
+def _validate_video_artifact(document: dict[str, Any]) -> None:
+    """Validate a hash-bound creative-video handoff without faking another kind."""
+    schema = "shipfactory.video-artifact/v1"
+    required = REQUIRED_TOP_LEVEL[schema]
+    _require_keys(document, schema, required)
+    if set(document) != required:
+        raise ArtifactValidationError(f"{schema} has unknown fields")
+    artifact_type = document["artifact_type"]
+    if artifact_type not in _VIDEO_ARTIFACT_TYPES:
+        raise ArtifactValidationError(f"{schema} has unsupported artifact_type")
+    if not isinstance(document["title"], str) or not document["title"].strip():
+        raise ArtifactValidationError(f"{schema} title must be nonempty")
+    if not isinstance(document["content"], dict):
+        raise ArtifactValidationError(f"{schema} content must be an object")
+    media = document["media"]
+    if artifact_type not in _VIDEO_MEDIA_TYPES:
+        if media is not None:
+            raise ArtifactValidationError(f"{schema} document handoff must not claim media")
+        return
+    if not isinstance(media, dict) or set(media) != {
+        "path", "sha256", "bytes", "mime_type", "width", "height", "duration_seconds",
+    }:
+        raise ArtifactValidationError(f"{schema} media descriptor has invalid shape")
+    path = media["path"]
+    if (not isinstance(path, str) or not path.startswith(".shipfactory-output/")
+            or "\\" in path or ".." in PurePosixPath(path).parts):
+        raise ArtifactValidationError(f"{schema} media path must stay under .shipfactory-output/")
+    if not _hash_string(media["sha256"], (64,)):
+        raise ArtifactValidationError(f"{schema} media sha256 must be a sha256")
+    if (not isinstance(media["bytes"], int) or isinstance(media["bytes"], bool)
+            or media["bytes"] < 1):
+        raise ArtifactValidationError(f"{schema} media bytes must be positive")
+    if (not isinstance(media["mime_type"], str)
+            or not media["mime_type"].startswith(("video/", "image/"))):
+        raise ArtifactValidationError(f"{schema} media mime_type must be video/ or image/")
+    for field in ("width", "height"):
+        if (not isinstance(media[field], int) or isinstance(media[field], bool)
+                or media[field] < 1):
+            raise ArtifactValidationError(f"{schema} media {field} must be positive")
+    if media["width"] != media["height"]:
+        raise ArtifactValidationError(f"{schema} media must be square")
+    duration = media["duration_seconds"]
+    if (not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0):
+        raise ArtifactValidationError(f"{schema} media duration_seconds must be nonnegative")
+
+
 def _validate_review_story(document: dict[str, Any]) -> None:
     schema = "shipfactory.review-story/v1"
     required = REQUIRED_TOP_LEVEL[schema]
@@ -570,12 +624,15 @@ def _validate_review_story(document: dict[str, Any]) -> None:
 
 
 _VALIDATORS = {
+    ("video-artifact", 1): _validate_video_artifact,
     ("exploration", 1): _validate_exploration,
     ("task-spec", 1): _validate_task_spec,
     ("plan", 1): _validate_plan,
     ("change-set", 1): _validate_change_set,
     ("review-story", 1): _validate_review_story,
 }
+for _video_kind in VIDEO_ARTIFACT_SCHEMAS:
+    _VALIDATORS[(_video_kind, 1)] = _validate_video_artifact
 
 
 def _validate_document(document: Any, *, kind: str, schema: str) -> int:
@@ -596,6 +653,10 @@ def _validate_document(document: Any, *, kind: str, schema: str) -> int:
             f"artifact schema mismatch: expected {schema!r}, got {document.get('schema')!r}"
         )
     validator(document)
+    if kind in VIDEO_ARTIFACT_SCHEMAS and document.get("artifact_type") != kind:
+        raise ArtifactValidationError(
+            f"{schema} artifact_type must match declared output kind {kind!r}"
+        )
     return version
 
 

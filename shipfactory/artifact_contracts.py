@@ -6,6 +6,9 @@ from copy import deepcopy
 from typing import Any
 
 REQUIRED_TOP_LEVEL: dict[str, frozenset[str]] = {
+    "shipfactory.video-artifact/v1": frozenset({
+        "schema", "artifact_type", "title", "content", "media",
+    }),
     "shipfactory.exploration/v1": frozenset({
         "schema", "intent_sha256", "base_sha", "repo_tree_sha", "references",
         "direct_callers", "constraints", "untrusted_directives", "unknowns",
@@ -26,6 +29,15 @@ REQUIRED_TOP_LEVEL: dict[str, frozenset[str]] = {
     }),
 }
 
+# These are distinct recipe-output kinds so dependencies remain typed, while every
+# one shares the same small, honest handoff/media descriptor shape.
+VIDEO_ARTIFACT_SCHEMAS = {
+    "reference-study", "treatment", "styleframes", "scene-manifest", "draft-media",
+    "qc-report", "contact-sheet", "vision-verdict", "video-review-story", "master-media",
+}
+for _kind in VIDEO_ARTIFACT_SCHEMAS:
+    REQUIRED_TOP_LEVEL[f"shipfactory.{_kind}/v1"] = REQUIRED_TOP_LEVEL["shipfactory.video-artifact/v1"]
+
 PLAN_NODE_KEYS = frozenset({
     "id", "title", "needs", "kind", "requirements", "allowed_paths",
     "expected_outputs", "test_cases", "risk_tags",
@@ -43,6 +55,13 @@ EXPLORATION_PROPOSED_REFERENCE_KEYS = EXPLORATION_REFERENCE_BASE_KEYS | frozense
 TASK_SPEC_REQUIREMENT_KEYS = frozenset({"id", "behavior", "oracle", "risk"})
 
 _TEMPLATES: dict[str, dict[str, Any]] = {
+    "shipfactory.video-artifact/v1": {
+        "schema": "shipfactory.video-artifact/v1",
+        "artifact_type": "<reference-study|treatment|styleframes|scene-manifest|draft-media|qc-report|contact-sheet|vision-verdict|review-story|master-media>",
+        "title": "<nonempty human-readable artifact title>",
+        "content": {"summary": "<structured handoff or QC summary>"},
+        "media": None,
+    },
     "shipfactory.exploration/v1": {
         "schema": "shipfactory.exploration/v1",
         "intent_sha256": "<64 hex: SHA-256 of the exact request/intent text>",
@@ -133,6 +152,12 @@ _TEMPLATES: dict[str, dict[str, Any]] = {
         "residual_risks": [],
     },
 }
+for _kind in VIDEO_ARTIFACT_SCHEMAS:
+    _TEMPLATES[f"shipfactory.{_kind}/v1"] = {
+        **deepcopy(_TEMPLATES["shipfactory.video-artifact/v1"]),
+        "schema": f"shipfactory.{_kind}/v1",
+        "artifact_type": _kind,
+    }
 
 
 def _prompt_placeholders(value: Any) -> set[str]:
@@ -168,6 +193,16 @@ def find_unresolved_output_placeholder(value: Any) -> str | None:
 
 
 _NOTES = {
+    "shipfactory.video-artifact/v1": (
+        "A video artifact is a sealed structured handoff with a hash-bound media descriptor. artifact_type must be one of "
+        "reference-study, treatment, styleframes, scene-manifest, draft-media, qc-report, "
+        "contact-sheet, vision-verdict, video-review-story, or master-media. title is nonempty and "
+        "content is an object. media is null for document handoffs. For styleframes, draft-media, "
+        "contact-sheet, or master-media it is required and has exactly path, sha256, bytes, "
+        "mime_type, width, height, duration_seconds. Its path remains under .shipfactory-output/, "
+        "sha256 is the media file hash, bytes is positive, width and height are positive square "
+        "dimensions, duration_seconds is nonnegative, and mime_type begins video/ or image/."
+    ),
     "shipfactory.exploration/v1": (
         "Each reference also requires string id/kind/status. Existing references require "
         "path, git_blob_sha, start_line, end_line, and text_sha256. Proposed references "
@@ -223,6 +258,8 @@ _NOTES = {
         "has retries, skips, or warnings."
     ),
 }
+for _kind in VIDEO_ARTIFACT_SCHEMAS:
+    _NOTES[f"shipfactory.{_kind}/v1"] = _NOTES["shipfactory.video-artifact/v1"]
 
 for _schema, _template in _TEMPLATES.items():
     if set(_template) != set(REQUIRED_TOP_LEVEL[_schema]):
