@@ -335,6 +335,32 @@ def test_operator_release_of_a_malformed_verdict_reactivates_the_review(
     assert tuple(audit) == ("operator_release", "applied", "malformed_verdict_released")
 
 
+def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanban_conn):
+    instance_id = "worker-blocked-review-release"
+    _block_review_with_result(
+        tmp_path, kanban_conn, instance_id, "SHIPFACTORY_VERDICT: {invalid}",
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET blocked_reason='worker_blocked' "
+            "WHERE instance_id=? AND step_id='verify' AND activation=1",
+            (instance_id,),
+        )
+    release_review_stall(instance_id, "verify", "prompt transport failed before verdict")
+    apply_events(kanban_conn, profiles=PROFILES)
+    fresh = _step(instance_id, "verify", 2)
+    assert fresh is not None and fresh["state"] == "running"
+
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason='worker_blocked' "
+            "WHERE instance_id=? AND step_id='verify' AND activation=2",
+            (instance_id,),
+        )
+    with pytest.raises(ValueError, match="release cap exhausted"):
+        release_review_stall(instance_id, "verify", "second harness failure")
+
+
 def _human_gate_recipe(tmp_path: Path, primitive: str):
     recipe_id = "approval-note" if primitive == "approval_gate" else "event-note"
     gate_params = (

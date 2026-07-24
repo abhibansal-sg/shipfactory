@@ -818,12 +818,24 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   diff/workspace to the sealed change-set artifact's producer activation and
   run, matching verifier workspace and verdict binding. A missing/mismatched
   exact producer fails closed rather than falling through to the skipped row.
+- Review prompts must carry opened documents and hashes, not duplicate every
+  sealed artifact/evidence byte as base64. SF-20's first correctness review
+  expanded to 183k input tokens and failed before verdict. Fix (finding #106,
+  SF-20): omit redundant `sealed_bytes_b64`, retain all verified documents and
+  hashes, and bind `exact_diff` to the sealed change-set's base/head rather than
+  the post-build verification bundle's equal base/head. The live prompt fell to
+  83,341 bytes and now carries the real 9,142-byte diff.
+- A generic review harness failure is not a rejecting verdict. Fix (finding
+  #107, SF-20): `worker_blocked` may receive exactly one audited operator release
+  into a fresh review activation against the same sealed inputs. A second
+  worker-blocked release for that step fails closed; neither release can approve
+  the gate or reopen source work.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#105 so far). When you fix one: commit message
+- Findings get numbers (#22–#107 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

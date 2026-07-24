@@ -88,7 +88,6 @@ def build_review_input_context(
         snapshot["artifacts"].append({
             "id": artifact["id"], "kind": kind, "sha256": artifact["sha256"],
             "activation": int(artifact["activation"]), "document": document,
-            "sealed_bytes_b64": base64.b64encode(sealed_bytes).decode("ascii"),
             "sealed_size_bytes": len(sealed_bytes),
         })
         artifacts_by_kind[kind] = artifact
@@ -116,7 +115,6 @@ def build_review_input_context(
             snapshot["evidence_bundles"].append({
                 "id": bundle["id"], "activation": int(bundle["activation"]),
                 "sha256": bundle["bundle_sha256"],
-                "sealed_bytes_b64": base64.b64encode(sealed_bytes).decode("ascii"),
                 "sealed_size_bytes": len(sealed_bytes),
                 "document": json.loads(sealed_bytes),
             })
@@ -130,8 +128,7 @@ def build_review_input_context(
     if change_inputs:
         producer_id = change_inputs[0]["from"]
         change_artifact = artifacts_by_kind.get("change-set")
-        if (change_artifact is None or change_artifact["step_id"] != producer_id
-                or change_artifact["run_id"] is None):
+        if change_artifact is None or change_artifact["step_id"] != producer_id:
             raise ValueError("review change-set sealed producer identity is missing")
         activation = int(change_artifact["activation"])
         producer_step = db.execute(
@@ -140,7 +137,8 @@ def build_review_input_context(
         ).fetchone()
         if (producer_step is None or not producer_step["kanban_task_id"]
                 or producer_step["producer_run_id"] is None
-                or int(producer_step["producer_run_id"]) != int(change_artifact["run_id"])):
+                or (change_artifact["run_id"] is not None
+                    and int(producer_step["producer_run_id"]) != int(change_artifact["run_id"]))):
             raise ValueError("review change-set exact producer task/run identity is missing")
         run_id = int(producer_step["producer_run_id"])
         run_row = db.execute(
@@ -153,18 +151,24 @@ def build_review_input_context(
         if not snapshot["evidence_bundles"]:
             raise ValueError("review change-set has no transitive verification identity")
         verified = snapshot["evidence_bundles"][-1]["document"]
+        change_document = artifact_document(change_artifact)
+        if (verified["head_sha"] != change_document["head_sha"]
+                or verified["tree_sha"] != change_document["tree_sha"]):
+            raise ValueError("review evidence is not bound to the sealed change-set revision")
         workspace = Path(run["workspace_path"])
         assert_commit_binding(workspace, verified["head_sha"], verified["tree_sha"])
         diff_bytes = subprocess.check_output(
-            ["git", "diff", "--binary", verified["base_sha"], verified["head_sha"]],
+            ["git", "diff", "--binary", change_document["base_sha"],
+             change_document["head_sha"]],
             cwd=workspace, stderr=subprocess.PIPE, timeout=30,
         )
         snapshot["exact_diff"] = {
             "producer_step_id": producer_id, "producer_task_id": producer_step["kanban_task_id"],
             "producer_activation": activation, "producer_run_id": run_id,
             "workspace_path": str(workspace.resolve()),
-            "base_sha": verified["base_sha"], "head_sha": verified["head_sha"],
-            "tree_sha": verified["tree_sha"],
+            "base_sha": change_document["base_sha"],
+            "head_sha": change_document["head_sha"],
+            "tree_sha": change_document["tree_sha"],
             "sha256": hashlib.sha256(diff_bytes).hexdigest(), "size_bytes": len(diff_bytes),
             "bytes_b64": base64.b64encode(diff_bytes).decode("ascii"),
         }

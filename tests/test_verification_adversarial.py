@@ -1010,7 +1010,15 @@ def test_review_task_gets_exact_sealed_spec_plan_change_set_diff_and_bundle(
     from shipfactory import artifacts
     from shipfactory.recipes import primitives
 
-    repo, head, tree = _repo(tmp_path)
+    repo, base_head, _base_tree = _repo(tmp_path)
+    (repo / "tracked.txt").write_text("reviewed candidate bytes\n", encoding="utf-8")
+    subprocess.check_call(["git", "add", "tracked.txt"], cwd=repo)
+    subprocess.check_call(["git", "commit", "-m", "candidate"], cwd=repo)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True).strip()
+    tracked_blob = subprocess.check_output(
+        ["git", "rev-parse", "HEAD:tracked.txt"], cwd=repo, text=True,
+    ).strip()
     manifest = verify.load_verification_manifest(repo, head)
     bundle = _run(repo, head, tree, manifest, instance_id="rvw-full-inputs", step_id="verify")
     _definition, _defs, latest, recipe = _seed_review_instance(
@@ -1053,6 +1061,45 @@ def test_review_task_gets_exact_sealed_spec_plan_change_set_diff_and_bundle(
         workspace=repo, producer="test",
     )
     (output_dir / "plan.json").unlink()
+    with store._connect() as db:
+        producer_run_id = int(db.execute(
+            "SELECT producer_run_id FROM recipe_steps WHERE instance_id=? "
+            "AND step_id='build' AND activation=1",
+            ("rvw-full-inputs",),
+        ).fetchone()["producer_run_id"])
+    change_document = {
+        "schema": "shipfactory.change-set/v1", "base_sha": base_head,
+        "head_sha": head, "tree_sha": tree, "commits": [head],
+        "changed_paths": [{
+            "path": "tracked.txt", "status": "M", "previous_path": None,
+            "blob_sha": tracked_blob,
+        }],
+        "allowed_paths": ["tracked.txt"], "dirty_tree": False,
+    }
+    (output_dir / "change-set.json").write_text(
+        json.dumps(change_document), encoding="utf-8",
+    )
+    sealed_change_path = tmp_path / "sealed-change-set.json"
+    sealed_change_bytes = (
+        json.dumps(change_document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    sealed_change_path.write_bytes(sealed_change_bytes)
+    with store._connect() as db:
+        now = store._now()
+        db.execute(
+            "INSERT INTO artifacts(id,instance_id,step_id,activation,run_id,kind,"
+            "schema_version,state,candidate_path,sealed_path,sha256,size_bytes,producer,"
+            "trust_domain,base_sha,head_sha,repo_tree_sha,validation_error,created_at,sealed_at) "
+            "VALUES(?,?,?,?,?,'change-set',1,'sealed',?,?,?,?,?,'trusted-generated',"
+            "?,?,?,NULL,?,?)",
+            (
+                "review-change-set", "rvw-full-inputs", "build", 1, producer_run_id,
+                ".shipfactory-output/change-set.json", str(sealed_change_path),
+                hashlib.sha256(sealed_change_bytes).hexdigest(), len(sealed_change_bytes),
+                f"run:{producer_run_id}", base_head, head, tree, now, now,
+            ),
+        )
+    (output_dir / "change-set.json").unlink()
     build = next(item for item in recipe["steps"] if item["id"] == "build")
     build["needs"] = ["plan"]
     recipe["steps"][:0] = [
@@ -1090,10 +1137,12 @@ def test_review_task_gets_exact_sealed_spec_plan_change_set_diff_and_bundle(
             {"step_id": "full-review", "activation": 1}, {}, [], db=db,
         )
     task = kanban_db.get_task(kanban_conn, task_id)
+    assert task is not None and task.body is not None
     assert spec["sha256"] in task.body and plan["sha256"] in task.body
     assert bundle["bundle_sha256"] in task.body
     assert '"producer_run_id":' in task.body and '"bytes_b64":' in task.body
-    assert '"sealed_bytes_b64":' in task.body
+    assert '"sealed_bytes_b64":' not in task.body
+    assert len(task.body.encode("utf-8")) < 180_000
 
 
 def test_approval_after_candidate_mutates_workspace_post_verification_is_blocked(tmp_path, kanban_conn):

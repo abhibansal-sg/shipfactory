@@ -40,7 +40,7 @@ _MALFORMED_VERDICT_REASONS = {
     "invalid request_changes verdict",
 }
 _RECOVERABLE_REVIEW_REASONS = _MALFORMED_VERDICT_REASONS | {
-    "review_stall", "clarifications_nonempty",
+    "review_stall", "clarifications_nonempty", "worker_blocked",
 }
 
 
@@ -2175,9 +2175,24 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
+        worker_release_count = 0
+        if step is not None and step["blocked_reason"] == "worker_blocked":
+            for prior in db.execute(
+                "SELECT payload_json FROM advance_events WHERE instance_id=? "
+                "AND source='operator_release' AND state='applied'",
+                (instance_id,),
+            ).fetchall():
+                try:
+                    prior_payload = json.loads(prior["payload_json"])
+                except (TypeError, ValueError):
+                    continue
+                if prior_payload.get("step_id") == step_id:
+                    worker_release_count += 1
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
             or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
+    if step["blocked_reason"] == "worker_blocked" and worker_release_count >= 1:
+        raise ValueError("worker-blocked review release cap exhausted for this step")
     return enqueue(
         instance_id,
         "operator_release",
@@ -2539,11 +2554,10 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 definition = next(
                     item for item in recipe["steps"] if item["id"] == step["step_id"]
                 )
-                if _malformed_verdict_reason(blocked_reason):
-                    # The reviewer, not the producer, failed: re-parsing the
-                    # malformed verdict here would only re-raise its parse
-                    # error and fail the event.  Release into one fresh review
-                    # activation against the SAME sealed inputs instead.
+                if _malformed_verdict_reason(blocked_reason) or blocked_reason == "worker_blocked":
+                    # The reviewer or its harness, not the producer, failed:
+                    # release into one fresh review activation against the SAME
+                    # sealed inputs instead of reopening source work.
                     _fresh_activation(
                         db, instance, definition, dict(step),
                         f"operator_release:{row['key']}",
@@ -2552,7 +2566,11 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? WHERE id=?",
                         (store._now(), instance["id"]),
                     )
-                    _finish_event(db, row, "applied", "malformed_verdict_released")
+                    outcome = (
+                        "worker_blocked_released" if blocked_reason == "worker_blocked"
+                        else "malformed_verdict_released"
+                    )
+                    _finish_event(db, row, "applied", outcome)
                     return
                 if blocked_reason == "review_stall":
                     from hermes_cli import kanban_db
