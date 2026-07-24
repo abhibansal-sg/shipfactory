@@ -804,6 +804,12 @@ def _kill_child(proc: subprocess.Popen[bytes], token: str | None) -> None:
 class _ProcessTreeTracker:
     """Continuously capture descendant PID/start-token pairs for safe cleanup."""
 
+    # Full-process environ scans are deliberately expensive on macOS. Fifty
+    # milliseconds still observes detached descendants long before cleanup,
+    # without starving timing- and SQLite-sensitive tests in the supervised
+    # child (finding #100).
+    _SCAN_INTERVAL_SECONDS = 0.05
+
     def __init__(self, proc: subprocess.Popen[bytes], scope: str):
         try:
             import psutil
@@ -900,7 +906,7 @@ class _ProcessTreeTracker:
     def _watch(self) -> None:
         self._scan()
         self.ready.set()
-        while not self._stop.wait(0.01):
+        while not self._stop.wait(self._SCAN_INTERVAL_SECONDS):
             self._scan()
 
     def cleanup(self) -> None:

@@ -1960,6 +1960,43 @@ def gate_decision(
     )
     return str(row["advance_event_key"])
 
+def _same_revision_case_contradiction(db: Any, bundle: dict[str, Any] | Any) -> bool:
+    """Prove that identical bytes/environment produced conflicting case results."""
+    if (bundle is None or bundle["state"] != "blocked"
+            or bundle["invalid_reason"] != "test_failed"
+            or bundle["base_sha"] != bundle["head_sha"]):
+        return False
+    cases = {
+        row["case_id"]: row for row in db.execute(
+            "SELECT * FROM verification_cases WHERE bundle_id=? AND attempt=1",
+            (bundle["id"],),
+        )
+    }
+    for case_id, candidate in cases.items():
+        if case_id.startswith("protected:") or candidate["status"] == "passed":
+            continue
+        protected = cases.get(f"protected:{case_id}")
+        if (protected is None or protected["status"] != "passed"
+                or protected["oracle_type"] != candidate["oracle_type"]
+                or protected["oracle_json"] != candidate["oracle_json"]
+                or protected["requirement_ids_json"] != candidate["requirement_ids_json"]):
+            continue
+        logs = {
+            row["case_id"]: row for row in db.execute(
+                "SELECT case_id,command_json,cwd_relpath,env_digest FROM evidence_items "
+                "WHERE bundle_id=? AND kind='log' AND case_id IN (?,?)",
+                (bundle["id"], case_id, f"protected:{case_id}"),
+            )
+        }
+        left, right = logs.get(case_id), logs.get(f"protected:{case_id}")
+        if (left is not None and right is not None
+                and left["command_json"] == right["command_json"]
+                and left["cwd_relpath"] == right["cwd_relpath"]
+                and left["env_digest"] == right["env_digest"]):
+            return True
+    return False
+
+
 def retry_verification(
     instance_id: str, step_id: str, *, producer_step: str,
     producer_activation: int, reason: str,
@@ -1967,8 +2004,9 @@ def retry_verification(
     """Queue an audited deterministic retry against one exact sealed candidate.
 
     This does not mark verification successful and cannot advance an approval
-    gate.  It only abandons a blocked, artifact-less rework activation and lets
-    the existing verification activation re-run the prior sealed bytes.
+    gate. It either abandons a blocked artifact-less rework activation, or uses
+    one separately capped retry when candidate/protected execution of identical
+    bytes and environment produced contradictory outcomes.
     """
     reason = str(reason).strip()
     if not reason:
@@ -2023,11 +2061,50 @@ def retry_verification(
                 or int(run["recipe_activation"] or -1) != int(producer_activation)
                 or run["exit_code"] != 0 or run["result"] != "done"):
             raise ValueError("selected producer run is not an exact successful durable run")
-        if (latest_producer is None
-                or int(latest_producer["activation"]) <= int(producer_activation)
-                or latest_producer["state"] != "blocked"
-                or latest_producer["rejected_by_step_id"] != step_id):
-            raise ValueError("latest producer is not a blocked verification rework")
+        abandon_rework = bool(
+            latest_producer is not None
+            and int(latest_producer["activation"]) > int(producer_activation)
+            and latest_producer["state"] == "blocked"
+            and latest_producer["rejected_by_step_id"] == step_id
+        )
+        latest_bundle = db.execute(
+            "SELECT * FROM evidence_bundles WHERE instance_id=? AND step_id=? "
+            "AND activation=?",
+            (instance_id, step_id, int(verify_step["activation"])),
+        ).fetchone()
+        contradiction_retry = bool(
+            verify_step["state"] == "blocked"
+            and latest_producer is not None
+            and int(latest_producer["activation"]) > int(producer_activation)
+            and latest_producer["state"] == "skipped"
+            and str(latest_producer["blocked_reason"] or "").startswith(
+                "verification_retry_abandoned:"
+            )
+            and _same_revision_case_contradiction(db, latest_bundle)
+        )
+        if not abandon_rework and not contradiction_retry:
+            raise ValueError(
+                "latest state is neither a blocked verification rework nor an "
+                "identical-input verification contradiction"
+            )
+        prior_retries = 0
+        for event_row in db.execute(
+            "SELECT payload_json FROM advance_events WHERE instance_id=? "
+            "AND source='verification_retry' AND state='applied'",
+            (instance_id,),
+        ):
+            try:
+                prior_payload = json.loads(event_row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (prior_payload.get("producer_step") == producer_step
+                    and int(prior_payload.get("producer_activation", -1))
+                    == int(producer_activation)):
+                prior_retries += 1
+        # One no-op recovery plus one contradiction rerun is the hard brake.
+        if prior_retries >= 2:
+            raise ValueError("verification retry cap exhausted for this sealed producer")
+        mode = "contradiction" if contradiction_retry else "abandon_rework"
         payload = {
             "step_id": step_id,
             "producer_step": producer_step,
@@ -2036,8 +2113,14 @@ def retry_verification(
             "artifact_id": artifact["id"],
             "artifact_sha256": artifact["sha256"],
             "head_sha": artifact["head_sha"],
+            "mode": mode,
             "reason": reason,
         }
+        if contradiction_retry:
+            payload.update({
+                "contradiction_bundle_id": latest_bundle["id"],
+                "contradiction_bundle_sha256": latest_bundle["bundle_sha256"],
+            })
     return enqueue(
         instance_id, "verification_retry", payload,
         expected_activation=int(verify_step["activation"]),
@@ -2304,6 +2387,49 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 canonical_artifact, canonical_producer = _sealed_change_set_producer(
                     db, instance["id"], definition or {},
                 )
+                mode = payload.get("mode", "abandon_rework")
+                mode_valid = False
+                contradiction_bundle = None
+                if mode == "abandon_rework":
+                    mode_valid = bool(
+                        latest_producer is not None and step is not None
+                        and int(latest_producer["activation"]) > producer_activation
+                        and latest_producer["state"] == "blocked"
+                        and latest_producer["rejected_by_step_id"] == step["step_id"]
+                    )
+                elif mode == "contradiction":
+                    contradiction_bundle = db.execute(
+                        "SELECT * FROM evidence_bundles WHERE id=? AND instance_id=? "
+                        "AND step_id=? AND activation=? AND bundle_sha256=?",
+                        (payload.get("contradiction_bundle_id"), instance["id"],
+                         payload.get("step_id"), int(step["activation"]) if step else -1,
+                         payload.get("contradiction_bundle_sha256")),
+                    ).fetchone()
+                    applied_retries = 0
+                    for event_row in db.execute(
+                        "SELECT payload_json FROM advance_events WHERE instance_id=? "
+                        "AND source='verification_retry' AND state='applied'",
+                        (instance["id"],),
+                    ):
+                        try:
+                            prior_payload = json.loads(event_row["payload_json"])
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if (prior_payload.get("producer_step") == producer_step_id
+                                and int(prior_payload.get("producer_activation", -1))
+                                == producer_activation):
+                            applied_retries += 1
+                    mode_valid = bool(
+                        step is not None and step["state"] == "blocked"
+                        and latest_producer is not None
+                        and int(latest_producer["activation"]) > producer_activation
+                        and latest_producer["state"] == "skipped"
+                        and str(latest_producer["blocked_reason"] or "").startswith(
+                            "verification_retry_abandoned:"
+                        )
+                        and applied_retries == 1
+                        and _same_revision_case_contradiction(db, contradiction_bundle)
+                    )
                 valid = (
                     step is not None and definition is not None
                     and definition.get("primitive") == "verification"
@@ -2319,34 +2445,39 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     and run["task_id"] == producer["kanban_task_id"]
                     and int(run["recipe_activation"] or -1) == producer_activation
                     and run["exit_code"] == 0 and run["result"] == "done"
-                    and latest_producer is not None
-                    and int(latest_producer["activation"]) > producer_activation
-                    and latest_producer["state"] == "blocked"
-                    and latest_producer["rejected_by_step_id"] == step["step_id"]
+                    and mode_valid
                 )
                 if not valid:
                     _finish_event(db, row, "discarded", "verification_retry_binding_changed")
                     return
                 assert latest_producer is not None and definition is not None and step is not None
-                latest_producer_dict: dict[str, Any] = {
-                    str(key): latest_producer[key] for key in latest_producer.keys()
-                }
                 step_dict: dict[str, Any] = {str(key): step[key] for key in step.keys()}
-                _transition(
-                    db, instance, latest_producer_dict, "skipped",
-                    f"verification_retry:{row['key']}",
-                    reason=f"verification_retry_abandoned:{payload.get('reason', '')}"[:2000],
-                )
-                if step["state"] in {"blocked", "failed"}:
+                if mode == "abandon_rework":
+                    latest_producer_dict: dict[str, Any] = {
+                        str(key): latest_producer[key] for key in latest_producer.keys()
+                    }
+                    _transition(
+                        db, instance, latest_producer_dict, "skipped",
+                        f"verification_retry:{row['key']}",
+                        reason=f"verification_retry_abandoned:{payload.get('reason', '')}"[:2000],
+                    )
+                    if step["state"] in {"blocked", "failed"}:
+                        _fresh_activation(
+                            db, instance, definition, step_dict,
+                            f"verification_retry:{row['key']}",
+                        )
+                    outcome = "verification_retry_scheduled"
+                else:
                     _fresh_activation(
                         db, instance, definition, step_dict,
-                        f"verification_retry:{row['key']}",
+                        f"verification_contradiction_retry:{row['key']}",
                     )
+                    outcome = "verification_retry_contradiction_scheduled"
                 db.execute(
                     "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? "
                     "WHERE id=?", (store._now(), instance["id"]),
                 )
-                _finish_event(db, row, "applied", "verification_retry_scheduled")
+                _finish_event(db, row, "applied", outcome)
                 return
             if row["source"] == "operator_release":
                 if step is None:

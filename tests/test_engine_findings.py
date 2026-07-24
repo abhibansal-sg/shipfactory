@@ -850,6 +850,87 @@ def test_finding_99_operator_retry_reuses_exact_sealed_producer_without_llm_rebu
     assert payload["producer_run_id"] == run_id
     assert payload["artifact_id"] == "artifact-f99"
 
+    # A failed candidate case followed by a passing protected case on the exact
+    # same commit, command, cwd, oracle, and environment is nondeterministic
+    # verifier evidence, not proof of a candidate defect. One separately capped
+    # machine-only retry gets a fresh activation; the failed bundle stays sealed.
+    kanban_conn.execute(
+        "UPDATE tasks SET workspace_path=? WHERE id=?",
+        (str(tmp_path / "candidate"), build1["kanban_task_id"]),
+    )
+    now = store._now()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason='test_failed',updated_at=? "
+            "WHERE instance_id='f99' AND step_id='verify' AND activation=2",
+            (now,),
+        )
+        db.execute(
+            "INSERT INTO evidence_bundles(id,instance_id,step_id,activation,input_revision_hash,"
+            "base_sha,head_sha,tree_sha,environment_session_id,manifest_relpath,manifest_blob_sha,"
+            "state,bundle_sha256,redaction_state,created_at,sealed_at,invalid_reason,phase_b_eligible) "
+            "VALUES('bundle-f99-contradiction','f99','verify',2,'i',?,?,?,?,'.shipfactory/verification.yaml',?,"
+            "'blocked',?,'clean',?,?,'test_failed',0)",
+            ("b" * 40, "b" * 40, "c" * 40, "env-f99", "m" * 40,
+             "d" * 64, now, now),
+        )
+        oracle = json.dumps({"type": "pytest_summary"}, sort_keys=True)
+        requirements = json.dumps(["tests"], sort_keys=True)
+        for case_id, status in (
+            ("protected-pytest", "failed"),
+            ("protected:protected-pytest", "passed"),
+        ):
+            db.execute(
+                "INSERT INTO verification_cases(bundle_id,case_id,attempt,requirement_ids_json,"
+                "oracle_type,oracle_json,status,evidence_item_ids_json,started_at,ended_at) "
+                "VALUES('bundle-f99-contradiction',?,1,?,'pytest_summary',?,?,?, ?,?)",
+                (case_id, requirements, oracle, status, "[]", now, now),
+            )
+            db.execute(
+                "INSERT INTO evidence_items(id,bundle_id,case_id,kind,path,sha256,size_bytes,"
+                "mime_type,producer,command_json,cwd_relpath,env_digest,exit_code,started_at,"
+                "ended_at,metadata_json) VALUES(?,?,?,'log',?,?,1,'text/plain','runner',"
+                "?,'.',?, ?,?,?, '{}')",
+                (f"item-{case_id}", "bundle-f99-contradiction", case_id, f"{case_id}.log", "e" * 64,
+                 json.dumps(["python", "-m", "pytest", "tests/"]), "env-digest",
+                 1 if status == "failed" else 0, now, now),
+            )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE evidence_items SET env_digest='different-environment' "
+            "WHERE id='item-protected:protected-pytest'",
+        )
+    with pytest.raises(ValueError, match="neither a blocked verification rework"):
+        advancer.retry_verification(
+            "f99", "verify", producer_step="build", producer_activation=1,
+            reason="must not retry non-identical execution",
+        )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE evidence_items SET env_digest='env-digest' "
+            "WHERE id='item-protected:protected-pytest'",
+        )
+    retry_key = advancer.retry_verification(
+        "f99", "verify", producer_step="build", producer_activation=1,
+        reason="identical candidate/protected execution contradicted itself",
+    )
+    retry_row = advancer._claim_event(owner="test-f99-contradiction", board="test")
+    assert retry_row and retry_row["key"] == retry_key
+    advancer._apply_claimed_event(kanban_conn, retry_row)
+    assert (_step("f99", "verify")["activation"], _step("f99", "verify")["state"]) == (3, "pending")
+    with store._connect() as db:
+        contradiction_event = db.execute(
+            "SELECT state,outcome,payload_json FROM advance_events WHERE key=?", (retry_key,),
+        ).fetchone()
+        preserved = db.execute(
+            "SELECT state,invalid_reason FROM evidence_bundles WHERE id='bundle-f99-contradiction'",
+        ).fetchone()
+    assert (contradiction_event["state"], contradiction_event["outcome"]) == (
+        "applied", "verification_retry_contradiction_scheduled",
+    )
+    assert json.loads(contradiction_event["payload_json"])["mode"] == "contradiction"
+    assert (preserved["state"], preserved["invalid_reason"]) == ("blocked", "test_failed")
+
 
 def test_finding_97_recipe_worktree_aligns_to_instance_base(tmp_path):
     """A recipe task's worktree cut from live HEAD is detached onto the

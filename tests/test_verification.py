@@ -693,6 +693,30 @@ def test_commit_binding_tolerates_factory_output_dir_only(tmp_path):
         verify.assert_commit_binding(repo, head, tree)
 
 
+def test_process_tree_tracker_uses_bounded_low_observer_effect_cadence(monkeypatch):
+    """Finding #100: the global environ scan must not run at the old 10ms hot loop."""
+    tracker = object.__new__(verify._ProcessTreeTracker)
+    observed: list[float] = []
+
+    class StopAfterOneWait:
+        def wait(self, timeout):
+            observed.append(timeout)
+            return True
+
+        def set(self):
+            pass
+
+    class Ready:
+        def set(self):
+            pass
+
+    monkeypatch.setattr(tracker, "_stop", StopAfterOneWait(), raising=False)
+    monkeypatch.setattr(tracker, "ready", Ready(), raising=False)
+    monkeypatch.setattr(tracker, "_scan", lambda: None)
+    tracker._watch()
+    assert observed == [0.05]
+
+
 def test_process_tree_environ_blip_is_not_a_supervision_gap():
     """Finding #90: a process exiting mid-environ-read (macOS bridge RuntimeError)
     must not fail the case; only an alive process with an unreadable
