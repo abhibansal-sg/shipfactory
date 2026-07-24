@@ -2267,7 +2267,9 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
         raise ValueError("review activation-cap release cap exhausted for this step")
     if budget_admission_repair and prior_admission_repair_count >= 1:
         raise ValueError("review activation-cap repair already applied for this activation")
-    if step["blocked_reason"] == "worker_blocked" and prior_worker_release_count >= 1:
+    worker_release_limit = 2 if step["primitive"] == "agent_task" else 1
+    if (step["blocked_reason"] == "worker_blocked"
+            and prior_worker_release_count >= worker_release_limit):
         raise ValueError("worker-blocked review release cap exhausted for this step")
     return enqueue(
         instance_id,
