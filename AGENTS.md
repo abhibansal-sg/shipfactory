@@ -855,12 +855,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   `agent_task` parked solely by its step-activation cap (finding #112, SF-20).
   It does not release worker failures or malformed output from agent tasks, and
   still creates a fresh audited activation rather than changing completion.
+- Review-story diff completeness is bound to the exact sealed change-set's
+  base/head, not the mutable instance base (finding #113, SF-20). Verification-
+  only recovery may advance the operational base to the sealed head; head/tree,
+  producer workspace, change-set bytes, and complete diff remain exact.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#112 so far). When you fix one: commit message
+- Findings get numbers (#22–#113 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

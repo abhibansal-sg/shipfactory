@@ -1725,16 +1725,21 @@ def _validate_review_story_context(
         )
 
     head_sha = str(bundle["head_sha"])
+    diff_base_sha = str(instance["base_sha"])
     diff_workspace = workspace
     if change_row is not None:
         change = dict(change_row)
         change_document = artifact_document(change)
-        if (change_document["base_sha"] != str(instance["base_sha"])
-                or change_document["head_sha"] != head_sha
+        # The exact sealed change-set owns the reviewed diff base. A later
+        # verification-only retry may advance the instance's operational base
+        # to the already-sealed head without changing these candidate bytes.
+        # Head/tree must still match the sealed evidence exactly.
+        if (change_document["head_sha"] != head_sha
                 or change_document["tree_sha"] != str(bundle["tree_sha"])):
             raise ArtifactValidationError(
                 f"{schema} change-set identity differs from the evidence bundle"
             )
+        diff_base_sha = str(change_document["base_sha"])
         if exact_inputs is not None:
             run = store.run_row(int(change["run_id"])) if change.get("run_id") is not None else None
             if run is None or not run.get("workspace_path"):
@@ -1746,7 +1751,7 @@ def _validate_review_story_context(
                 change_document, instance_id, str(change["step_id"]),
                 int(change["activation"]), int(change["run_id"]), diff_workspace,
             )
-    changed = _changed_paths(diff_workspace, str(instance["base_sha"]), head_sha)
+    changed = _changed_paths(diff_workspace, diff_base_sha, head_sha)
     generated = list(document["generated_or_mechanical_files"])
     all_declared = narrated_paths + generated
     duplicates = sorted({path for path in all_declared if all_declared.count(path) != 1})

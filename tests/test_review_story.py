@@ -207,6 +207,21 @@ steps:
     return repo, story, output
 
 
+def test_story_accepts_exact_change_set_after_instance_base_advances_to_verified_head(tmp_path):
+    repo, story, _output = _story_fixture(
+        tmp_path, "advanced-instance-base", {"app.py": "new\n"},
+    )
+    head = _git(repo, "rev-parse", "HEAD")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_instances SET base_sha=? WHERE id=?",
+            (head, "advanced-instance-base"),
+        )
+    assert artifacts._validate_review_story_context(
+        story, "advanced-instance-base", repo,
+    ) is None
+
+
 def test_story_omitting_deleted_security_check_is_rejected(tmp_path):
     repo, story, _output = _story_fixture(
         tmp_path, "deleted-check", {"app.py": "new\n", "security_check.py": None},
