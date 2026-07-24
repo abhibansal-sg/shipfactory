@@ -28,3 +28,33 @@ closed unless explicitly reopened. Reference these before proposing structure.
   no-core-mod law, blocks on external review).
 - Surfacing: a **Projects tab** in the ShipFactory dashboard view — project →
   its flights (board level flattened away), plus the unclassified bucket.
+
+## D-002 · Modular video-production capability + governed creative recipe (2026-07-24)
+
+- Build **two reusable Hermes skills and one ShipFactory recipe**, not one skill
+  per sequential production step:
+  - `procedural-video`: deterministic NumPy/Pillow/OpenCV/FFmpeg renderer,
+    reusable code templates, resumable scene rendering, and machine QC.
+  - `video-production`: orchestration and lane selection across procedural,
+    ASCII, tldraw, HyperFrames, generative-video, music, and delivery skills.
+  - `creative-video@1`: research → treatment → styleframe → build → machine
+    verification → vision review → master → human operator approval.
+- Sequential mechanics such as typography checks, frame rendering, contact
+  sheets, frame diffs, and audio muxing belong as scripts/references inside the
+  engine skill. A separate skill is warranted only for an independently
+  reusable trigger and toolchain.
+- **Seat policy:** every seat exercising creative direction or design judgment
+  uses `gpt-5.6-sol`; bounded research/implementation/QC seats use the best-fit
+  non-creative model; at least one final correctness/adversarial review remains
+  cross-provider. The recipe records resolved seat/model evidence per run.
+- V1 is deliberately narrow: square deterministic Python scenes, local assets,
+  one soundtrack, independent scene clips, FFmpeg master, contact-sheet and
+  frame-diff evidence. No node editor, plugin registry, asset database, 3D,
+  cloud render farm, or automated subjective approval.
+- First dogfood: build the capability through one Linear-backed Factory flight,
+  then validate it with a separate flight producing a 15–20 second ShipFactory
+  launch film. One issue = one flight; the factory never decomposes Linear work.
+- Rejected alternatives: one skill per pipeline step (routing ambiguity and
+  drift); forcing creative work through `dev-pipeline@14` forever (software
+  artifact assumptions); making HyperFrames or generative video the default
+  lane (contradicts the proven Nous NumPy/Pillow/OpenCV/FFmpeg workflow).
