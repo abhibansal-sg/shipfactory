@@ -362,16 +362,20 @@ def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanba
     # before it acquired a board task, then repair that SAME activation.
     with store._connect() as db:
         db.execute(
-            "UPDATE recipe_steps SET state='blocked',blocked_reason=?,kanban_task_id=NULL "
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=?,kanban_task_id=NULL,"
+            "input_artifact_set_hash=?,input_revision_hash=? "
             "WHERE instance_id=? AND step_id='verify' AND activation=2",
-            ("budget_exhausted:step_activation_cap:verify", instance_id),
+            (
+                "budget_exhausted:step_activation_cap:verify",
+                "a" * 64, "b" * 64, instance_id,
+            ),
         )
     repair_key = release_review_stall(
         instance_id, "verify", "repair audited operator retry admission",
     )
     apply_events(kanban_conn, profiles=PROFILES)
     repaired = _step(instance_id, "verify", 2)
-    assert repaired is not None and repaired["state"] == "pending"
+    assert repaired is not None and repaired["state"] == "ready"
     assert _step(instance_id, "verify", 3) is None
     with store._connect() as db:
         instance = db.execute(

@@ -841,12 +841,17 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   an absent optional `change-set` does not invalidate an evidence-only review;
   an absent required change-set still fails closed, and any present change-set
   remains bound to its exact sealed producer activation/run/workspace.
+- Reopening the same activation must not reuse its already-applied
+  `pending→ready` transition key. Fix (finding #110, SF-20): a taskless,
+  hash-bound review activation with audited operator-retry and admission-repair
+  provenance resumes at `ready`; reconciliation also repairs the earlier
+  deployed `pending` state through a distinct audited transition key.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#109 so far). When you fix one: commit message
+- Findings get numbers (#22–#110 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

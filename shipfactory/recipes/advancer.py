@@ -1290,6 +1290,24 @@ def reconcile(conn: Any, instance_id: str, *, profiles: dict[str, dict[str, Any]
             latest = {x["step_id"]: x for x in _latest(db, instance_id)}
             for step_id, step in list(latest.items()):
                 if step["state"] != "pending": continue
+                if (step["primitive"] == "review_gate"
+                        and step["kanban_task_id"] is None
+                        and step["input_artifact_set_hash"]
+                        and step["input_revision_hash"]
+                        and _operator_review_retry(db, instance, step)):
+                    repair = db.execute(
+                        "SELECT key FROM advance_events WHERE instance_id=? "
+                        "AND source='operator_release' AND state='applied' "
+                        "AND outcome='operator_review_admission_repaired' "
+                        "AND expected_activation=? ORDER BY applied_at DESC LIMIT 1",
+                        (instance_id, int(step["activation"])),
+                    ).fetchone()
+                    if repair is not None:
+                        changed |= _transition(
+                            db, instance, step, "ready",
+                            f"operator_review_admission_repair:{repair['key']}",
+                        )
+                        continue
                 if all(latest[parent]["state"] in {"done", "skipped"} for parent in defs[step_id]["needs"]):
                     if recipe.get("schema") == "shipfactory.recipe/v2":
                         from shipfactory.artifacts import (
@@ -2593,6 +2611,8 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     # ordinary recipe cap parked it before dispatch. Repair that
                     # same never-dispatched activation; do not mint another retry.
                     if (step["kanban_task_id"] is not None
+                            or not step["input_artifact_set_hash"]
+                            or not step["input_revision_hash"]
                             or not _operator_review_retry(db, instance, dict(step))):
                         _finish_event(
                             db, row, "discarded",
@@ -2600,7 +2620,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         )
                         return
                     db.execute(
-                        "UPDATE recipe_steps SET state='pending',blocked_reason=NULL,updated_at=? "
+                        "UPDATE recipe_steps SET state='ready',blocked_reason=NULL,updated_at=? "
                         "WHERE instance_id=? AND step_id=? AND activation=? AND state='blocked'",
                         (store._now(), instance["id"], step["step_id"], step["activation"]),
                     )
