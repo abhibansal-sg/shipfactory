@@ -1916,7 +1916,15 @@ def run_verification(
     infra_recovered = False
     failure_reason: str | None = None
     case_sources = [("candidate", manifest)] if run_candidate_cases else []
-    if protected_manifest is not None:
+    duplicate_protected_surface = bool(
+        run_candidate_cases
+        and protected_manifest is not None
+        and base_sha == head_sha
+        and protected_manifest.base_sha == manifest.base_sha
+        and protected_manifest.blob_sha == manifest.blob_sha
+        and protected_manifest.raw == manifest.raw
+    )
+    if protected_manifest is not None and not duplicate_protected_surface:
         case_sources.append(("protected", protected_manifest))
     required_case_ids = [
         case["id"] if provenance == "candidate" else f"protected:{case['id']}"

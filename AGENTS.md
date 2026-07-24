@@ -771,7 +771,7 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   cleanup windows), and recognize only cryptographically/auditably identical
   candidate/protected contradictions as infrastructure evidence. The same
   enqueue-only operator surface has a hard brake of one no-op recovery plus at
-  most two machine-only contradiction retries; every rerun gets a fresh
+  most three machine-only contradiction retries; every rerun gets a fresh
   verification activation. Failed sealed bundles remain immutable, source is
   never rebuilt, and no approval can advance without a wholly green rerun.
 - Reducing the expensive full-process environ sweep from 10ms to 50ms was not
@@ -782,12 +782,21 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   cleanup. Persistent detached descendants remain nonce-fenced; ordinary
   children are captured quickly by ancestry; final cleanup always performs a
   full sweep. This separates cleanup assurance from verifier observer load.
+- Candidate and protected verification are distinct surfaces only when their
+  revision or manifest differs. SF-20 had already advanced its base to the
+  candidate, so both surfaces were the exact same commit and manifest; running
+  the 588-test suite twice back-to-back added heat but zero assurance, and the
+  second copy repeatedly flaked timing/SQLite tests after the first passed.
+  Fix (finding #102, SF-20): when base SHA, head SHA, manifest base, manifest
+  blob hash, and raw manifest bytes are all identical, execute the candidate
+  surface once and seal that one case set. Different revisions/manifests still
+  run independently and protected failures still override candidate success.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#101 so far). When you fix one: commit message
+- Findings get numbers (#22–#102 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

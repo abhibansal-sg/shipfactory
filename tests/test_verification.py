@@ -306,6 +306,34 @@ def test_deterministic_failure_not_retried_but_infra_retries_once(tmp_path):
     assert document["phase_b_eligible"] is False
 
 
+def test_identical_base_and_candidate_manifest_runs_once(tmp_path):
+    """Finding #102: exact same revision+manifest is one surface, not two hot suites."""
+    repo, head, tree = _repo(tmp_path)
+    manifest = verify.load_verification_manifest(repo, head)
+    calls: list[str] = []
+
+    def passing(case, workspace, env, timeout):
+        calls.append(env["SHIPFACTORY_CASE_ID"])
+        now = store._now()
+        return {
+            "classification": "passed", "stdout": b"1 passed", "stderr": b"",
+            "exit_code": 0, "started_at": now, "ended_at": now,
+        }
+
+    bundle = _run(
+        repo, head, tree, manifest, protected_manifest=manifest,
+        drivers={"command": passing}, instance_id="identical-surface",
+    )
+    assert bundle["state"] == "done"
+    assert calls == ["unit-suite"]
+    with store._connect() as db:
+        cases = db.execute(
+            "SELECT case_id,status FROM verification_cases WHERE bundle_id=?",
+            (bundle["id"],),
+        ).fetchall()
+    assert [tuple(row) for row in cases] == [("unit-suite", "passed")]
+
+
 def test_protected_baseline_failure_overrides_candidate_pass(tmp_path):
     repo, head, tree = _repo(tmp_path)
     candidate = verify.load_verification_manifest(repo, head)
