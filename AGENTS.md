@@ -770,15 +770,24 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   (finding #100, SF-20): scan at 50ms (still well inside detached-descendant
   cleanup windows), and recognize only cryptographically/auditably identical
   candidate/protected contradictions as infrastructure evidence. The same
-  enqueue-only operator surface gets one separately capped machine-only fresh
-  verification activation; the failed sealed bundle remains immutable, source
-  is never rebuilt, and no approval can advance without a wholly green rerun.
+  enqueue-only operator surface has a hard brake of one no-op recovery plus at
+  most two machine-only contradiction retries; every rerun gets a fresh
+  verification activation. Failed sealed bundles remain immutable, source is
+  never rebuilt, and no approval can advance without a wholly green rerun.
+- Reducing the expensive full-process environ sweep from 10ms to 50ms was not
+  enough: the verifier runner still consumed roughly 40% CPU and alternately
+  flaked the candidate and protected copies of the same timing test. Fix
+  (finding #101, SF-20): keep cheap recursive ancestry scans at 10ms, but run
+  the all-process nonce/environ sweep every 500ms plus at startup and final
+  cleanup. Persistent detached descendants remain nonce-fenced; ordinary
+  children are captured quickly by ancestry; final cleanup always performs a
+  full sweep. This separates cleanup assurance from verifier observer load.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#100 so far). When you fix one: commit message
+- Findings get numbers (#22–#101 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

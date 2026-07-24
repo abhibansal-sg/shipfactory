@@ -1963,7 +1963,9 @@ def gate_decision(
 def _same_revision_case_contradiction(db: Any, bundle: dict[str, Any] | Any) -> bool:
     """Prove that identical bytes/environment produced conflicting case results."""
     if (bundle is None or bundle["state"] != "blocked"
-            or bundle["invalid_reason"] != "test_failed"
+            or bundle["invalid_reason"] not in {
+                "test_failed", "protected_baseline_test_failed",
+            }
             or bundle["base_sha"] != bundle["head_sha"]):
         return False
     cases = {
@@ -1973,10 +1975,16 @@ def _same_revision_case_contradiction(db: Any, bundle: dict[str, Any] | Any) -> 
         )
     }
     for case_id, candidate in cases.items():
-        if case_id.startswith("protected:") or candidate["status"] == "passed":
+        if case_id.startswith("protected:"):
             continue
         protected = cases.get(f"protected:{case_id}")
-        if (protected is None or protected["status"] != "passed"
+        if protected is None:
+            continue
+        statuses_contradict = bool(
+            candidate["status"] != protected["status"]
+            and "passed" in {candidate["status"], protected["status"]}
+        )
+        if (not statuses_contradict
                 or protected["oracle_type"] != candidate["oracle_type"]
                 or protected["oracle_json"] != candidate["oracle_json"]
                 or protected["requirement_ids_json"] != candidate["requirement_ids_json"]):
@@ -2101,8 +2109,8 @@ def retry_verification(
                     and int(prior_payload.get("producer_activation", -1))
                     == int(producer_activation)):
                 prior_retries += 1
-        # One no-op recovery plus one contradiction rerun is the hard brake.
-        if prior_retries >= 2:
+        # One no-op recovery plus two contradiction reruns is the hard brake.
+        if prior_retries >= 3:
             raise ValueError("verification retry cap exhausted for this sealed producer")
         mode = "contradiction" if contradiction_retry else "abandon_rework"
         payload = {
@@ -2427,7 +2435,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         and str(latest_producer["blocked_reason"] or "").startswith(
                             "verification_retry_abandoned:"
                         )
-                        and applied_retries == 1
+                        and applied_retries in {1, 2}
                         and _same_revision_case_contradiction(db, contradiction_bundle)
                     )
                 valid = (

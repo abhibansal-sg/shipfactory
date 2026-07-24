@@ -693,15 +693,17 @@ def test_commit_binding_tolerates_factory_output_dir_only(tmp_path):
         verify.assert_commit_binding(repo, head, tree)
 
 
-def test_process_tree_tracker_uses_bounded_low_observer_effect_cadence(monkeypatch):
-    """Finding #100: the global environ scan must not run at the old 10ms hot loop."""
+def test_process_tree_tracker_splits_fast_ancestry_from_expensive_scope_sweeps(monkeypatch):
+    """Finding #101: global environ scans cannot run in the 10ms ancestry hot loop."""
     tracker = object.__new__(verify._ProcessTreeTracker)
-    observed: list[float] = []
+    waits: list[float] = []
+    scans: list[bool] = []
+    times = iter([0.0, 0.02, 0.60, 0.61])
 
-    class StopAfterOneWait:
+    class StopAfterTwoScans:
         def wait(self, timeout):
-            observed.append(timeout)
-            return True
+            waits.append(timeout)
+            return len(waits) >= 3
 
         def set(self):
             pass
@@ -710,11 +712,15 @@ def test_process_tree_tracker_uses_bounded_low_observer_effect_cadence(monkeypat
         def set(self):
             pass
 
-    monkeypatch.setattr(tracker, "_stop", StopAfterOneWait(), raising=False)
+    monkeypatch.setattr(tracker, "_stop", StopAfterTwoScans(), raising=False)
     monkeypatch.setattr(tracker, "ready", Ready(), raising=False)
-    monkeypatch.setattr(tracker, "_scan", lambda: None)
+    monkeypatch.setattr(
+        tracker, "_scan", lambda *, include_scope_sweep=True: scans.append(include_scope_sweep),
+    )
+    monkeypatch.setattr(verify, "monotonic", lambda: next(times))
     tracker._watch()
-    assert observed == [0.05]
+    assert waits == [0.01, 0.01, 0.01]
+    assert scans == [True, False, True]
 
 
 def test_process_tree_environ_blip_is_not_a_supervision_gap():

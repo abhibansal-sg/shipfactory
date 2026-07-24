@@ -804,11 +804,11 @@ def _kill_child(proc: subprocess.Popen[bytes], token: str | None) -> None:
 class _ProcessTreeTracker:
     """Continuously capture descendant PID/start-token pairs for safe cleanup."""
 
-    # Full-process environ scans are deliberately expensive on macOS. Fifty
-    # milliseconds still observes detached descendants long before cleanup,
-    # without starving timing- and SQLite-sensitive tests in the supervised
-    # child (finding #100).
-    _SCAN_INTERVAL_SECONDS = 0.05
+    # Cheap ancestry scans remain fast; the expensive all-process environ sweep
+    # runs separately. This preserves both lineage and nonce detection without
+    # making the verifier the dominant CPU consumer (finding #101).
+    _ANCESTRY_SCAN_INTERVAL_SECONDS = 0.01
+    _SCOPE_SCAN_INTERVAL_SECONDS = 0.5
 
     def __init__(self, proc: subprocess.Popen[bytes], scope: str):
         try:
@@ -855,7 +855,7 @@ class _ProcessTreeTracker:
                 return None
         return self._GAP
 
-    def _scan(self) -> None:
+    def _scan(self, *, include_scope_sweep: bool = True) -> None:
         from shipfactory import spawn
         try:
             descendants = self._psutil.Process(self.proc.pid).children(recursive=True)
@@ -865,34 +865,35 @@ class _ProcessTreeTracker:
         except (self._psutil.Error, ProcessLookupError, OSError, PermissionError):
             descendants = []
         # A child can call setsid() and be reparented before an ancestry poll.
-        # The runner-owned nonce is inherited in its environment, so a full
-        # process scan still finds that detached scope without relying on a
-        # stale PID or a parent relationship.
-        try:
-            for candidate in self._psutil.process_iter(["pid"]):
-                if int(candidate.pid) == os.getpid():
-                    continue
-                try:
-                    if candidate.environ().get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope:
-                        descendants.append(candidate)
-                except (RuntimeError, SystemError):
-                    # psutil's macOS proc_environ bridge fails this way when a
-                    # process exits or turns zombie mid-read — routine on a
-                    # busy machine, and latching available=False on every exit
-                    # blip failed green suites (finding #90). Retry against a
-                    # liveness check: only a demonstrably alive process whose
-                    # environment stays unreadable is a real supervision gap.
-                    environ = self._environ_retry(candidate)
-                    if environ is self._GAP:
-                        self.available = False
-                    elif (environ is not None
-                          and environ.get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope):
-                        descendants.append(candidate)
-                    continue
-                except (self._psutil.Error, OSError, PermissionError):
-                    continue
-        except (self._psutil.Error, OSError, PermissionError, RuntimeError, SystemError):
-            self.available = False
+        # The runner-owned nonce is inherited in its environment, so a periodic
+        # full process scan still finds that detached scope without relying on a
+        # stale PID or a parent relationship. Ancestry scans remain cheap/fast.
+        if include_scope_sweep:
+            try:
+                for candidate in self._psutil.process_iter(["pid"]):
+                    if int(candidate.pid) == os.getpid():
+                        continue
+                    try:
+                        if candidate.environ().get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope:
+                            descendants.append(candidate)
+                    except (RuntimeError, SystemError):
+                        # psutil's macOS proc_environ bridge fails this way when a
+                        # process exits or turns zombie mid-read — routine on a
+                        # busy machine, and latching available=False on every exit
+                        # blip failed green suites (finding #90). Retry against a
+                        # liveness check: only a demonstrably alive process whose
+                        # environment stays unreadable is a real supervision gap.
+                        environ = self._environ_retry(candidate)
+                        if environ is self._GAP:
+                            self.available = False
+                        elif (environ is not None
+                              and environ.get("SHIPFACTORY_SUPERVISION_SCOPE") == self.scope):
+                            descendants.append(candidate)
+                        continue
+                    except (self._psutil.Error, OSError, PermissionError):
+                        continue
+            except (self._psutil.Error, OSError, PermissionError, RuntimeError, SystemError):
+                self.available = False
         for child in descendants:
             token = spawn._process_start_token(int(child.pid))
             if not token:
@@ -904,10 +905,15 @@ class _ProcessTreeTracker:
             self.identities[int(child.pid)] = (token, int(pgid))
 
     def _watch(self) -> None:
-        self._scan()
+        self._scan(include_scope_sweep=True)
         self.ready.set()
-        while not self._stop.wait(self._SCAN_INTERVAL_SECONDS):
-            self._scan()
+        next_scope_sweep = monotonic() + self._SCOPE_SCAN_INTERVAL_SECONDS
+        while not self._stop.wait(self._ANCESTRY_SCAN_INTERVAL_SECONDS):
+            now = monotonic()
+            include_scope_sweep = now >= next_scope_sweep
+            self._scan(include_scope_sweep=include_scope_sweep)
+            if include_scope_sweep:
+                next_scope_sweep = monotonic() + self._SCOPE_SCAN_INTERVAL_SECONDS
 
     def cleanup(self) -> None:
         from shipfactory import spawn

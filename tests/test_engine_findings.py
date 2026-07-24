@@ -930,6 +930,20 @@ def test_finding_99_operator_retry_reuses_exact_sealed_producer_without_llm_rebu
     )
     assert json.loads(contradiction_event["payload_json"])["mode"] == "contradiction"
     assert (preserved["state"], preserved["invalid_reason"]) == ("blocked", "test_failed")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE evidence_bundles SET invalid_reason='protected_baseline_test_failed' "
+            "WHERE id='bundle-f99-contradiction'",
+        )
+        db.execute(
+            "UPDATE verification_cases SET status=CASE "
+            "WHEN case_id='protected-pytest' THEN 'passed' ELSE 'failed' END "
+            "WHERE bundle_id='bundle-f99-contradiction'",
+        )
+        reverse_bundle = db.execute(
+            "SELECT * FROM evidence_bundles WHERE id='bundle-f99-contradiction'",
+        ).fetchone()
+        assert advancer._same_revision_case_contradiction(db, reverse_bundle)
 
 
 def test_finding_97_recipe_worktree_aligns_to_instance_base(tmp_path):
