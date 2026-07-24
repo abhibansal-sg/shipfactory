@@ -863,12 +863,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   activation release and one worker-blocked harness/artifact retry are distinct
   audited brakes. A downstream agent task may receive the latter, but still only
   as a fresh activation; neither path marks work complete or touches approval.
+- Revalidating a previously sealed change-set for review uses that sealed
+  change-set's base as an explicit, local override (finding #115, SF-20), while
+  still rederiving bytes from its authenticated producer workspace and checking
+  plan bridging. The mutable instance base remains the default everywhere else.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#114 so far). When you fix one: commit message
+- Findings get numbers (#22–#115 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

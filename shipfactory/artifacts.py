@@ -1356,7 +1356,7 @@ def rederive_change_set(
 
 def _validate_change_set_context(
     document: dict[str, Any], instance_id: str, step_id: str, activation: int,
-    run_id: int | None, workspace: Path,
+    run_id: int | None, workspace: Path, *, trusted_base_override: str | None = None,
 ) -> dict[str, Any]:
     """Bind a change-set to its exact run, current instance base, and plan."""
     if run_id is None:
@@ -1399,7 +1399,7 @@ def _validate_change_set_context(
             raise ArtifactValidationError(
                 "change-set build must consume exactly one approved sealed plan"
             )
-        trusted_base = str(instance["base_sha"] or "")
+        trusted_base = str(trusted_base_override or instance["base_sha"] or "")
     plan = artifact_document(plans[0])
     if plan["base_sha"] != trusted_base:
         # A production rework advances the instance base past the plan's
@@ -1750,6 +1750,7 @@ def _validate_review_story_context(
             _validate_change_set_context(
                 change_document, instance_id, str(change["step_id"]),
                 int(change["activation"]), int(change["run_id"]), diff_workspace,
+                trusted_base_override=diff_base_sha,
             )
     changed = _changed_paths(diff_workspace, diff_base_sha, head_sha)
     generated = list(document["generated_or_mechanical_files"])
