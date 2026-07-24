@@ -2214,7 +2214,8 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
-        worker_release_count = 0
+        prior_release_count = 0
+        prior_admission_repair_count = 0
         budget_admission_repair = False
         if step is not None and str(step["blocked_reason"] or "").startswith(
             "budget_exhausted:step_activation_cap:"
@@ -2223,7 +2224,7 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
                 step["kanban_task_id"] is None
                 and _operator_review_retry(db, {"id": instance_id}, dict(step))
             )
-        if step is not None and step["blocked_reason"] == "worker_blocked":
+        if step is not None:
             for prior in db.execute(
                 "SELECT payload_json FROM advance_events WHERE instance_id=? "
                 "AND source='operator_release' AND state='applied'",
@@ -2234,14 +2235,23 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
                 except (TypeError, ValueError):
                     continue
                 if prior_payload.get("step_id") == step_id:
-                    worker_release_count += 1
+                    prior_release_count += 1
+            prior_admission_repair_count = int(db.execute(
+                "SELECT COUNT(*) FROM advance_events WHERE instance_id=? "
+                "AND source='operator_release' AND state='applied' "
+                "AND outcome='operator_review_admission_repaired' "
+                "AND expected_activation=?",
+                (instance_id, int(step["activation"])),
+            ).fetchone()[0])
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
             or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
     if (str(step["blocked_reason"] or "").startswith("budget_exhausted:")
-            and not budget_admission_repair):
-        raise ValueError("review activation-cap repair has no audited operator retry provenance")
-    if step["blocked_reason"] == "worker_blocked" and worker_release_count >= 1:
+            and not budget_admission_repair and prior_release_count >= 1):
+        raise ValueError("review activation-cap release cap exhausted for this step")
+    if budget_admission_repair and prior_admission_repair_count >= 1:
+        raise ValueError("review activation-cap repair already applied for this activation")
+    if step["blocked_reason"] == "worker_blocked" and prior_release_count >= 1:
         raise ValueError("worker-blocked review release cap exhausted for this step")
     return enqueue(
         instance_id,
@@ -2604,9 +2614,9 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 definition = next(
                     item for item in recipe["steps"] if item["id"] == step["step_id"]
                 )
-                if str(blocked_reason or "").startswith(
-                    "budget_exhausted:step_activation_cap:"
-                ):
+                if (str(blocked_reason or "").startswith(
+                        "budget_exhausted:step_activation_cap:"
+                ) and _operator_review_retry(db, instance, dict(step))):
                     # The audited operator retry was created correctly, but the
                     # ordinary recipe cap parked it before dispatch. Repair that
                     # same never-dispatched activation; do not mint another retry.
@@ -2630,7 +2640,11 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                     )
                     _finish_event(db, row, "applied", "operator_review_admission_repaired")
                     return
-                if _malformed_verdict_reason(blocked_reason) or blocked_reason == "worker_blocked":
+                if (_malformed_verdict_reason(blocked_reason)
+                        or blocked_reason == "worker_blocked"
+                        or str(blocked_reason or "").startswith(
+                            "budget_exhausted:step_activation_cap:"
+                        )):
                     # The reviewer or its harness, not the producer, failed:
                     # release into one fresh review activation against the SAME
                     # sealed inputs instead of reopening source work.

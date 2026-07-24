@@ -401,7 +401,7 @@ def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanba
             "WHERE instance_id=? AND step_id='verify' AND activation=2",
             ("budget_exhausted:step_activation_cap:verify", instance_id),
         )
-    with pytest.raises(ValueError, match="no audited operator retry provenance"):
+    with pytest.raises(ValueError, match="release cap exhausted"):
         release_review_stall(instance_id, "verify", "unbound cap repair")
 
     with store._connect() as db:
@@ -412,6 +412,56 @@ def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanba
         )
     with pytest.raises(ValueError, match="release cap exhausted"):
         release_review_stall(instance_id, "verify", "second harness failure")
+
+
+def test_cap_blocked_review_bootstraps_one_audited_retry_then_repairs_same_activation(
+    tmp_path, kanban_conn,
+):
+    instance_id = "cap-blocked-review-release"
+    _block_review_with_result(
+        tmp_path, kanban_conn, instance_id, "SHIPFACTORY_VERDICT: {invalid}",
+    )
+    first = _step(instance_id, "verify", 1)
+    assert first is not None
+    kanban_conn.execute("DELETE FROM tasks WHERE id=?", (first["kanban_task_id"],))
+    kanban_conn.commit()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET blocked_reason=?,kanban_task_id=NULL WHERE "
+            "instance_id=? AND step_id='verify' AND activation=1",
+            ("budget_exhausted:step_activation_cap:verify", instance_id),
+        )
+    release_review_stall(instance_id, "verify", "bootstrap audited capped review retry")
+    apply_events(kanban_conn, profiles=PROFILES)
+    fresh = _step(instance_id, "verify", 2)
+    assert fresh is not None and fresh["state"] == "running"
+
+    kanban_conn.execute("DELETE FROM tasks WHERE id=?", (fresh["kanban_task_id"],))
+    kanban_conn.commit()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=?,kanban_task_id=NULL,"
+            "input_artifact_set_hash=?,input_revision_hash=? WHERE instance_id=? "
+            "AND step_id='verify' AND activation=2",
+            (
+                "budget_exhausted:step_activation_cap:verify",
+                "a" * 64, "b" * 64, instance_id,
+            ),
+        )
+    release_review_stall(instance_id, "verify", "repair same never-dispatched retry")
+    apply_events(kanban_conn, profiles=PROFILES)
+    repaired = _step(instance_id, "verify", 2)
+    assert repaired is not None and repaired["state"] == "ready"
+    assert _step(instance_id, "verify", 3) is None
+
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=? WHERE "
+            "instance_id=? AND step_id='verify' AND activation=2",
+            ("budget_exhausted:step_activation_cap:verify", instance_id),
+        )
+    with pytest.raises(ValueError, match="already applied"):
+        release_review_stall(instance_id, "verify", "third release must fail")
 
 
 def _human_gate_recipe(tmp_path: Path, primitive: str):
