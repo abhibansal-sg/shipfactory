@@ -50,7 +50,12 @@ def _malformed_verdict_reason(reason: Any) -> bool:
 
 
 def _recoverable_review_reason(reason: Any) -> bool:
-    return str(reason or "") in _RECOVERABLE_REVIEW_REASONS or _malformed_verdict_reason(reason)
+    value = str(reason or "")
+    return bool(
+        value in _RECOVERABLE_REVIEW_REASONS
+        or _malformed_verdict_reason(value)
+        or value.startswith("budget_exhausted:step_activation_cap:")
+    )
 
 def advance_key(instance_id: str, recipe_hash: str, step_id: str, activation: int, transition: str, source_id: str) -> str:
     return hashlib.sha256("|".join(map(str, (instance_id, recipe_hash, step_id, activation, transition, source_id))).encode()).hexdigest()
@@ -185,6 +190,18 @@ def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
                      )},
         )
 
+def _operator_review_retry(db: Any, instance: dict[str, Any], step: dict[str, Any]) -> bool:
+    """Recognize the one audited fresh review created by an operator release."""
+    if step["primitive"] != "review_gate" or int(step["activation"]) <= 1:
+        return False
+    return db.execute(
+        "SELECT 1 FROM advance_events WHERE instance_id=? AND state='applied' "
+        "AND outcome='fresh_activation' AND source LIKE 'operator_release:%' "
+        "AND expected_activation=? LIMIT 1",
+        (instance["id"], int(step["activation"]) - 1),
+    ).fetchone() is not None
+
+
 def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any],
            step: dict[str, Any]) -> str | None:
     """Count-only admission guard (finding #77 — token budgets removed).
@@ -198,6 +215,10 @@ def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any],
     """
     budgets = recipe["budgets"]
     v2 = recipe.get("schema") == "shipfactory.recipe/v2"
+    # This activation is governed by the separately bounded operator-release
+    # brake, so it must neither consume nor be rejected by recipe source-run caps.
+    if _operator_review_retry(db, instance, step):
+        return None
     if instance["activation_count"] + 1 > budgets["max_activations"]:
         return "budget_exhausted:max_activations" if v2 else "activation_fuse"
     count = db.execute("SELECT COUNT(*) FROM recipe_steps WHERE instance_id=? AND step_id=? AND primitive IN ('agent_task','review_gate')", (instance["id"], step["step_id"])).fetchone()[0]
@@ -2171,11 +2192,19 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
         raise ValueError("operator release requires a reason")
     with store._connect() as db:
         step = db.execute(
-            "SELECT activation,state,primitive,blocked_reason FROM recipe_steps "
+            "SELECT activation,state,primitive,blocked_reason,kanban_task_id FROM recipe_steps "
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
         worker_release_count = 0
+        budget_admission_repair = False
+        if step is not None and str(step["blocked_reason"] or "").startswith(
+            "budget_exhausted:step_activation_cap:"
+        ):
+            budget_admission_repair = bool(
+                step["kanban_task_id"] is None
+                and _operator_review_retry(db, {"id": instance_id}, dict(step))
+            )
         if step is not None and step["blocked_reason"] == "worker_blocked":
             for prior in db.execute(
                 "SELECT payload_json FROM advance_events WHERE instance_id=? "
@@ -2191,6 +2220,9 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
     if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
             or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
+    if (str(step["blocked_reason"] or "").startswith("budget_exhausted:")
+            and not budget_admission_repair):
+        raise ValueError("review activation-cap repair has no audited operator retry provenance")
     if step["blocked_reason"] == "worker_blocked" and worker_release_count >= 1:
         raise ValueError("worker-blocked review release cap exhausted for this step")
     return enqueue(
@@ -2554,6 +2586,30 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 definition = next(
                     item for item in recipe["steps"] if item["id"] == step["step_id"]
                 )
+                if str(blocked_reason or "").startswith(
+                    "budget_exhausted:step_activation_cap:"
+                ):
+                    # The audited operator retry was created correctly, but the
+                    # ordinary recipe cap parked it before dispatch. Repair that
+                    # same never-dispatched activation; do not mint another retry.
+                    if (step["kanban_task_id"] is not None
+                            or not _operator_review_retry(db, instance, dict(step))):
+                        _finish_event(
+                            db, row, "discarded",
+                            "operator_review_admission_provenance_changed",
+                        )
+                        return
+                    db.execute(
+                        "UPDATE recipe_steps SET state='pending',blocked_reason=NULL,updated_at=? "
+                        "WHERE instance_id=? AND step_id=? AND activation=? AND state='blocked'",
+                        (store._now(), instance["id"], step["step_id"], step["activation"]),
+                    )
+                    db.execute(
+                        "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? "
+                        "WHERE id=?", (store._now(), instance["id"]),
+                    )
+                    _finish_event(db, row, "applied", "operator_review_admission_repaired")
+                    return
                 if _malformed_verdict_reason(blocked_reason) or blocked_reason == "worker_blocked":
                     # The reviewer or its harness, not the producer, failed:
                     # release into one fresh review activation against the SAME

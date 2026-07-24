@@ -128,8 +128,15 @@ def build_review_input_context(
     if change_inputs:
         producer_id = change_inputs[0]["from"]
         change_artifact = artifacts_by_kind.get("change-set")
-        if change_artifact is None or change_artifact["step_id"] != producer_id:
+        if change_artifact is None:
+            if any(item.get("required", False) for item in change_inputs):
+                raise ValueError("review required change-set sealed producer identity is missing")
+            change_inputs = []
+        elif change_artifact["step_id"] != producer_id:
             raise ValueError("review change-set sealed producer identity is missing")
+    if change_inputs:
+        producer_id = change_inputs[0]["from"]
+        change_artifact = artifacts_by_kind["change-set"]
         activation = int(change_artifact["activation"])
         producer_step = db.execute(
             "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",

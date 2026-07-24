@@ -9,13 +9,14 @@ import pytest
 
 from shipfactory import store
 from shipfactory.recipes.advancer import (
+    _admit,
     apply_events,
     event,
     gate_decision,
     reconcile,
     release_review_stall,
 )
-from shipfactory.recipes.instantiate import instantiate
+from shipfactory.recipes.instantiate import instantiate, recipe_for_instance
 from shipfactory.recipes.loader import RecipeError, load_library
 from shipfactory.recipes.selector import (
     RECIPE_SELECTOR_PROMPT,
@@ -350,6 +351,54 @@ def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanba
     apply_events(kanban_conn, profiles=PROFILES)
     fresh = _step(instance_id, "verify", 2)
     assert fresh is not None and fresh["state"] == "running"
+
+    # Remove the synthetic task so the fixture matches the live admission-cap
+    # failure: activation exists, but dispatch never allocated a board task.
+    kanban_conn.execute("DELETE FROM tasks WHERE id=?", (fresh["kanban_task_id"],))
+    kanban_conn.commit()
+
+    # A recipe source-run cap must not consume the separately bounded operator
+    # retry. Simulate the live race where admission parked the fresh activation
+    # before it acquired a board task, then repair that SAME activation.
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=?,kanban_task_id=NULL "
+            "WHERE instance_id=? AND step_id='verify' AND activation=2",
+            ("budget_exhausted:step_activation_cap:verify", instance_id),
+        )
+    repair_key = release_review_stall(
+        instance_id, "verify", "repair audited operator retry admission",
+    )
+    apply_events(kanban_conn, profiles=PROFILES)
+    repaired = _step(instance_id, "verify", 2)
+    assert repaired is not None and repaired["state"] == "pending"
+    assert _step(instance_id, "verify", 3) is None
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT * FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone()
+        recipe = recipe_for_instance(dict(instance), db=db).document
+        assert _admit(db, dict(instance), recipe, repaired) is None
+        repair_audit = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?", (repair_key,),
+        ).fetchone()
+    assert tuple(repair_audit) == ("applied", "operator_review_admission_repaired")
+
+    # A generic capped review with no matching audited fresh-activation event
+    # cannot use the repair surface.
+    with store._connect() as db:
+        db.execute(
+            "DELETE FROM advance_events WHERE instance_id=? "
+            "AND source LIKE 'operator_release:%' AND outcome='fresh_activation'",
+            (instance_id,),
+        )
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason=? "
+            "WHERE instance_id=? AND step_id='verify' AND activation=2",
+            ("budget_exhausted:step_activation_cap:verify", instance_id),
+        )
+    with pytest.raises(ValueError, match="no audited operator retry provenance"):
+        release_review_stall(instance_id, "verify", "unbound cap repair")
 
     with store._connect() as db:
         db.execute(

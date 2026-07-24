@@ -830,12 +830,23 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   into a fresh review activation against the same sealed inputs. A second
   worker-blocked release for that step fails closed; neither release can approve
   the gate or reopen source work.
+- The separately bounded operator review retry must not be rejected by the
+  ordinary source-work activation budget. Fix (finding #108, SF-20): admission
+  recognizes only the fresh review activation created by an applied audited
+  operator-release event and does not charge it to recipe source-run caps. If an
+  older runtime already parked that never-dispatched activation at the cap, one
+  audited repair reopens that same activation; no new retry is minted. Missing
+  provenance or an existing board task fails closed.
+- Optional review inputs preserve their declared semantics. Fix (finding #109):
+  an absent optional `change-set` does not invalidate an evidence-only review;
+  an absent required change-set still fails closed, and any present change-set
+  remains bound to its exact sealed producer activation/run/workspace.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#107 so far). When you fix one: commit message
+- Findings get numbers (#22–#109 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
