@@ -2090,11 +2090,21 @@ def retry_verification(
             )
             and _same_revision_case_contradiction(db, latest_bundle)
         )
-        if not abandon_rework and not contradiction_retry:
-            raise ValueError(
-                "latest state is neither a blocked verification rework nor an "
-                "identical-input verification contradiction"
+        failed_recheck_base = bool(
+            verify_step["state"] == "blocked"
+            and latest_producer is not None
+            and int(latest_producer["activation"]) > int(producer_activation)
+            and latest_producer["state"] == "skipped"
+            and str(latest_producer["blocked_reason"] or "").startswith(
+                "verification_retry_abandoned:"
             )
+            and latest_bundle is not None
+            and latest_bundle["state"] == "blocked"
+            and latest_bundle["invalid_reason"] in {
+                "test_failed", "protected_baseline_test_failed",
+            }
+            and bool(latest_bundle["bundle_sha256"])
+        )
         prior_retries = 0
         for event_row in db.execute(
             "SELECT payload_json FROM advance_events WHERE instance_id=? "
@@ -2109,10 +2119,23 @@ def retry_verification(
                     and int(prior_payload.get("producer_activation", -1))
                     == int(producer_activation)):
                 prior_retries += 1
-        # One no-op recovery plus four contradiction reruns is the hard brake.
+        # The fifth and final event may be an explicit environment-remediation
+        # recheck. It still cannot advance without an entirely green sealed run.
+        environment_recheck = bool(
+            failed_recheck_base and not contradiction_retry and prior_retries == 4
+        )
+        if not abandon_rework and not contradiction_retry and not environment_recheck:
+            raise ValueError(
+                "latest state is neither a blocked verification rework, an "
+                "identical-input contradiction, nor the final bounded environment recheck"
+            )
         if prior_retries >= 5:
             raise ValueError("verification retry cap exhausted for this sealed producer")
-        mode = "contradiction" if contradiction_retry else "abandon_rework"
+        mode = (
+            "contradiction" if contradiction_retry
+            else "environment_recheck" if environment_recheck
+            else "abandon_rework"
+        )
         payload = {
             "step_id": step_id,
             "producer_step": producer_step,
@@ -2124,7 +2147,8 @@ def retry_verification(
             "mode": mode,
             "reason": reason,
         }
-        if contradiction_retry:
+        if contradiction_retry or environment_recheck:
+            assert latest_bundle is not None
             payload.update({
                 "contradiction_bundle_id": latest_bundle["id"],
                 "contradiction_bundle_sha256": latest_bundle["bundle_sha256"],
@@ -2405,7 +2429,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         and latest_producer["state"] == "blocked"
                         and latest_producer["rejected_by_step_id"] == step["step_id"]
                     )
-                elif mode == "contradiction":
+                elif mode in {"contradiction", "environment_recheck"}:
                     contradiction_bundle = db.execute(
                         "SELECT * FROM evidence_bundles WHERE id=? AND instance_id=? "
                         "AND step_id=? AND activation=? AND bundle_sha256=?",
@@ -2435,8 +2459,20 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         and str(latest_producer["blocked_reason"] or "").startswith(
                             "verification_retry_abandoned:"
                         )
-                        and applied_retries in {1, 2, 3, 4}
-                        and _same_revision_case_contradiction(db, contradiction_bundle)
+                        and (
+                            (mode == "contradiction"
+                             and applied_retries in {1, 2, 3, 4}
+                             and _same_revision_case_contradiction(
+                                 db, contradiction_bundle,
+                             ))
+                            or (mode == "environment_recheck"
+                                and applied_retries == 4
+                                and contradiction_bundle is not None
+                                and contradiction_bundle["state"] == "blocked"
+                                and contradiction_bundle["invalid_reason"] in {
+                                    "test_failed", "protected_baseline_test_failed",
+                                })
+                        )
                     )
                 valid = (
                     step is not None and definition is not None
@@ -2476,11 +2512,14 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         )
                     outcome = "verification_retry_scheduled"
                 else:
+                    retry_kind = (
+                        "environment" if mode == "environment_recheck" else "contradiction"
+                    )
                     _fresh_activation(
                         db, instance, definition, step_dict,
-                        f"verification_contradiction_retry:{row['key']}",
+                        f"verification_{retry_kind}_retry:{row['key']}",
                     )
-                    outcome = "verification_retry_contradiction_scheduled"
+                    outcome = f"verification_retry_{retry_kind}_scheduled"
                 db.execute(
                     "UPDATE recipe_instances SET status='running',blocked_reason=NULL,updated_at=? "
                     "WHERE id=?", (store._now(), instance["id"]),

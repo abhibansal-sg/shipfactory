@@ -945,6 +945,56 @@ def test_finding_99_operator_retry_reuses_exact_sealed_producer_without_llm_rebu
         ).fetchone()
         assert advancer._same_revision_case_contradiction(db, reverse_bundle)
 
+    # After four applied retries, exactly one final environment-remediation
+    # recheck may rerun a failed sealed bundle without pretending it passed.
+    for index in (3, 4):
+        synthetic = advancer.enqueue(
+            "f99", "verification_retry",
+            {"producer_step": "build", "producer_activation": 1, "synthetic": index},
+            key=f"f99-synthetic-retry-{index}",
+        )
+        with store._connect() as db:
+            db.execute(
+                "UPDATE advance_events SET state='applied',outcome='historical_retry' "
+                "WHERE key=?", (synthetic,),
+            )
+    now = store._now()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE recipe_steps SET state='blocked',blocked_reason='test_failed',updated_at=? "
+            "WHERE instance_id='f99' AND step_id='verify' AND activation=3", (now,),
+        )
+        db.execute(
+            "INSERT INTO evidence_bundles(id,instance_id,step_id,activation,input_revision_hash,"
+            "base_sha,head_sha,tree_sha,environment_session_id,manifest_relpath,manifest_blob_sha,"
+            "state,bundle_sha256,redaction_state,created_at,sealed_at,invalid_reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("bundle-f99-environment", "f99", "verify", 3, "rev-env", "b" * 40,
+             "b" * 40, "b" * 40, "env-f99", ".shipfactory/verification.yaml",
+             "manifest-f99", "blocked", "bundle-sha-environment", "clean", now, now,
+             "test_failed"),
+        )
+    environment_key = advancer.retry_verification(
+        "f99", "verify", producer_step="build", producer_activation=1,
+        reason="candidate HERMES_HOME was isolated after the sealed environment failure",
+    )
+    with store._connect() as db:
+        queued = db.execute(
+            "SELECT payload_json FROM advance_events WHERE key=?", (environment_key,),
+        ).fetchone()
+    assert json.loads(queued["payload_json"])["mode"] == "environment_recheck"
+    claimed = advancer._claim_event(owner="test-f99-environment", board="test")
+    assert claimed and claimed["key"] == environment_key
+    advancer._apply_claimed_event(kanban_conn, claimed)
+    assert (_step("f99", "verify")["activation"], _step("f99", "verify")["state"]) == (4, "pending")
+    with store._connect() as db:
+        applied = db.execute(
+            "SELECT state,outcome FROM advance_events WHERE key=?", (environment_key,),
+        ).fetchone()
+    assert (applied["state"], applied["outcome"]) == (
+        "applied", "verification_retry_environment_scheduled",
+    )
+
 
 def test_finding_97_recipe_worktree_aligns_to_instance_base(tmp_path):
     """A recipe task's worktree cut from live HEAD is detached onto the

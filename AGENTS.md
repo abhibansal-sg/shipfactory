@@ -770,8 +770,9 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   (finding #100, SF-20): scan at 50ms (still well inside detached-descendant
   cleanup windows), and recognize only cryptographically/auditably identical
   candidate/protected contradictions as infrastructure evidence. The same
-  enqueue-only operator surface has a hard brake of one no-op recovery plus at
-  most four machine-only contradiction retries; every rerun gets a fresh
+  enqueue-only operator surface has a hard brake of one no-op recovery, at most
+  three identical-input contradiction retries, and one final explicitly
+  audited environment-remediation recheck; every rerun gets a fresh
   verification activation. Failed sealed bundles remain immutable, source is
   never rebuilt, and no approval can advance without a wholly green rerun.
 - Reducing the expensive full-process environ sweep from 10ms to 50ms was not
@@ -800,12 +801,21 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   Fix (finding #103, SF-20): set both `HOME` and `HERMES_HOME` in the child env
   to the bundle-scoped verification-runner home. Evidence stays in the trusted
   parent; tests and nested Hermes imports get an isolated control database.
+- A control-plane environment fix can leave the latest sealed bundle with a
+  single `test_failed` case and no candidate/protected contradiction pair. That
+  is not permission to reinterpret the failure, but it must not force source
+  churn either. Fix (finding #104, SF-20): after four already-applied audited
+  retries, allow exactly one final `environment_recheck` event for the same
+  canonical sealed producer. Enqueue and apply both revalidate the failed
+  sealed bundle, exact producer run/artifact, skipped no-op rework, retry count,
+  and current blocked activation. It only creates a fresh machine-verification
+  activation; it cannot mutate evidence, mark a case passed, or approve a gate.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#103 so far). When you fix one: commit message
+- Findings get numbers (#22–#104 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
