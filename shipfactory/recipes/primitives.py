@@ -129,15 +129,19 @@ def build_review_input_context(
     ]
     if change_inputs:
         producer_id = change_inputs[0]["from"]
+        change_artifact = artifacts_by_kind.get("change-set")
+        if (change_artifact is None or change_artifact["step_id"] != producer_id
+                or change_artifact["run_id"] is None):
+            raise ValueError("review change-set sealed producer identity is missing")
+        activation = int(change_artifact["activation"])
         producer_step = db.execute(
-            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? "
-            "ORDER BY activation DESC LIMIT 1",
-            (instance["id"], producer_id),
+            "SELECT * FROM recipe_steps WHERE instance_id=? AND step_id=? AND activation=?",
+            (instance["id"], producer_id, activation),
         ).fetchone()
         if (producer_step is None or not producer_step["kanban_task_id"]
-                or producer_step["producer_run_id"] is None):
+                or producer_step["producer_run_id"] is None
+                or int(producer_step["producer_run_id"]) != int(change_artifact["run_id"])):
             raise ValueError("review change-set exact producer task/run identity is missing")
-        activation = int(producer_step["activation"])
         run_id = int(producer_step["producer_run_id"])
         run_row = db.execute(
             "SELECT * FROM runs WHERE id=? AND task_id=? AND recipe_activation=?",

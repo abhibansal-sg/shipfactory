@@ -810,12 +810,20 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   sealed bundle, exact producer run/artifact, skipped no-op rework, retry count,
   and current blocked activation. It only creates a fresh machine-verification
   activation; it cannot mutate evidence, mark a case passed, or approve a gate.
+- Every downstream consumer of a `change-set` must resolve its producer from the
+  sealed artifact's `(step_id, activation, run_id)`, never from the latest step
+  row. After verification-only recovery, the latest build activation is the
+  truthfully skipped no-op while the canonical artifact still belongs to
+  build/2. Fix (finding #105, SF-20): review input assembly now binds its exact
+  diff/workspace to the sealed change-set artifact's producer activation and
+  run, matching verifier workspace and verdict binding. A missing/mismatched
+  exact producer fails closed rather than falling through to the skipped row.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#104 so far). When you fix one: commit message
+- Findings get numbers (#22–#105 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
