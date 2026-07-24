@@ -16,7 +16,7 @@ import yaml
 
 from shipfactory.artifacts import ArtifactValidationError, _validate_document
 from shipfactory.artifact_contracts import artifact_output_contract
-from shipfactory.recipes.loader import RecipeError, load_library, validate
+from shipfactory.recipes.loader import RecipeError, bind_parameters, load_library, validate
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,7 +93,7 @@ def test_creative_recipe_topology_artifacts_and_human_gate():
     assert [step["id"] for step in steps] == ["research", "treatment", "styleframes", "motion-build", "machine-verify", "vision-review", "adversarial-review", "master", "approval", "notify"]
     assert len([step for step in steps if step["id"] == "motion-build"]) == 1
     by_id = {step["id"]: step for step in steps}
-    assert by_id["approval"]["primitive"] == "approval_gate" and by_id["approval"]["params"]["approvers"] == ["operator"]
+    assert by_id["approval"]["primitive"] == "approval_gate" and by_id["approval"]["params"]["approvers"] == ["${operator_approver}"]
     assert by_id["notify"]["needs"] == ["approval"] and by_id["notify"]["params"]["target"] == "${notify_target}"
     assert {item["kind"] for step in steps for item in step["outputs"]} >= {"reference-study", "treatment", "styleframes", "scene-manifest", "draft-media", "qc-report", "contact-sheet", "vision-verdict", "video-review-story", "master-media"}
     invalid = copy.deepcopy(recipe); invalid["steps"][-2]["primitive"] = "agent_task"
@@ -124,8 +124,21 @@ def test_ratified_seat_model_policy_and_bounded_review_targets():
         if step["id"] not in expected: continue
         seat, executor, model, effort = expected[step["id"]]
         instructions = step["params"]["instructions"]
-        assert step["params"]["seat"] == seat
+        parameter = step["params"]["seat"][2:-1]
+        policy = _recipe()["parameters"][parameter]
+        assert policy == {"type": "enum", "required": False, "default": seat, "values": [seat]}
         assert f"{executor} / {model} / {effort}" in instructions
+    bound = bind_parameters(
+        load_library(ROOT / "recipes", persist=False).get("creative-video@1"),
+        {"brief": "fixture"},
+    )
+    assert bound["motion_designer_seat"] == "video-motion-designer"
+    assert bound["operator_approver"] == "operator"
+    with pytest.raises(RecipeError, match="wrong type"):
+        bind_parameters(
+            load_library(ROOT / "recipes", persist=False).get("creative-video@1"),
+            {"brief": "fixture", "motion_designer_seat": "fallback"},
+        )
     vision = next(step for step in _recipe()["steps"] if step["id"] == "vision-review")
     assert "only upstream styleframes or motion-build" in vision["params"]["instructions"]
 

@@ -10,6 +10,19 @@ parameters:
   brief: {type: string, required: true, default: null}
   reference_inputs: {type: string, required: false, default: null}
   notify_target: {type: string, required: false, default: telegram:Abhinav}
+  # The loader may inspect a published library before the operator-managed
+  # video seats are present in a test or a different profile.  These closed
+  # enum bindings keep that inspection independent of live seats.yaml while
+  # making every rendered seat immutable policy, never a caller fallback.
+  research_seat: {type: enum, required: false, default: video-researcher, values: [video-researcher]}
+  creative_director_seat: {type: enum, required: false, default: video-creative-director, values: [video-creative-director]}
+  styleframe_designer_seat: {type: enum, required: false, default: video-styleframe-designer, values: [video-styleframe-designer]}
+  motion_designer_seat: {type: enum, required: false, default: video-motion-designer, values: [video-motion-designer]}
+  machine_verifier_seat: {type: enum, required: false, default: video-machine-verifier, values: [video-machine-verifier]}
+  vision_reviewer_seat: {type: enum, required: false, default: video-vision-reviewer, values: [video-vision-reviewer]}
+  adversarial_reviewer_seat: {type: enum, required: false, default: video-adversarial-reviewer, values: [video-adversarial-reviewer]}
+  render_engineer_seat: {type: enum, required: false, default: video-render-engineer, values: [video-render-engineer]}
+  operator_approver: {type: enum, required: false, default: operator, values: [operator]}
 budgets:
   max_activations: 12
   step_activation_caps:
@@ -31,7 +44,7 @@ steps:
     outputs:
       - {kind: reference-study, schema: shipfactory.reference-study/v1, path: .shipfactory-output/reference-study.json}
     params:
-      seat: video-researcher
+      seat: "${research_seat}"
       instructions: |
         Research ${brief} using ${reference_inputs}. Policy binding: codex / gpt-5.6-terra / medium.
         Produce the reference-study handoff only; record local/rights-safe reference observations.
@@ -49,7 +62,7 @@ steps:
     outputs:
       - {kind: treatment, schema: shipfactory.treatment/v1, path: .shipfactory-output/treatment.json}
     params:
-      seat: video-creative-director
+      seat: "${creative_director_seat}"
       instructions: |
         Turn the sealed research into a timed treatment. Policy binding: codex / gpt-5.6-sol / high; no fallback.
         Declare intended scene rhythm, visual language, and local-asset constraints.
@@ -67,7 +80,7 @@ steps:
     outputs:
       - {kind: styleframes, schema: shipfactory.styleframes/v1, path: .shipfactory-output/styleframes.json}
     params:
-      seat: video-styleframe-designer
+      seat: "${styleframe_designer_seat}"
       instructions: |
         Produce square styleframes bound to the treatment. Policy binding: codex / gpt-5.6-sol / high; no fallback.
       execution_profile: build
@@ -86,7 +99,7 @@ steps:
       - {kind: scene-manifest, schema: shipfactory.scene-manifest/v1, path: .shipfactory-output/scene-manifest.json}
       - {kind: draft-media, schema: shipfactory.draft-media/v1, path: .shipfactory-output/draft-media.json}
     params:
-      seat: video-motion-designer
+      seat: "${motion_designer_seat}"
       instructions: |
         Build the draft with procedural-video. Policy binding: codex / gpt-5.6-sol / high; no fallback.
         Render all scene fan-out inside this one worker; never create a top-level card per scene.
@@ -107,7 +120,7 @@ steps:
       - {kind: qc-report, schema: shipfactory.qc-report/v1, path: .shipfactory-output/qc-report.json}
       - {kind: contact-sheet, schema: shipfactory.contact-sheet/v1, path: .shipfactory-output/contact-sheet.json}
     params:
-      seat: video-machine-verifier
+      seat: "${machine_verifier_seat}"
       instructions: |
         Run deterministic procedural-video QC: frame diffs, duplicates, contact sheets, and FFprobe. Policy binding: codex / gpt-5.6-luna / medium.
         Do not perform subjective approval; emit only hash-bound QC and contact-sheet descriptors.
@@ -128,7 +141,7 @@ steps:
     outputs:
       - {kind: vision-verdict, schema: shipfactory.vision-verdict/v1, path: .shipfactory-output/vision-verdict.json}
     params:
-      seat: video-vision-reviewer
+      seat: "${vision_reviewer_seat}"
       instructions: |
         Review sealed styleframes, draft, QC, and contact sheet. Policy binding: codex / gpt-5.6-sol / high; no fallback.
         A rework verdict may target only upstream styleframes or motion-build, never this review, verification, or a downstream step.
@@ -150,7 +163,7 @@ steps:
     outputs:
       - {kind: video-review-story, schema: shipfactory.video-review-story/v1, path: .shipfactory-output/video-review-story.json}
     params:
-      seat: video-adversarial-reviewer
+      seat: "${adversarial_reviewer_seat}"
       instructions: |
         Independently audit sealed draft, QC, and vision evidence. Policy binding: claude / claude-opus-4-8 / high.
         This is the required cross-provider final correctness/evidence review. Rework may target only upstream motion-build.
@@ -171,7 +184,7 @@ steps:
     outputs:
       - {kind: master-media, schema: shipfactory.master-media/v1, path: .shipfactory-output/master-media.json}
     params:
-      seat: video-render-engineer
+      seat: "${render_engineer_seat}"
       instructions: |
         Produce the picture-locked FFmpeg master and media descriptor from the reviewed draft. Policy binding: codex / gpt-5.6-terra / high.
       execution_profile: build
@@ -188,7 +201,7 @@ steps:
       - {from: adversarial-review, kind: video-review-story, required: true}
     outputs: []
     params:
-      approvers: [operator]
+      approvers: ["${operator_approver}"]
       instructions: Human operator approval only. Agents must never approve, release, or notify this gate.
   - id: notify
     primitive: notify
