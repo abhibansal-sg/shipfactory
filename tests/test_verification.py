@@ -565,6 +565,19 @@ def test_runner_env_grants_the_trusted_browser_cache(monkeypatch, tmp_path):
     assert child_env["PLAYWRIGHT_BROWSERS_PATH"] == str(cache)
 
 
+def test_candidate_env_isolates_hermes_control_home(tmp_path):
+    """Finding #103: candidate tests never touch the live Factory SQLite home."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env = verify._minimal_case_env(workspace, {"env": {}}, "bundle-isolated")
+    assert env["HERMES_HOME"] == env["HOME"]
+    assert "bundle-isolated" in env["HERMES_HOME"]
+    with pytest.raises(verify.VerificationManifestError, match="HERMES_HOME"):
+        verify._minimal_case_env(
+            workspace, {"env": {"HERMES_HOME": "/tmp/live-control"}}, "bundle-bad",
+        )
+
+
 def test_evidence_item_read_retries_transient_oserror(tmp_path, monkeypatch):
     """finding #82: a momentary OSError on an item read is retried, not fatal."""
     real = tmp_path / "item.log"

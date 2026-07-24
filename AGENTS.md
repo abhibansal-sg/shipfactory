@@ -771,7 +771,7 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   cleanup windows), and recognize only cryptographically/auditably identical
   candidate/protected contradictions as infrastructure evidence. The same
   enqueue-only operator surface has a hard brake of one no-op recovery plus at
-  most three machine-only contradiction retries; every rerun gets a fresh
+  most four machine-only contradiction retries; every rerun gets a fresh
   verification activation. Failed sealed bundles remain immutable, source is
   never rebuilt, and no approval can advance without a wholly green rerun.
 - Reducing the expensive full-process environ sweep from 10ms to 50ms was not
@@ -791,12 +791,21 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   blob hash, and raw manifest bytes are all identical, execute the candidate
   surface once and seal that one case set. Different revisions/manifests still
   run independently and protected failures still override candidate success.
+- Verification commands must not inherit the production `HERMES_HOME`. The
+  trusted parent persists evidence to the live Factory database, but the child
+  pytest process is untrusted candidate execution: sharing the control home
+  made repository tests contend with the live daemon's SQLite writer, and a
+  test that monkeypatched `time.sleep` accidentally intercepted store lock
+  backoff, consuming its own sentinel sleeps and failing nondeterministically.
+  Fix (finding #103, SF-20): set both `HOME` and `HERMES_HOME` in the child env
+  to the bundle-scoped verification-runner home. Evidence stays in the trusted
+  parent; tests and nested Hermes imports get an isolated control database.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#102 so far). When you fix one: commit message
+- Findings get numbers (#22–#103 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.

@@ -753,10 +753,13 @@ def _minimal_case_env(
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
+        # Candidate code and nested Hermes imports get a bundle-scoped control
+        # home; they must never contend with or mutate the live Factory DB.
+        "HERMES_HOME": str(home),
     }
     for key, value in (profile.get("env", {}) or {}).items():
         if (not isinstance(key, str) or not key or "=" in key or "\x00" in key
-                or key == "HOME" or key.startswith("SHIPFACTORY_")
+                or key in {"HOME", "HERMES_HOME"} or key.startswith("SHIPFACTORY_")
                 or not isinstance(value, str) or "\x00" in value):
             raise VerificationManifestError(
                 f"verification profile env contains unsafe variable {key!r}"
@@ -772,6 +775,8 @@ def _runner_env(bundle_id: str) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
+        # The trusted runner owns evidence persistence and therefore stays on
+        # the live Factory control home. Only candidate commands are isolated.
         "HERMES_HOME": str(store._db_path().parent.parent),
     }
     python_paths = [str(Path(__file__).resolve().parent.parent)]

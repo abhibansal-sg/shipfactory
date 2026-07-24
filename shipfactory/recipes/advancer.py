@@ -2109,8 +2109,8 @@ def retry_verification(
                     and int(prior_payload.get("producer_activation", -1))
                     == int(producer_activation)):
                 prior_retries += 1
-        # One no-op recovery plus three contradiction reruns is the hard brake.
-        if prior_retries >= 4:
+        # One no-op recovery plus four contradiction reruns is the hard brake.
+        if prior_retries >= 5:
             raise ValueError("verification retry cap exhausted for this sealed producer")
         mode = "contradiction" if contradiction_retry else "abandon_rework"
         payload = {
@@ -2435,7 +2435,7 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                         and str(latest_producer["blocked_reason"] or "").startswith(
                             "verification_retry_abandoned:"
                         )
-                        and applied_retries in {1, 2, 3}
+                        and applied_retries in {1, 2, 3, 4}
                         and _same_revision_case_contradiction(db, contradiction_bundle)
                     )
                 valid = (
