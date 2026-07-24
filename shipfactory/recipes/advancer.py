@@ -192,7 +192,7 @@ def plan_worker_transition(*, run_id: int, task_id: str, board: str | None,
 
 def _operator_review_retry(db: Any, instance: dict[str, Any], step: dict[str, Any]) -> bool:
     """Recognize the one audited fresh review created by an operator release."""
-    if step["primitive"] != "review_gate" or int(step["activation"]) <= 1:
+    if step["primitive"] not in {"review_gate", "agent_task"} or int(step["activation"]) <= 1:
         return False
     return db.execute(
         "SELECT 1 FROM advance_events WHERE instance_id=? AND state='applied' "
@@ -2243,7 +2243,16 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
                 "AND expected_activation=?",
                 (instance_id, int(step["activation"])),
             ).fetchone()[0])
-    if (not step or step["primitive"] != "review_gate" or step["state"] != "blocked"
+    cap_block = bool(step and str(step["blocked_reason"] or "").startswith(
+        "budget_exhausted:step_activation_cap:"
+    ))
+    primitive_allowed = bool(
+        step and (
+            step["primitive"] == "review_gate"
+            or (step["primitive"] == "agent_task" and cap_block)
+        )
+    )
+    if (not step or not primitive_allowed or step["state"] != "blocked"
             or not _recoverable_review_reason(step["blocked_reason"])):
         raise ValueError("review step is not parked for operator-recoverable review block")
     if (str(step["blocked_reason"] or "").startswith("budget_exhausted:")
@@ -2605,7 +2614,14 @@ def _apply_claimed_event(conn: Any, row: dict[str, Any]) -> None:
                 if step is None:
                     _finish_event(db, row, "discarded", "stale_or_nonmatching_activation")
                     return
-                if (step["primitive"] != "review_gate" or step["state"] != "blocked"
+                cap_block = str(step["blocked_reason"] or "").startswith(
+                    "budget_exhausted:step_activation_cap:"
+                )
+                primitive_allowed = (
+                    step["primitive"] == "review_gate"
+                    or (step["primitive"] == "agent_task" and cap_block)
+                )
+                if (not primitive_allowed or step["state"] != "blocked"
                         or not _recoverable_review_reason(step["blocked_reason"])):
                     _finish_event(db, row, "discarded", "review_gate_not_recoverable")
                     return

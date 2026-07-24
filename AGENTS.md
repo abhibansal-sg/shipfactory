@@ -851,12 +851,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   may only repair that same taskless, hash-bound activation once. Fix (finding
   #111, SF-20): count all prior per-step operator releases and per-activation
   admission repairs, so the recovery cannot become a reusable budget bypass.
+- The same one-use cap recovery also applies to a taskless downstream
+  `agent_task` parked solely by its step-activation cap (finding #112, SF-20).
+  It does not release worker failures or malformed output from agent tasks, and
+  still creates a fresh audited activation rather than changing completion.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#111 so far). When you fix one: commit message
+- Findings get numbers (#22–#112 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
