@@ -434,6 +434,44 @@ def test_factory_commit_stages_validated_paths_without_touching_ignored_output_r
     assert ignored.read_text(encoding="utf-8") == "not source\n"
 
 
+def test_factory_change_set_finalizes_rework_from_instance_pivot_base(
+    tmp_path, kanban_conn,
+):
+    """A stale-but-lineage-valid plan commits rework on the advanced base."""
+    instance_id = "factory-rework-pivot"
+    repo, plan_base, run_id, output, inputs = _dirty_finalizer_case(
+        tmp_path, kanban_conn, instance_id,
+    )
+    subprocess.run(
+        ["git", "reset", "--hard", plan_base], cwd=repo, check=True, capture_output=True,
+    )
+    (repo / "src" / "app.py").write_text("value = 20\n", encoding="utf-8")
+    pivot = _commit(repo, "prior sealed build")
+    now = store._now()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO artifacts(id,instance_id,step_id,activation,run_id,kind,"
+            "schema_version,state,producer,base_sha,head_sha,repo_tree_sha,created_at,sealed_at) "
+            "VALUES(?,?, 'prior-build',1,999,'change-set',1,'sealed','test',?,?,?,?,?)",
+            (
+                artifacts.artifact_id(instance_id, "prior-build", 1, "change-set"),
+                instance_id, plan_base, pivot,
+                _git(repo, "rev-parse", f"{pivot}^{{tree}}"), now, now,
+            ),
+        )
+        db.execute(
+            "UPDATE recipe_instances SET base_sha=?,updated_base_at=? WHERE id=?",
+            (pivot, now, instance_id),
+        )
+    (repo / "src" / "app.py").write_text("value = 21\n", encoding="utf-8")
+
+    document = _finalize_dirty_case(repo, instance_id, run_id, output, inputs)
+
+    assert document["base_sha"] == pivot
+    assert document["head_sha"] == _git(repo, "rev-parse", "HEAD")
+    assert _git(repo, "rev-parse", "HEAD^") == pivot
+
+
 def test_factory_change_set_finalize_is_idempotent_after_commit_before_manifest(
     tmp_path, kanban_conn,
 ):

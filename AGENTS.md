@@ -717,6 +717,14 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   pivots. Together these unblock the entire build-rework path (review- and
   verification-triggered), which had deadlocked at sealing on its first two
   real exercises (dashboard-r2 post-commit mutation, r3 plan-base mismatch).
+- Canonical finalization must use the instance's advanced base, not the sealed
+  plan's original base, after a lineage-valid rework pivot. Input validation
+  already accepted the old plan through `base_reaches`, but the finalizer still
+  compared `HEAD` with `plan.base_sha`; a correctly aligned rework worktree was
+  therefore misclassified as a prior Factory commit with post-commit source
+  mutations. Resolve and authenticate the current instance base, require the
+  plan base to reach it through this instance's sealed change-set chain, and
+  create the new Factory commit on that pivot (finding #98, SF-20 first rework).
 - A test_failed verification routes a production-rework cone back to the
   change-set producer (finding #95) instead of parking. It mirrors a review
   request_changes: `_verification_rework_target` picks the verification

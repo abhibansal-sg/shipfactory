@@ -1109,7 +1109,18 @@ def finalize_change_set_for_task(
         if item.get("kind") == "task-spec":
             forbidden_paths.extend(artifact_document(item).get("forbidden_paths", []))
 
-    base = _git(worktree, "rev-parse", f"{plan['base_sha']}^{{commit}}")
+    plan_base = _git(worktree, "rev-parse", f"{plan['base_sha']}^{{commit}}")
+    with store._connect() as db:
+        instance = db.execute(
+            "SELECT base_sha FROM recipe_instances WHERE id=?", (instance_id,),
+        ).fetchone()
+        if instance is None or not instance["base_sha"]:
+            raise ArtifactValidationError("change-set instance base is missing")
+        base = _git(worktree, "rev-parse", f"{instance['base_sha']}^{{commit}}")
+        if plan_base != base and not base_reaches(db, instance_id, plan_base, base):
+            raise ArtifactValidationError(
+                "change-set approved plan base differs from instance base"
+            )
     head = _git(worktree, "rev-parse", "HEAD^{commit}")
     message = _factory_commit_message(instance_id, step_id, activation)
     timestamp = _factory_commit_timestamp(ownership["started_at"])
