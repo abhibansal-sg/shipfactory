@@ -10,6 +10,7 @@ import pytest
 from shipfactory import store
 from shipfactory.recipes.advancer import (
     _admit,
+    _operator_review_retry,
     apply_events,
     event,
     gate_decision,
@@ -351,6 +352,28 @@ def test_worker_blocked_review_gets_one_audited_fresh_activation(tmp_path, kanba
     apply_events(kanban_conn, profiles=PROFILES)
     fresh = _step(instance_id, "verify", 2)
     assert fresh is not None and fresh["state"] == "running"
+
+    # Provenance is step-scoped. An operator release for another review step
+    # at the same activation must not grant this step a budget exemption.
+    with store._connect() as db:
+        event_row = db.execute(
+            "SELECT key,payload_json FROM advance_events WHERE instance_id=? "
+            "AND source='operator_release' AND state='applied'",
+            (instance_id,),
+        ).fetchone()
+        assert event_row is not None
+        original_payload = event_row["payload_json"]
+        payload = json.loads(original_payload)
+        payload["step_id"] = "other-review"
+        db.execute(
+            "UPDATE advance_events SET payload_json=? WHERE key=?",
+            (json.dumps(payload, sort_keys=True), event_row["key"]),
+        )
+        assert not _operator_review_retry(db, {"id": instance_id}, fresh)
+        db.execute(
+            "UPDATE advance_events SET payload_json=? WHERE key=?",
+            (original_payload, event_row["key"]),
+        )
 
     # Remove the synthetic task so the fixture matches the live admission-cap
     # failure: activation exists, but dispatch never allocated a board task.

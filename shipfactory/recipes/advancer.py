@@ -194,12 +194,23 @@ def _operator_review_retry(db: Any, instance: dict[str, Any], step: dict[str, An
     """Recognize the one audited fresh review created by an operator release."""
     if step["primitive"] not in {"review_gate", "agent_task"} or int(step["activation"]) <= 1:
         return False
-    return db.execute(
-        "SELECT 1 FROM advance_events WHERE instance_id=? AND state='applied' "
-        "AND outcome='fresh_activation' AND source LIKE 'operator_release:%' "
-        "AND expected_activation=? LIMIT 1",
+    rows = db.execute(
+        "SELECT parent.payload_json FROM advance_events child "
+        "JOIN advance_events parent ON child.source=('operator_release:' || parent.key) "
+        "WHERE child.instance_id=? AND child.state='applied' "
+        "AND child.outcome='fresh_activation' AND child.expected_activation=? "
+        "AND parent.instance_id=child.instance_id AND parent.source='operator_release' "
+        "AND parent.state='applied' AND parent.expected_activation=child.expected_activation",
         (instance["id"], int(step["activation"]) - 1),
-    ).fetchone() is not None
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("step_id") == step["step_id"]:
+            return True
+    return False
 
 
 def _admit(db: Any, instance: dict[str, Any], recipe: dict[str, Any],
@@ -2210,7 +2221,7 @@ def release_review_stall(instance_id: str, step_id: str, reason: str) -> str:
         raise ValueError("operator release requires a reason")
     with store._connect() as db:
         step = db.execute(
-            "SELECT activation,state,primitive,blocked_reason,kanban_task_id FROM recipe_steps "
+            "SELECT step_id,activation,state,primitive,blocked_reason,kanban_task_id FROM recipe_steps "
             "WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()

@@ -872,12 +872,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   trusted-runtime remediation retry. Review gates remain capped at one. The
   daemon must export the trusted current ShipFactory source root before any
   candidate workspace so spawned harnesses cannot import stale control code.
+- Operator-review retry provenance is step-scoped (finding #117, SF-20): the
+  internal fresh-activation event must join back to its exact applied outer
+  operator-release event by event key, and that outer payload's `step_id` must
+  match. Instance and activation equality alone can collide across review steps.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#116 so far). When you fix one: commit message
+- Findings get numbers (#22–#117 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
