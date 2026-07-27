@@ -496,10 +496,17 @@ def test_run_action_rejects_live_app_reporting_stale_instance_and_head(tmp_path)
 # §2.4.10 #5 -- tests skip/deselect everything and exit zero.
 # ---------------------------------------------------------------------------
 
-def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_closed(tmp_path):
+def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_closed(
+    tmp_path, monkeypatch,
+):
+    # This oracle is about fabricated pytest evidence.  Keep the production
+    # ancestry watcher active, but fence the unrelated host-wide environ
+    # sweep so another ambient process cannot win the supervision race first.
+    import psutil
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: [])
     fake_pytest = tmp_path / "pytest"
     fake_pytest.write_text(
-        "#!/usr/bin/env python3\nprint('125 passed in 0.01s')\n",
+        f"#!{sys.executable}\nprint('125 passed in 0.01s')\n",
         encoding="utf-8",
     )
     fake_pytest.chmod(0o755)
@@ -512,6 +519,49 @@ def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_c
     bundle = _run(repo, head, tree, manifest)
     assert bundle["state"] == "blocked"
     assert bundle["invalid_reason"] == "test_failed"
+
+
+def test_production_path_environ_runtimeerror_fails_closed_as_test_infrastructure_error(
+    tmp_path, monkeypatch,
+):
+    """A live supervised leader with an unreadable scope remains infrastructure."""
+    import psutil
+
+    leader_pid: list[int | None] = [None]
+
+    class RootProcess:
+        def children(self, recursive=False):
+            return []
+
+    class BrokenCandidate:
+        @property
+        def pid(self):
+            return leader_pid[0]
+
+        def is_running(self):
+            return True
+
+        def status(self):
+            return "running"
+
+        def environ(self):
+            raise RuntimeError("proc_environ returned a result with an exception set")
+
+    def process(pid):
+        leader_pid[0] = int(pid)
+        return RootProcess()
+
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: [BrokenCandidate()])
+
+    document = _manifest(argv=[sys.executable, "-c", "print('ok')"])
+    repo, head, tree = _repo(tmp_path, document)
+    manifest = verify.load_verification_manifest(repo, head)
+    bundle = _run(repo, head, tree, manifest, instance_id="unreadable-scope")
+
+    assert leader_pid[0] is not None
+    assert bundle["state"] == "blocked"
+    assert bundle["invalid_reason"] == "test_infrastructure_error"
 
 
 def test_candidate_owned_relative_python_cannot_forge_pytest_evidence_via_run_action(tmp_path):
