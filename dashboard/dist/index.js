@@ -105,6 +105,28 @@
     return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
   }
 
+  function graphVisualState(rawValue, state) {
+    if (rawValue == null || rawValue === "") return "pending";
+    var current = normalizedState(rawValue);
+    if (current === "running") return "running";
+    if (["done", "completed", "approved", "passed"].indexOf(current) >= 0) return "done";
+    if (["failed", "blocked", "worker_blocked", "rejected", "cancelled"].indexOf(current) >= 0) return "failed";
+    if (["pending", "ready", "waiting_event"].indexOf(current) >= 0) return "pending";
+    if (["waiting", "waiting_gate", "needs_input"].indexOf(current) >= 0) {
+      var actor = state && state.actor || {};
+      var blocker = state && state.blocker || {};
+      var actorKind = normalizedState(typeof actor === "string" ? actor : actor.kind || actor.id || actor.label);
+      var blockerKind = normalizedState(typeof blocker === "string" ? blocker : blocker.kind || blocker.id);
+      var blockerReason = normalizedState(typeof blocker === "string" ? blocker : blocker.reason);
+      if (actorKind === "operator" ||
+        ["approval", "approval_gate", "operator", "human", "needs_input", "waiting_gate"].indexOf(blockerKind) >= 0 ||
+        /(^|-)approval(-|$)|(^|-)operator(-|$)|(^|-)human(-|$)/.test(blockerReason)) return "waiting";
+      return "pending";
+    }
+    if (current === "skipped") return "skipped";
+    return "unsupported";
+  }
+
   function StatePill(props) {
     var value = props.value || "unknown";
     var state = normalizedState(value);
@@ -740,9 +762,9 @@
     var edges = graphEdges(graph, overlay);
 
     function nodeClass(node, state) {
-      var current = normalizedState(state && state.state || node.state || "unknown");
+      var current = graphVisualState(state && state.state != null ? state.state : node.state, state);
       var shape = node.shape === "diamond" ? "diamond" : "rectangle";
-      var unsupported = node.primitive === "unsupported" || node.unsupported || node.shape !== "diamond" && node.shape !== "rectangle";
+      var unsupported = current === "unsupported" || node.primitive === "unsupported" || node.unsupported || node.shape !== "diamond" && node.shape !== "rectangle";
       return [
         "factory-graph-node",
         "factory-graph-node--" + shape,
@@ -759,13 +781,14 @@
     function renderNode(node) {
       var box = geometry.positions[node.id];
       var state = graphNodeOverlay(overlay, node.id) || {};
-      var current = graphText(state.state, node.state);
+      var rawState = graphText(state.state, node.state);
+      var current = graphVisualState(rawState, state);
       var actor = state.actor && (state.actor.id || state.actor.kind);
       var blocker = state.blocker && (state.blocker.reason || state.blocker.kind);
       var invalidShape = node.shape !== "diamond" && node.shape !== "rectangle";
-      var unsupportedNode = node.primitive === "unsupported" || node.unsupported || invalidShape;
+      var unsupportedNode = current === "unsupported" || node.primitive === "unsupported" || node.unsupported || invalidShape;
       var label = graphText(node.title, node.id) + " · " + graphText(node.primitive) +
-        " · " + current + " · actor " + graphText(actor) + " · blocker " + graphText(blocker);
+        " · " + rawState + " · actor " + graphText(actor) + " · blocker " + graphText(blocker);
       var activation = state.current_activation == null ? state.activation : state.current_activation;
       var shape = node.shape === "diamond"
         ? h("polygon", {
@@ -2210,8 +2233,10 @@
       var active = true;
       var timer = null;
       function loadOverlay() {
+        if (document.visibilityState === "hidden") return;
         request("/instances/" + encodeURIComponent(launchResult.instance_id) + "/graph").then(function (payload) {
-          if (active && payload && payload.graph) {
+          if (!payload || !payload.graph) throw new Error("Live overlay response is incomplete.");
+          if (active) {
             setLivePayload(payload);
             setOverlayError("");
           }
