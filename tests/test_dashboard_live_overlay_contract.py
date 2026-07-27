@@ -53,3 +53,43 @@ def test_poll_cleanup_and_runtime_visibility_guards_are_explicit():
         "setOverlayError(\"\");",
     ):
         assert token in BUNDLE
+
+
+def test_overlay_does_not_request_while_document_is_hidden():
+    assert "if (document.visibilityState === \"hidden\") return;" in BUNDLE
+    overlay_start = BUNDLE.index("function loadOverlay()")
+    overlay_end = BUNDLE.index("timer = setInterval(loadOverlay", overlay_start)
+    overlay_poll = BUNDLE[overlay_start:overlay_end]
+    assert overlay_poll.index('document.visibilityState === "hidden"') < overlay_poll.index("request(")
+
+
+def test_incomplete_overlay_wrapper_surfaces_a_visible_error():
+    assert 'if (!payload || !payload.graph) throw new Error("Live overlay response is incomplete.");' in BUNDLE
+    assert "setOverlayError(errorText(err))" in BUNDLE
+    assert 'role: "status"' in BUNDLE[BUNDLE.index("function GraphOverlayWarning"):BUNDLE.index("function GraphInspector")]
+
+
+def test_overlay_states_use_canonical_visual_classes_but_keep_raw_state_text():
+    start = BUNDLE.index("function graphVisualState")
+    end = BUNDLE.index("function GraphUnsupportedState", start)
+    mapper = BUNDLE[start:end]
+    for token in (
+        'if (rawValue == null || rawValue === "") return "pending";',
+        'if (current === "running") return "running";',
+        '["done", "completed", "approved", "passed"].indexOf(current) >= 0) return "done";',
+        '["failed", "blocked", "worker_blocked", "rejected", "cancelled"].indexOf(current) >= 0) return "failed";',
+        '["pending", "ready", "waiting_event"].indexOf(current) >= 0) return "pending";',
+        '["waiting", "waiting_gate", "needs_input"].indexOf(current) >= 0)',
+        'if (actorKind === "operator"',
+        'return "waiting";',
+        'return "skipped";',
+        'return "unsupported";',
+    ):
+        assert token in mapper
+
+    render_start = BUNDLE.index("function renderNode")
+    render_end = BUNDLE.index("return h(\"section\"", render_start)
+    render = BUNDLE[render_start:render_end]
+    assert 'var rawState = graphText(state.state, node.state);' in render
+    assert '" · " + rawState + " · actor "' in render
+    assert '"aria-label": label' in render
