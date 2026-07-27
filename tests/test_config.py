@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from shipfactory.config import FactoryConfigError, load_seats
+from shipfactory.config import (
+    FactoryConfigError,
+    PROJECTS_VISUAL_RECIPES_DEFAULTS,
+    load_seats,
+    projects_visual_recipes_config,
+)
 
 
 def _profiles(monkeypatch):
@@ -159,3 +164,90 @@ def test_live_seats_migrate_no_op(tmp_path, monkeypatch):
         assert seat.config == {} and seat.skills == ()
         assert seat.executor in {"hermes", "codex", "claude", "grok", "opencode"}
     assert dest.read_bytes() == before  # loader never rewrites the store
+
+
+def _write_minimal_seats(path: Path, *, block: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "company: demo\n"
+        "seats: {}\n"
+        + (f"recipes:\n  projects_visual_recipes:\n{block}" if block else ""),
+        encoding="utf-8",
+    )
+
+
+def test_projects_visual_recipes_absent_is_default_on_and_has_no_safety_switches(tmp_path):
+    path = tmp_path / "seats.yaml"
+    _write_minimal_seats(path)
+
+    cfg = load_seats(path)
+    effective = projects_visual_recipes_config(cfg.recipes)
+
+    assert effective == PROJECTS_VISUAL_RECIPES_DEFAULTS
+    assert all(effective[name] is True for name in (
+        "enabled", "policy_editing_enabled", "launch_enabled", "graph_enabled",
+        "live_overlay_enabled", "history_enabled",
+    ))
+    assert not {"unclassified_launch_enabled", "auto_approve", "approval_enabled"} & set(effective)
+
+
+def test_projects_visual_recipes_same_file_is_hot_reloaded(tmp_path):
+    path = tmp_path / "seats.yaml"
+    _write_minimal_seats(path)
+    first = load_seats(path)
+    assert projects_visual_recipes_config(first.recipes)["recent_flight_limit"] == 20
+
+    _write_minimal_seats(path, block="    recent_flight_limit: 7\n")
+    second = load_seats(path)
+
+    assert second is not first
+    assert projects_visual_recipes_config(second.recipes)["recent_flight_limit"] == 7
+
+
+def test_projects_visual_recipes_every_setting_can_be_overridden(tmp_path):
+    path = tmp_path / "seats.yaml"
+    overrides = {
+        "enabled": False,
+        "policy_editing_enabled": False,
+        "launch_enabled": False,
+        "graph_enabled": False,
+        "live_overlay_enabled": False,
+        "history_enabled": False,
+        "recent_flight_limit": 9,
+        "ui_refresh_interval_seconds": 11,
+        "graph_direction": "LR",
+        "graph_rank_gap": 70,
+        "graph_lane_gap": 31,
+        "graph_node_width": 210,
+        "graph_node_height": 80,
+        "graph_diamond_size": 30,
+        "history_fold_threshold": 12,
+    }
+    block = "".join(
+        f"    {key}: {str(value).lower() if isinstance(value, bool) else value}\n"
+        for key, value in overrides.items()
+    )
+    _write_minimal_seats(path, block=block)
+
+    effective = projects_visual_recipes_config(load_seats(path).recipes)
+
+    assert effective == {**PROJECTS_VISUAL_RECIPES_DEFAULTS, **overrides}
+
+
+@pytest.mark.parametrize(
+    "block, message",
+    [
+        ("    unknown_setting: true\n", "unknown keys"),
+        ("    enabled: 'yes'\n", "enabled must be boolean"),
+        ("    recent_flight_limit: 0\n", "positive integer"),
+        ("    graph_rank_gap: false\n", "positive integer"),
+        ("    graph_direction: diagonal\n", "direction"),
+        ("    graph_direction: []\n", "direction"),
+    ],
+)
+def test_projects_visual_recipes_invalid_values_fail_closed(tmp_path, block, message):
+    path = tmp_path / "seats.yaml"
+    _write_minimal_seats(path, block=block)
+
+    with pytest.raises(FactoryConfigError, match=message):
+        load_seats(path)

@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Mapping
 
+from shipfactory.config import projects_visual_recipes_config
 from shipfactory.recipes.primitives import review_verdict_targets
 
 
@@ -173,12 +174,20 @@ def _unsupported_node(review: Mapping[str, Any], reason: str) -> dict[str, Any]:
     }
 
 
-def project_graph(recipe: Mapping[str, Any], *, recipe_hash: str, pinned: bool) -> dict[str, Any]:
+def project_graph(
+    recipe: Mapping[str, Any],
+    *,
+    recipe_hash: str,
+    pinned: bool,
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the deterministic ``shipfactory.graph/v1`` recipe projection.
 
     ``recipe`` is intentionally not revalidated or normalized here.  Callers
     must pass the exact document that has already passed the immutable recipe
-    loader; this function only copies declared policy into a graph.
+    loader; this function only copies declared policy into a graph.  ``config``
+    is the fresh effective Projects/visual-recipes configuration; omitting it
+    uses the validated defaults for compatibility with existing callers.
     """
     steps = list(recipe["steps"])
     nodes = [_step_node(recipe, step) for step in steps]
@@ -215,6 +224,7 @@ def project_graph(recipe: Mapping[str, Any], *, recipe_hash: str, pinned: bool) 
                 projection_only=True, reason=reason,
             )
 
+    effective_config = projects_visual_recipes_config(None) if config is None else dict(config)
     return {
         "schema_version": GRAPH_SCHEMA,
         "source": {
@@ -226,5 +236,12 @@ def project_graph(recipe: Mapping[str, Any], *, recipe_hash: str, pinned: bool) 
         },
         "nodes": nodes,
         "edges": edges.finish(),
-        "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28},
+        "layout": {
+            "direction": effective_config["graph_direction"],
+            "rank_gap": effective_config["graph_rank_gap"],
+            "lane_gap": effective_config["graph_lane_gap"],
+            "node_width": effective_config["graph_node_width"],
+            "node_height": effective_config["graph_node_height"],
+            "diamond_size": effective_config["graph_diamond_size"],
+        },
     }
