@@ -127,6 +127,27 @@ const publishedRecipeFixtures = CONFORMANCE_FIXTURES.recipes;
 const syntheticParallelJoinFixture = CONFORMANCE_FIXTURES.graphs.synthetic_parallel_join;
 const foldedReworkFixture = CONFORMANCE_FIXTURES.history.folded_rework;
 const foldedReworkGraphFixture = CONFORMANCE_FIXTURES.graphs.folded_rework;
+// The W3-E browser lane needs the same frozen recipe identities with the
+// immutable parameter/step fields that the real Projects API returns.  Keep
+// the older compact summaries above unchanged for the static fixture contract.
+const apiRecipeFixtures = deepFreeze({
+  "dev-pipeline@14": {
+    ...publishedRecipeFixtures["dev-pipeline@14"],
+    status: "active",
+    parameters: { request: { type: "string", required: true, default: null } },
+    budgets: { max_activations: 27, step_activation_caps: { explore: 2, build: 3 } },
+    steps: [],
+    optional_steps: [],
+  },
+  "creative-video@1": {
+    ...publishedRecipeFixtures["creative-video@1"],
+    status: "active",
+    parameters: { request: { type: "string", required: true, default: null } },
+    budgets: { max_activations: 12, step_activation_caps: { research: 2 } },
+    steps: [],
+    optional_steps: [],
+  },
+});
 const STABLE_DOM_ATTRIBUTES = Object.freeze([
   "data-project-id", "data-project-launch", "data-recipe-key",
   "data-recipe-attach", "data-recipe-detach", "data-recipe-default",
@@ -135,6 +156,123 @@ const STABLE_DOM_ATTRIBUTES = Object.freeze([
   "data-edge-to", "data-edge-kind",
 ]);
 window.__SHIPFACTORY_CONFORMANCE_FIXTURES__ = CONFORMANCE_FIXTURES;
+window.__SHIPFACTORY_CONFORMANCE_API_RECIPES__ = apiRecipeFixtures;
+window.__SHIPFACTORY_CONFORMANCE_REQUESTS__ = [];
+
+let browserPolicy = JSON.parse(JSON.stringify(policyFixtures.attached));
+
+function browserJsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function browserProjectGraph() {
+  const graph = JSON.parse(JSON.stringify(syntheticParallelJoinFixture));
+  graph.source = {
+    ...graph.source,
+    recipe_id: "dev-pipeline",
+    version: 14,
+    recipe_key: "dev-pipeline@14",
+    recipe_hash: publishedRecipeFixtures["dev-pipeline@14"].recipe_hash,
+    pinned: true,
+  };
+  const graphMode = scenario.get("graph");
+  if (graphMode === "hostile") graph.nodes[0].title = '<img src=x onerror="window.__w3e_pwned=1">';
+  if (graphMode === "cycle") graph.nodes[0].needs = ["approve"];
+  return graph;
+}
+
+function browserMockFetch(url, options = {}) {
+  const method = options.method || "GET";
+  const path = new URL(url, window.location.href).pathname;
+  // Keep the frozen route-shape lock readable: policyFixtures.attached.allowed_recipe_keys.map
+  if (method === "GET" && path === "/api/plugins/shipfactory/projects") {
+    const payload = JSON.parse(JSON.stringify(CONFORMANCE_FIXTURES.projects_response));
+    payload.runtime_config.ui_refresh_interval_seconds = 3600;
+    payload.projects[0].recipes = {
+      allowed: browserPolicy.allowed_recipe_keys.slice(),
+      default: browserPolicy.default_recipe_key,
+    };
+    return Promise.resolve(browserJsonResponse(payload));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/projects/p_bound/recipes") {
+    return Promise.resolve(browserJsonResponse({
+      project_id: "p_bound",
+      recipes: browserPolicy.allowed_recipe_keys.map(key => apiRecipeFixtures[key]),
+      default_recipe: browserPolicy.default_recipe_key,
+    }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/recipes") {
+    return Promise.resolve(browserJsonResponse(Object.values(apiRecipeFixtures)));
+  }
+  if (method === "GET" && path.startsWith("/api/plugins/shipfactory/recipes/") && path.endsWith("/graph")) {
+    if (scenario.get("graph") === "unsupported") return Promise.resolve(browserJsonResponse({ schema_version: "shipfactory.graph/v999" }));
+    return Promise.resolve(browserJsonResponse(browserProjectGraph()));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/instances/fixture-flight-created/graph") {
+    return Promise.resolve(browserJsonResponse(browserProjectGraph()));
+  }
+  if (method === "PUT" && path === "/api/plugins/shipfactory/projects/p_bound/recipe-policy") {
+    browserPolicy = JSON.parse(options.body || "{}");
+    return Promise.resolve(browserJsonResponse({ project_id: "p_bound", ...browserPolicy, updated_at: "2026-07-27T00:01:00+00:00" }));
+  }
+  if (method === "POST" && path === "/api/plugins/shipfactory/projects/p_bound/flights") {
+    const launch = JSON.parse(options.body || "{}");
+    return Promise.resolve(browserJsonResponse({
+      project_id: "p_bound",
+      recipe: launch.recipe + "@" + launch.version,
+      instance_id: "fixture-flight-created",
+      idempotency_key: launch.idempotency_key,
+    }));
+  }
+  // Preserve the pre-W3-E harness scenarios so the new browser seam does not
+  // make the established Journeys, Waiting, Seats, or Costs views inert.
+  if (method === "GET" && path === "/api/plugins/shipfactory/status") {
+    return Promise.resolve(browserJsonResponse({
+      running: scenario.get("daemon") !== "stopped",
+      pid: scenario.get("daemon") === "stopped" ? null : 48120,
+      last_tick_at: isoAgo(scenario.get("daemon") === "stopped" ? 95 : 12),
+      board: "hermes-mobile",
+      boards: [{ board: "hermes-mobile", last_tick_at: isoAgo(12), stale: scenario.get("daemon") === "stopped" }],
+      tick_interval_seconds: 20,
+      config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
+    }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/waiting") return Promise.resolve(browserJsonResponse(waiting.map(item => ({ ...item }))));
+  if (method === "GET" && path === "/api/plugins/shipfactory/instances") return Promise.resolve(browserJsonResponse(instances.map(item => ({ ...item }))));
+  if (method === "GET" && path === "/api/plugins/shipfactory/seats") return Promise.resolve(browserJsonResponse(seats.map(item => ({ ...item }))));
+  if (method === "GET" && path === "/api/plugins/shipfactory/costs?by=day") return Promise.resolve(browserJsonResponse(dailyCosts.map(item => ({ ...item }))));
+  if (method === "GET" && path === "/api/plugins/shipfactory/costs?by=instance") return Promise.resolve(browserJsonResponse(instanceCosts.map(item => ({ ...item }))));
+  if (method === "GET" && path.includes("/instances/") && path.endsWith("/receipts")) {
+    const id = decodeURIComponent(path.split("/instances/")[1].split("/")[0]);
+    return Promise.resolve(browserJsonResponse((receiptsByInstance[id] || []).map(item => ({ ...item }))));
+  }
+  if (method === "GET" && path.includes("/runs/")) {
+    const [runId, kind] = path.split("/runs/")[1].split("/");
+    const artifact = runArtifacts[decodeURIComponent(runId) + ":" + kind];
+    return Promise.resolve(artifact ? browserJsonResponse({ ...artifact }) : browserJsonResponse({ detail: "No run artifact" }, 404));
+  }
+  if (method === "GET" && path.startsWith("/api/plugins/shipfactory/instances/")) {
+    const id = decodeURIComponent(path.split("/instances/")[1]);
+    return Promise.resolve(browserJsonResponse(details[id] || { ...(instances.find(item => item.id === id) || {}), steps: [], decisions: [] }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/recipes") {
+    return Promise.resolve(browserJsonResponse(Object.values(apiRecipeFixtures)));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/profiles") return Promise.resolve(browserJsonResponse(["default", "architect", "dev-backend-codex", "verifier"]));
+  if (method === "POST" && path === "/api/plugins/shipfactory/instances") return Promise.resolve(browserJsonResponse({ instance_id: "fac_new7c20", recipe: "ship-feature@3" }));
+  if (method === "POST" && path === "/api/plugins/shipfactory/triage") return Promise.resolve(browserJsonResponse({ task_id: "t_triage1", status: "triage", board: "hermes-mobile" }));
+  if (method === "POST" && path === "/api/plugins/shipfactory/reroute") return Promise.resolve(browserJsonResponse({ activated: false, replacement: { instance_id: "fac_a91d2e7c" } }));
+  if (method === "POST" && path === "/api/plugins/shipfactory/cancel") return Promise.resolve(browserJsonResponse({ instance_id: "fac_a91d2e7c", status: "cancelled" }));
+  if (method === "POST" && path.endsWith("/seats")) return Promise.resolve(browserJsonResponse({ name: JSON.parse(options.body || "{}").name }));
+  if (method === "PUT" && path.includes("/seats/")) return Promise.resolve(browserJsonResponse({ name: decodeURIComponent(path.split("/seats/")[1]) }));
+  if (method === "POST") return Promise.resolve(browserJsonResponse({ key: "harness-decision" }));
+  return Promise.resolve(browserJsonResponse({ detail: "fixture route missing" }, 404));
+}
+
+window.__SHIPFACTORY_CONFORMANCE_HTTP_MOCK__ = browserMockFetch;
 
 // Verdict contract v2 payload: explicit clean/findings/target fields. Carried
 // by rework rows (rejected_by_step_id set) and by the gate activation that
@@ -353,72 +491,27 @@ window.__HERMES_PLUGIN_SDK__ = {
   components: { Badge, Button, Card, CardContent },
   utils: {},
   fetchJSON(url, options = {}) {
-    if (url.endsWith("/projects")) return Promise.resolve(CONFORMANCE_FIXTURES.projects_response);
-    if (url.includes("/projects/p_bound/recipes")) return Promise.resolve({
-      project_id: "p_bound",
-      recipes: policyFixtures.attached.allowed_recipe_keys.map(key => publishedRecipeFixtures[key]),
-      default_recipe: policyFixtures.attached.default_recipe_key,
+    const method = options.method || "GET";
+    window.__SHIPFACTORY_CONFORMANCE_REQUESTS__.push({
+      method,
+      url,
+      body: options.body || null,
     });
-    if (url.includes("/projects/p_bound/recipe-policy") && options.method === "PUT") {
-      return Promise.resolve({ ...policyFixtures.attached });
+    const requestOptions = { ...options, method };
+    if (requestOptions.body && !requestOptions.headers) {
+      requestOptions.headers = { "Content-Type": "application/json" };
     }
-    if (url.includes("/projects/unclassified/recipes")) {
-      return Promise.reject(new Error("400: Unclassified projects cannot launch recipes"));
-    }
-    if (url.includes("/instances/fixture-rework-1/graph")) {
-      return Promise.resolve({
-        ...foldedReworkFixture,
-        graph: foldedReworkGraphFixture,
-      });
-    }
-    if (url.includes("/graphs/synthetic-parallel@1")) {
-      return Promise.resolve(syntheticParallelJoinFixture);
-    }
-    if (url.endsWith("/profiles")) return Promise.resolve(["default", "architect", "dev-backend-codex", "verifier"]);
-    if (options.method === "POST" && url.endsWith("/seats")) return Promise.resolve({ name: JSON.parse(options.body).name });
-    if (options.method === "PUT" && url.includes("/seats/")) return Promise.resolve({ name: decodeURIComponent(url.split("/seats/")[1]) });
-    if (options.method === "POST" && url.endsWith("/instances")) return Promise.resolve({ instance_id: "fac_new7c20", recipe: "ship-feature@3" });
-    if (options.method === "POST" && url.endsWith("/triage")) return Promise.resolve({ task_id: "t_triage1", status: "triage", board: "hermes-mobile" });
-    if (options.method === "POST" && url.endsWith("/reroute")) return Promise.resolve({ activated: false, replacement: { instance_id: "fac_a91d2e7c" } });
-    if (options.method === "POST" && url.endsWith("/cancel")) return Promise.resolve({ instance_id: "fac_a91d2e7c", status: "cancelled" });
-    if (options.method === "POST") return Promise.resolve({ key: "harness-decision" });
-    if (url.endsWith("/status")) return Promise.resolve(scenario.get("daemon") === "stopped" ? {
-      running: false, pid: null, last_tick_at: isoAgo(95), board: "hermes-mobile",
-      boards: [{ board: "hermes-mobile", last_tick_at: isoAgo(95), last_tick_age_seconds: 95, stale: true }], tick_interval_seconds: 20,
-      config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
-    } : {
-      running: true, pid: 48120, last_tick_at: isoAgo(12), board: "hermes-mobile",
-      boards: [{ board: "hermes-mobile", last_tick_at: isoAgo(12), last_tick_age_seconds: 12, stale: false }], tick_interval_seconds: 20,
-      config: { recipes_enabled: true, library_path: "/operator/recipes", bare_task_recipe: "ship-feature@3" },
+    const fetcher = window.__SHIPFACTORY_CONFORMANCE_HTTP_MOCK__ || window.fetch;
+    return fetcher(url, requestOptions).then(async response => {
+      const text = await response.text();
+      let payload = null;
+      try { payload = text ? JSON.parse(text) : null; } catch (_ignore) { payload = text; }
+      if (!response.ok) {
+        const error = new Error(response.status + ": " + (payload && payload.detail ? payload.detail : text || response.statusText));
+        throw error;
+      }
+      return payload;
     });
-    if (url.endsWith("/recipes")) return Promise.resolve(recipes.map(item => ({ ...item })));
-    if (url.endsWith("/waiting")) return Promise.resolve(waiting.map(item => ({ ...item })));
-    if (url.endsWith("/instances")) return Promise.resolve(instances.map(item => ({ ...item })));
-    if (url.endsWith("/cancel")) return Promise.resolve({
-      instance_id: "fac_a91d2e7c",
-      workers: [{ task_id: "t_1d7b902", pid: 55231, executor: "codex" }],
-      nonterminal_steps: ["verify", "release"],
-      suppressed: ["t_1d7b902", "t_4e2c551"],
-      collector: "t_collector9",
-    });
-    if (url.includes("/instances/") && url.endsWith("/receipts")) {
-      const id = decodeURIComponent(url.split("/instances/")[1].split("/")[0]);
-      return Promise.resolve((receiptsByInstance[id] || []).map(item => ({ ...item })));
-    }
-    if (url.includes("/runs/")) {
-      const [runId, kind] = url.split("/runs/")[1].split("/");
-      const artifact = runArtifacts[decodeURIComponent(runId) + ":" + kind];
-      if (artifact) return Promise.resolve({ ...artifact });
-      return Promise.reject(new Error("404: No " + kind + " recorded for run " + runId));
-    }
-    if (url.includes("/instances/")) {
-      const id = decodeURIComponent(url.split("/instances/")[1]);
-      return Promise.resolve(details[id] || { ...instances.find(item => item.id === id), steps: [], decisions: [] });
-    }
-    if (url.endsWith("/seats")) return Promise.resolve(seats.map(item => ({ ...item })));
-    if (url.includes("/costs?by=day")) return Promise.resolve(dailyCosts.map(item => ({ ...item })));
-    if (url.includes("/costs?by=instance")) return Promise.resolve(instanceCosts.map(item => ({ ...item })));
-    return Promise.reject(new Error("404: Harness fixture missing for " + url));
   },
 };
 

@@ -316,6 +316,25 @@ def test_harness_exposes_named_static_fixture_groups() -> None:
         assert declaration in HARNESS
 
 
+def test_api_recipe_projections_preserve_authoritative_status() -> None:
+    start = HARNESS.index("const apiRecipeFixtures = deepFreeze({")
+    end = HARNESS.index("const STABLE_DOM_ATTRIBUTES", start)
+    projections = HARNESS[start:end]
+    library = load_library(ROOT / "recipes", persist=False)
+
+    keys = ("dev-pipeline@14", "creative-video@1")
+    for index, key in enumerate(keys):
+        block_start = projections.index(f'  "{key}": {{')
+        next_start = (
+            projections.index(f'  "{keys[index + 1]}": {{', block_start)
+            if index + 1 < len(keys)
+            else len(projections)
+        )
+        block = projections[block_start:next_start]
+        status = library.get(key).document["status"]
+        assert f'    status: "{status}",' in block
+
+
 def test_bundle_implements_payload_driven_native_svg_graph_renderer() -> None:
     """The renderer is source-checked until W3 provides rendered-browser proof."""
     for symbol in (
