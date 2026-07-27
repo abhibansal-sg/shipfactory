@@ -209,6 +209,15 @@ def test_projects_and_graph_rendered_browser_contract(
                     assert "Next actor: Operator" in (overlay_text or "")
                     assert "Blocker: human action required" in (overlay_text or "")
                     assert "Human operator approval required." in (overlay_text or "")
+                    overlay_requests = [
+                        item
+                        for item in await page.evaluate("window.__SHIPFACTORY_CONFORMANCE_REQUESTS__")
+                        if item["method"] == "GET"
+                        and item["url"] == "/api/plugins/shipfactory/instances/fixture-flight-created/graph"
+                    ]
+                    assert len(overlay_requests) == 1
+                    assert await page.locator('[data-step-id="start"]').get_attribute("data-activation") == "1"
+                    assert await page.locator('[data-step-id="approve"]').get_attribute("data-activation") == "1"
                     await page.locator('[data-step-id="approve"]').click()
                     inspector = page.locator('[role="dialog"][aria-label="Graph node inspector"]')
                     await inspector.wait_for(state="visible")
