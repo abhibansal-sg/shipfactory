@@ -388,3 +388,88 @@ def test_renderer_does_not_add_a_workflow_definition_or_mutation_surface() -> No
     assert "graph_node_width" not in renderer
     assert "graph_node_height" not in renderer
     assert "graph_diamond_size" not in renderer
+
+
+def test_bundle_projects_is_primary_server_configured_launch_surface() -> None:
+    projects = BUNDLE[BUNDLE.index("function validateProjectsRuntimeConfig"):BUNDLE.index("var VIEW_REGISTRY")]
+    assert 'var _a = useState("projects")' in BUNDLE
+    for symbol in (
+        "function ProjectsView", "function ProjectDetails", "function ProjectRecipeCard",
+        "function ProjectLaunchPanel", "function validateProjectsRuntimeConfig",
+        "function canonicalRecipePolicy", "function GraphRenderer",
+    ):
+        assert symbol in BUNDLE
+    for endpoint in (
+        'request("/projects")',
+        '"/projects/" + encodeURIComponent(projectId) + "/recipes"',
+        '"/projects/" + encodeURIComponent(project.id) + "/recipe-policy"',
+        '"/projects/" + encodeURIComponent(project.id) + "/flights"',
+        '"/recipes/" + encodeURIComponent(selected.id) + "/versions/"',
+        '"/instances/" + encodeURIComponent(launchResult.instance_id) + "/graph"',
+    ):
+        assert endpoint in BUNDLE
+    for config_field in (
+        "runtime_config", "policy_editing_enabled", "launch_enabled", "graph_enabled",
+        "live_overlay_enabled", "history_enabled", "recent_flight_limit",
+        "ui_refresh_interval_seconds", "history_fold_threshold", "graph_direction",
+    ):
+        assert config_field in projects
+    for attribute in (
+        "data-project-id", "data-project-launch", "data-recipe-key",
+        "data-recipe-attach", "data-recipe-detach", "data-recipe-default",
+        "data-flight-instance-id", "data-unclassified",
+    ):
+        assert attribute in projects
+    assert 'skip_steps: skips.slice().sort()' in projects
+    assert 'idempotency_key: idempotencyKey' in projects
+    assert 'setIdempotencyKey(newNonce())' in projects
+    assert 'body: JSON.stringify(next)' in projects
+    assert '"board"' not in projects
+    assert '"collector"' not in projects
+    assert "dangerouslySetInnerHTML" not in projects
+    assert ".innerHTML" not in projects
+
+
+def test_projects_css_declares_responsive_primary_surface() -> None:
+    for selector in (
+        ".factory-projects-view", ".factory-projects-layout", ".factory-project-list",
+        ".factory-project-detail", ".factory-project-row", ".factory-project-recipe",
+    ):
+        assert selector in CSS
+    assert "grid-template-columns: minmax(15rem" in CSS
+    assert "@media (max-width: 860px)" in CSS
+
+
+def test_projects_resource_contracts_preserve_data_and_expose_catalog_failures() -> None:
+    projects = BUNDLE[BUNDLE.index("function useProjectsResource"):BUNDLE.index("function ProjectRow")]
+    catalog = BUNDLE[BUNDLE.index("function useProjectRecipeCatalogResource"):BUNDLE.index("function ProjectRow")]
+
+    projects_catch = projects[projects.index("}).catch(function (err)"):projects.index("}).finally", projects.index("}).catch(function (err)"))]
+    assert "setData(null)" not in projects_catch
+    assert "setError(errorText(err))" in projects_catch
+    assert "return { data: data, loading: loading, error: error" in catalog
+    assert "Recipe catalog response is incomplete." in catalog
+    assert 'request("/recipes")' in catalog
+    assert "reload: load" in catalog
+
+
+def test_projects_recipe_catalog_ui_contract_is_explicit_and_identity_safe() -> None:
+    projects = BUNDLE[BUNDLE.index("function ProjectDetails"):BUNDLE.index("function ProjectsView")]
+    controls = BUNDLE[BUNDLE.index("function ProjectPolicyControls"):BUNDLE.index("function ProjectRecipeCard")]
+    recipe_card = BUNDLE[BUNDLE.index("function ProjectRecipeCard"):BUNDLE.index("function ProjectLaunchPanel")]
+
+    assert "project.binding === \"bound\" && runtime.policy_editing_enabled" in projects
+    assert "catalogResource.error" in projects
+    assert 'title: "Recipe catalog unavailable"' in projects
+    assert "onRetry: catalogResource.reload" in projects
+    assert "catalogResource.enabled && catalogResource.error ? null" in projects
+    assert 'recipe.recipe_hash ? h("span"' in recipe_card
+    assert 'var inactive = !attached && recipe.status !== "active"' in controls
+    assert "disabled = !props.enabled || props.busy || inactive" in controls
+    assert "Attach disabled: recipe is inactive." in controls
+    assert "Inactive — cannot attach" in controls
+    assert "setLaunchResult(null)" in projects
+    assert "setGraph(null)" in projects
+    assert "[project.id, selected && selected.id, selected && selected.version, selected && selected.recipe_hash]" in projects
+    identity_reset = projects[projects.index("setLaunchResult(null)"):projects.index("useEffect(function () {", projects.index("setLaunchResult(null)"))]
+    assert "setIdempotencyKey" not in identity_reset
