@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from shipfactory import store
 from shipfactory.recipes.loader import load_library
@@ -143,22 +144,24 @@ def test_graph_config_is_fresh_and_projects_all_layout_values(tmp_path, monkeypa
     assert len(calls) == 2
 
 
-def test_graph_requires_both_stage_zero_flags_and_reports_unknowns(tmp_path, monkeypatch):
-    flags = {"enabled": False}
-    _configure(tmp_path, monkeypatch, flags=flags)
+@pytest.mark.parametrize("disabled_flag", ["enabled", "graph_enabled"])
+def test_graph_requires_each_stage_zero_flag_in_an_isolated_seed(
+    tmp_path, monkeypatch, disabled_flag,
+):
+    flags = {disabled_flag: False}
+    library = _configure(tmp_path, monkeypatch, flags=flags)
+    instance_id = f"instance-{disabled_flag}"
+    _seed_instance(library, instance_id=instance_id)
     client = _client()
-    disabled = client.get("/api/plugins/shipfactory/recipes/graph-fixture/versions/1/graph")
+    disabled = client.get(
+        f"/api/plugins/shipfactory/instances/{instance_id}/graph"
+    )
     assert disabled.status_code == 403
     assert disabled.json()["error"] == "feature_disabled"
 
-    flags.update({"enabled": True, "graph_enabled": False})
-    disabled_graph = client.get(
-        "/api/plugins/shipfactory/recipes/graph-fixture/versions/1/graph"
-    )
-    assert disabled_graph.status_code == 403
-    assert disabled_graph.json()["error"] == "feature_disabled"
-
-    flags.update({"enabled": True, "graph_enabled": True})
+def test_graph_reports_unknown_versions_and_invalid_version_format(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, flags={"enabled": True, "graph_enabled": True})
+    client = _client()
     unknown_version = client.get(
         "/api/plugins/shipfactory/recipes/graph-fixture/versions/9/graph"
     )
@@ -178,8 +181,8 @@ def test_instance_graph_uses_only_authenticated_persisted_identity(tmp_path, mon
 
     assert response.status_code == 200
     body = response.json()
-    assert body["source"]["recipe_hash"] == digest
-    assert body["source"]["pinned"] is True
+    assert body["graph"]["source"]["recipe_hash"] == digest
+    assert body["graph"]["source"]["pinned"] is True
     assert "secret-board" not in json.dumps(body)
     assert client.get("/api/plugins/shipfactory/instances/missing/graph").status_code == 404
 

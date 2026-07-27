@@ -34,6 +34,9 @@ from shipfactory.recipes.loader import Recipe, RecipeError, validate
 router = APIRouter()
 
 
+_APPROVAL_WAITING_STATES = frozenset({"waiting", "waiting_gate", "needs_input"})
+
+
 class GateDecision(BaseModel):
     instance: str = Field(min_length=1)
     step: str = Field(min_length=1)
@@ -224,7 +227,12 @@ def _gate_or_400(instance_id: str, step_id: str) -> None:
             "SELECT primitive,state FROM recipe_steps WHERE instance_id=? AND step_id=? ORDER BY activation DESC LIMIT 1",
             (instance_id, step_id),
         ).fetchone()
-    if not instance or not step or step["primitive"] != "approval_gate" or step["state"] != "waiting":
+    if (
+        not instance
+        or not step
+        or step["primitive"] != "approval_gate"
+        or step["state"] not in _APPROVAL_WAITING_STATES
+    ):
         raise HTTPException(status_code=400, detail="approval gate is not waiting")
 
 
@@ -433,6 +441,424 @@ def _pinned_instance_recipe(config: Any, instance_id: str) -> Recipe:
         frozenset(profiles),
         frozenset(verification_profiles),
     )
+
+
+def _strict_overlay_verdict(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode only a JSON object; never turn malformed worker text into data."""
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None, "malformed"
+    if not isinstance(value, dict):
+        return None, "malformed"
+    return value, "parsed"
+
+
+def _overlay_actor(
+    graph_node: dict[str, Any],
+    run: dict[str, Any] | None,
+) -> dict[str, Any]:
+    primitive = graph_node.get("primitive")
+    if primitive == "approval_gate" or graph_node.get("operator_only"):
+        return {
+            "kind": "operator",
+            "id": "operator",
+            "label": "Human operator approval required",
+        }
+    if primitive in {"verification", "notify", "wait_for_event"}:
+        return {
+            "kind": "machine",
+            "id": primitive,
+            "label": primitive.replace("_", " "),
+        }
+    seat = graph_node.get("seat")
+    profile = graph_node.get("execution_profile")
+    actor: dict[str, Any] = {
+        "kind": "seat",
+        "id": seat,
+        "execution_profile": profile,
+    }
+    if run is None:
+        actor["label"] = (
+            f"assigned {seat} / {profile}; run not yet recorded"
+            if seat and profile else "assigned seat/profile; run not yet recorded"
+        )
+    else:
+        actor["run_id"] = run.get("id")
+        actor["label"] = f"{seat} / {profile}"
+    return actor
+
+
+def _overlay_blocker(
+    step: dict[str, Any],
+    instance: dict[str, Any],
+    graph_node: dict[str, Any],
+    dependency_waiting: bool,
+) -> dict[str, Any] | None:
+    state = str(step.get("state") or "unknown")
+    # A persisted blocked state is authoritative even when its declared
+    # dependencies are also incomplete.  Dependency waiting by itself is not
+    # a blocker and must remain null below.
+    if state in {"blocked", "worker_blocked"}:
+        reason = step.get("blocked_reason") or instance.get("blocked_reason")
+        return {
+            "kind": "blocked" if reason else "unknown",
+            "reason": str(reason) if reason else "unknown",
+            "step_id": step["step_id"],
+            "activation": step["activation"],
+        }
+    if state == "failed":
+        return {
+            "kind": "failed",
+            "reason": str(step.get("blocked_reason") or "step failed"),
+            "step_id": step["step_id"],
+            "activation": step["activation"],
+        }
+    if state not in {
+        "done", "skipped", "cancelled", "running", "running_verification",
+        "ready", "pending", "waiting", "waiting_gate", "needs_input",
+        "waiting_event",
+    }:
+        return {
+            "kind": "unknown",
+            "reason": "unknown step state",
+            "step_id": step["step_id"],
+            "activation": step["activation"],
+        }
+    if graph_node.get("primitive") == "approval_gate" and state in _APPROVAL_WAITING_STATES:
+        return {
+            "kind": "approval",
+            "reason": "human action required",
+            "step_id": step["step_id"],
+            "activation": step["activation"],
+        }
+    if dependency_waiting:
+        return None
+    return None
+
+
+def _overlay_history(
+    db: Any,
+    instance_id: str,
+    recipe_order: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    rows = [dict(row) for row in db.execute(
+        "SELECT * FROM recipe_steps WHERE instance_id=? ORDER BY activation,step_id",
+        (instance_id,),
+    ).fetchall()]
+    positions = {step_id: index for index, step_id in enumerate(recipe_order)}
+    rows.sort(key=lambda row: (
+        positions.get(row["step_id"], len(positions)),
+        int(row.get("activation") or 0),
+        str(row["step_id"]),
+    ))
+    history: list[dict[str, Any]] = []
+    by_step: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        verdict, verdict_status = _strict_overlay_verdict(row.get("verdict_json"))
+        finding_count = row.get("finding_count")
+        if finding_count is None and verdict is not None:
+            findings = verdict.get("findings")
+            if isinstance(findings, list):
+                finding_count = len(findings)
+        item: dict[str, Any] = {
+            "step_id": row["step_id"],
+            "activation": row["activation"],
+            "state": row["state"],
+            "rejected_by_step_id": row.get("rejected_by_step_id"),
+            "rejected_by_activation": row.get("rejected_by_activation"),
+            "verdict": verdict,
+            "finding_count": finding_count,
+        }
+        if verdict_status is not None:
+            item["verdict_status"] = verdict_status
+        history.append(item)
+        by_step[row["step_id"]].append(item)
+    return history, by_step
+
+
+def _instance_graph_overlay(
+    db: Any,
+    instance: dict[str, Any],
+    graph: dict[str, Any],
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Project persisted recipe state over an immutable graph without writes."""
+    instance_id = str(instance["id"])
+    recipe_order = [
+        node["id"] for node in graph.get("nodes", [])
+        if not node.get("projection_only")
+    ]
+    graph_nodes = {
+        node["id"]: node for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+    }
+    history_rows, history_by_step = _overlay_history(db, instance_id, recipe_order)
+    latest: dict[str, dict[str, Any]] = {}
+    for row in history_rows:
+        latest[row["step_id"]] = row
+    step_rows = {
+        (row["step_id"], int(row["activation"])): dict(row)
+        for row in db.execute(
+            "SELECT * FROM recipe_steps WHERE instance_id=?",
+            (instance_id,),
+        ).fetchall()
+    }
+    run_rows = [dict(row) for row in db.execute(
+        """
+        SELECT r.* FROM runs AS r
+        JOIN recipe_steps AS s ON s.instance_id=?
+          AND s.kanban_task_id IS NOT NULL AND s.kanban_task_id=r.task_id
+          AND (r.recipe_activation IS NULL OR r.recipe_activation=s.activation)
+        """,
+        (instance_id,),
+    ).fetchall()]
+    runs_by_step: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for run in run_rows:
+        for key, row in step_rows.items():
+            if row.get("kanban_task_id") != run.get("task_id"):
+                continue
+            if run.get("recipe_activation") is not None and int(run["recipe_activation"]) != key[1]:
+                continue
+            runs_by_step[key].append(run)
+    for values in runs_by_step.values():
+        values.sort(key=lambda row: int(row.get("id") or 0))
+
+    def dependency_waiting(step_id: str) -> bool:
+        node = graph_nodes.get(step_id) or {}
+        for parent in node.get("needs", []):
+            parent_row = latest.get(parent)
+            if parent_row is None or parent_row.get("state") not in {"done", "skipped"}:
+                return True
+        return False
+
+    overlays: list[dict[str, Any]] = []
+    for node in graph.get("nodes", []):
+        step_id = node.get("id")
+        if node.get("projection_only") or step_id not in latest:
+            continue
+        row = latest[step_id]
+        key = (step_id, int(row["activation"]))
+        run = runs_by_step.get(key, [])[-1] if runs_by_step.get(key) else None
+        overlays.append({
+            "step_id": step_id,
+            "current_activation": row["activation"],
+            "state": row["state"],
+            "attempts": len(history_by_step.get(step_id, [])),
+            "task_id": step_rows.get(key, {}).get("kanban_task_id"),
+            "actor": _overlay_actor(node, run),
+            "blocker": _overlay_blocker(
+                step_rows.get(key, row), instance, node, dependency_waiting(step_id),
+            ),
+        })
+
+    # A review router is a display projection of its review source.  It has no
+    # recipe-step row and therefore can never become a second workflow node.
+    for node in graph.get("nodes", []):
+        if node.get("primitive") != "review_verdict_router":
+            continue
+        source_id = str(node.get("id", ""))[:-len(":verdict")]
+        source = next((item for item in overlays if item["step_id"] == source_id), None)
+        if source is None:
+            continue
+        overlays.append({
+            "step_id": node["id"],
+            "current_activation": source["current_activation"],
+            "state": source["state"],
+            "attempts": source["attempts"],
+            "task_id": source["task_id"],
+            "actor": source["actor"],
+            "blocker": source["blocker"],
+            "projection_source": source_id,
+        })
+
+    rework_edges: list[dict[str, Any]] = []
+    # Rework provenance names recipe steps only.  Router and unsupported nodes
+    # are display projections and must never be accepted as persisted sources.
+    recipe_node_ids = {
+        node["id"] for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+        and not node.get("projection_only")
+        and node.get("primitive") != "unsupported"
+    }
+    router_ids = {
+        node["id"] for node in graph.get("nodes", [])
+        if node.get("primitive") == "review_verdict_router"
+    }
+    for row in history_rows:
+        source = row.get("rejected_by_step_id")
+        if not source or source not in recipe_node_ids:
+            continue
+        target = row["step_id"]
+        if target not in recipe_node_ids:
+            continue
+        edge_from = f"{source}:verdict" if f"{source}:verdict" in router_ids else source
+        rework_edges.append({
+            "id": f"{edge_from}->{target}:review_rework:{row['activation']}",
+            "from": edge_from,
+            "to": target,
+            "kind": "review_rework",
+            "kinds": ["review_rework"],
+            "label": f"request_changes -> {target}",
+            "projection_only": True,
+            "source_step_id": source,
+            "source_activation": row.get("rejected_by_activation"),
+            "target_activation": row["activation"],
+        })
+
+    terminal = {"done", "skipped", "cancelled", "failed"}
+    state_priority = {
+        "running": 0,
+        "running_verification": 0,
+        "ready": 1,
+        "waiting": 2,
+        "waiting_gate": 2,
+        "waiting_event": 2,
+        "blocked": 2,
+        "worker_blocked": 2,
+        "needs_input": 2,
+        "pending": 3,
+    }
+    candidates: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    graph_position = {
+        node.get("id"): index
+        for index, node in enumerate(graph.get("nodes", []))
+        if isinstance(node, dict)
+    }
+    for node in graph.get("nodes", []):
+        if node.get("projection_only") or node.get("id") not in latest:
+            continue
+        row = latest[node["id"]]
+        state = str(row.get("state") or "unknown")
+        if state in terminal:
+            continue
+        overlay = next((item for item in overlays if item["step_id"] == node["id"]), None)
+        if overlay is not None:
+            candidates.append((
+                state_priority.get(state, len(state_priority)),
+                graph_position[node["id"]],
+                row,
+                overlay,
+            ))
+    unknown_nodes = [
+        (node, latest[node["id"]], next((item for item in overlays if item["step_id"] == node["id"]), None))
+        for node in graph.get("nodes", [])
+        if not node.get("projection_only")
+        and node.get("id") in latest
+        and str(latest[node["id"]].get("state") or "unknown") not in {
+            "done", "skipped", "cancelled", "failed", "blocked", "worker_blocked",
+            "running", "running_verification", "ready", "pending", "waiting",
+            "waiting_gate", "needs_input", "waiting_event",
+        }
+    ]
+    next_candidate: dict[str, Any] | None = None
+    next_overlay: dict[str, Any] | None = None
+    if not unknown_nodes and candidates:
+        _, _, next_candidate, next_overlay = min(candidates, key=lambda item: (item[0], item[1]))
+    next_actor = None
+    blocker = None
+    if unknown_nodes:
+        _, unknown_row, unknown_overlay = min(
+            unknown_nodes, key=lambda item: graph_position.get(item[0]["id"], len(graph_position))
+        )
+        blocker = unknown_overlay["blocker"] if unknown_overlay is not None else {
+            "kind": "unknown",
+            "reason": "unknown step state",
+            "step_id": unknown_row["step_id"],
+            "activation": unknown_row["activation"],
+        }
+    elif next_candidate is not None and next_overlay is not None:
+        next_actor = {
+            **next_overlay["actor"],
+            "step_id": next_candidate["step_id"],
+            "activation": next_candidate["activation"],
+        }
+        blocker = next_overlay["blocker"]
+    else:
+        # Failed steps are terminal and therefore absent from candidates, but
+        # their persisted failure remains the authoritative explanation when
+        # the workflow has no next actor.
+        terminal_blockers = [
+            item for item in overlays
+            if item.get("blocker") is not None
+            and item["state"] in {"failed", "blocked", "worker_blocked"}
+        ]
+        if terminal_blockers:
+            blocker = min(
+                terminal_blockers,
+                key=lambda item: graph_position.get(item["step_id"], len(graph_position)),
+            )["blocker"]
+        elif instance.get("status") == "blocked":
+            reason = instance.get("blocked_reason")
+            blocker = {
+                "kind": "blocked" if reason else "unknown",
+                "reason": str(reason) if reason else "unknown",
+                "step_id": None,
+                "activation": None,
+            }
+
+    history: Any
+    if runtime.get("history_enabled"):
+        history = {
+            "enabled": True,
+            "fold_threshold": int(runtime["history_fold_threshold"]),
+            "items": history_rows,
+        }
+    else:
+        history = {
+            "enabled": False,
+            "fold_threshold": int(runtime["history_fold_threshold"]),
+            "items": [],
+            "reason": "disabled",
+        }
+    return {
+        "instance": {
+            "instance_id": instance_id,
+            "project_id": instance.get("project_id"),
+            "status": instance.get("status"),
+            "linear_issue_id": instance.get("linear_issue_id"),
+        },
+        "next_actor": next_actor,
+        "blocker": blocker,
+        "nodes": overlays,
+        "history": history,
+        "rework_edges": rework_edges,
+        "receipts": {
+            "available": bool(run_rows),
+            "endpoint": f"/instances/{instance_id}/receipts",
+        },
+        "evidence": {"status": "unavailable", "items": []},
+    }
+
+
+def _disabled_graph_overlay(instance_id: str, runtime: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable empty wrapper without touching persisted overlay state."""
+    return {
+        "instance": {
+            "instance_id": instance_id,
+            "project_id": None,
+            "status": None,
+            "linear_issue_id": None,
+        },
+        "next_actor": None,
+        "blocker": None,
+        "nodes": [],
+        "history": {
+            "enabled": False,
+            "fold_threshold": int(runtime["history_fold_threshold"]),
+            "items": [],
+            "reason": "live_overlay_disabled",
+        },
+        "rework_edges": [],
+        "receipts": {
+            "available": False,
+            "endpoint": f"/instances/{instance_id}/receipts",
+        },
+        "evidence": {"status": "unavailable", "items": []},
+    }
 
 
 def _project_value(project: Any, name: str, default: Any = None) -> Any:
@@ -1063,12 +1489,22 @@ def instance_graph(instance_id: str) -> dict[str, Any] | JSONResponse:
     try:
         config, runtime = _fresh_graph_runtime_config()
         recipe = _pinned_instance_recipe(config, instance_id)
-        return project_graph(
+        graph = project_graph(
             recipe.document,
             recipe_hash=recipe.hash,
             pinned=True,
             config=runtime,
         )
+        if not runtime["live_overlay_enabled"]:
+            return {"graph": graph, **_disabled_graph_overlay(instance_id, runtime)}
+        with store._connect() as db:
+            row = db.execute(
+                "SELECT * FROM recipe_instances WHERE id=?", (instance_id,)
+            ).fetchone()
+            if row is None:
+                _project_error(404, "instance_not_found", "unknown recipe instance")
+            overlay = _instance_graph_overlay(db, dict(row), graph, runtime)
+        return {"graph": graph, **overlay}
     except _ProjectAPIError as exc:
         return _project_error_response(exc)
 
@@ -1261,7 +1697,7 @@ def get_instance(instance_id: str) -> dict[str, Any]:
         story = None
         waiting_approval = db.execute(
             "SELECT step_id FROM recipe_steps WHERE instance_id=? "
-            "AND primitive='approval_gate' AND state='waiting' "
+            "AND primitive='approval_gate' AND state IN ('waiting','waiting_gate','needs_input') "
             "ORDER BY activation DESC LIMIT 1",
             (instance_id,),
         ).fetchone()
@@ -1394,7 +1830,7 @@ def waiting_gates() -> list[dict[str, Any]]:
             FROM recipe_steps AS s JOIN recipe_instances AS i ON i.id=s.instance_id
             JOIN (SELECT instance_id,step_id,MAX(activation) AS activation FROM recipe_steps GROUP BY instance_id,step_id) AS latest
               ON latest.instance_id=s.instance_id AND latest.step_id=s.step_id AND latest.activation=s.activation
-            WHERE s.primitive='approval_gate' AND s.state='waiting'
+            WHERE s.primitive='approval_gate' AND s.state IN ('waiting','waiting_gate','needs_input')
             ORDER BY i.updated_at DESC,s.step_id
             """
         ).fetchall()
