@@ -5,15 +5,18 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from typing import Any
 
 import yaml
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 # Dashboard APIs are imported directly from ``dashboard/plugin_api.py`` by
 # Hermes, unlike the normal plugin entry point.  Make the repository root
@@ -24,6 +27,7 @@ if _PLUGIN_ROOT not in sys.path:
 
 from shipfactory import store
 from shipfactory.recipes import advancer
+from shipfactory.recipes.loader import RecipeError
 
 
 router = APIRouter()
@@ -79,6 +83,24 @@ class RerouteRecipe(BaseModel):
     recipe: str = Field(min_length=1)
     version: int = Field(ge=1)
     parameters: dict[str, object] = Field(default_factory=dict)
+
+
+class ProjectRecipePolicyWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_recipe_keys: list[str]
+    default_recipe_key: str | None = None
+
+
+class ProjectFlightRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recipe: str = Field(min_length=1)
+    version: int = Field(ge=1)
+    parameters: dict[str, object] = Field(default_factory=dict)
+    skip_steps: list[str] = Field(default_factory=list)
+    linear_issue_id: str | None = None
+    idempotency_key: str = Field(min_length=1)
 
 
 class SeatWrite(BaseModel):
@@ -257,6 +279,445 @@ def _request_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+class _ProjectAPIError(Exception):
+    def __init__(self, status_code: int, error: str, message: str, field: str | None = None):
+        self.status_code = status_code
+        self.error = error
+        self.message = message
+        self.field = field
+
+
+def _project_error(
+    status_code: int, error: str, message: str, field: str | None = None,
+) -> None:
+    raise _ProjectAPIError(status_code, error, message, field)
+
+
+def _project_error_response(exc: _ProjectAPIError) -> JSONResponse:
+    payload = {"error": exc.error, "message": exc.message}
+    if exc.field is not None:
+        payload["field"] = exc.field
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+def _fresh_projects_runtime_config() -> tuple[Any, dict[str, Any]]:
+    """Load the single operator config source at every Projects request."""
+    from shipfactory.config import load_seats, projects_visual_recipes_config
+
+    config = load_seats()
+    return config, projects_visual_recipes_config(config.recipes)
+
+
+def _project_value(project: Any, name: str, default: Any = None) -> Any:
+    if isinstance(project, dict):
+        return project.get(name, default)
+    return getattr(project, name, default)
+
+
+def _project_registry(project_id: str | None = None) -> tuple[Any, list[Any]]:
+    """Read Hermes projects and their explicit ``board_slug`` live."""
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing() as conn:
+        projects = list(projects_db.list_projects(conn))
+        if project_id is None:
+            return None, projects
+        project = projects_db.get_project(conn, project_id)
+    return project, projects
+
+
+def _project_binding(project: Any, projects: list[Any]) -> str:
+    board_slug = _project_value(project, "board_slug")
+    if not isinstance(board_slug, str) or not board_slug.strip():
+        return "unbound"
+    matches = [item for item in projects if _project_value(item, "board_slug") == board_slug]
+    return "bound" if len(matches) == 1 and _project_value(matches[0], "id") == _project_value(project, "id") else "ambiguous"
+
+
+def resolve_hermes_project(project_id: str) -> dict[str, Any]:
+    """Return a live Hermes project projection without persisting a mapping."""
+    project, projects = _project_registry(project_id)
+    if project is None:
+        _project_error(404, "project_not_found", "unknown Hermes project")
+    return {
+        "project": project,
+        "projects": projects,
+        "binding": _project_binding(project, projects),
+        "board_slug": _project_value(project, "board_slug"),
+    }
+
+
+def _project_summary(project: Any, binding: str, policy: dict[str, Any] | None,
+                     rollup: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _project_value(project, "id"),
+        "slug": _project_value(project, "slug"),
+        "name": _project_value(project, "name"),
+        "binding": binding,
+        "recipes": {
+            "allowed": list(policy["allowed_recipe_keys"] if policy else []),
+            "default": policy["default_recipe_key"] if policy else None,
+        },
+        "rollup": rollup,
+    }
+
+
+def _rollup_rows(rows: list[dict[str, Any]], recent_limit: int) -> dict[str, Any]:
+    waiting_states = {"waiting_gate", "waiting_event"}
+    terminal_states = {"done", "failed", "cancelled", *waiting_states}
+    counts = defaultdict(int)
+    for row in rows:
+        counts[row["status"]] += 1
+    recent = sorted(
+        rows,
+        key=lambda row: (str(row.get("updated_at") or ""), str(row.get("id") or "")),
+        reverse=True,
+    )[:recent_limit]
+    return {
+        "active": sum(count for state, count in counts.items() if state not in terminal_states),
+        "waiting": sum(count for state, count in counts.items() if state in waiting_states),
+        "recent": [
+            {
+                "instance_id": row["id"],
+                "recipe": f"{row['recipe_id']}@{row['recipe_version']}",
+                "status": row["status"],
+                "updated_at": row["updated_at"],
+                "linear_issue_id": row.get("linear_issue_id"),
+            }
+            for row in recent
+        ],
+    }
+
+
+def _project_rollups(db: Any, projects: list[Any], recent_limit: int) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    rows = [dict(row) for row in db.execute(
+        "SELECT id,board,project_id,recipe_id,recipe_version,status,updated_at,linear_issue_id "
+        "FROM recipe_instances"
+    ).fetchall()]
+    by_board: dict[str, list[Any]] = defaultdict(list)
+    for project in projects:
+        board_slug = _project_value(project, "board_slug")
+        if isinstance(board_slug, str) and board_slug.strip():
+            by_board[board_slug].append(project)
+    buckets: dict[str, list[dict[str, Any]]] = {str(_project_value(p, "id")): [] for p in projects}
+    unclassified: list[dict[str, Any]] = []
+    for row in rows:
+        candidates = by_board.get(row.get("board"), [])
+        owner = candidates[0] if len(candidates) == 1 else None
+        if owner is not None and row.get("project_id") not in {None, _project_value(owner, "id")}:
+            owner = None
+        if owner is None:
+            unclassified.append(row)
+        else:
+            buckets[str(_project_value(owner, "id"))].append(row)
+    return (
+        {project_id: _rollup_rows(items, recent_limit) for project_id, items in buckets.items()},
+        _rollup_rows(unclassified, recent_limit),
+    )
+
+
+def _policy_for(db: Any, project_id: str) -> dict[str, Any] | None:
+    try:
+        return store.load_project_recipe_policy(db, project_id)
+    except (TypeError, ValueError) as exc:
+        _project_error(400, "invalid_policy", str(exc))
+
+
+def _library_for_config(config: Any, *, persist: bool) -> Any:
+    from shipfactory.recipes.loader import load_library
+
+    recipes = config.recipes or {}
+    path = recipes.get("library_path")
+    if not path:
+        _project_error(400, "invalid_recipe_library", "recipes.library_path is not configured")
+    try:
+        return load_library(
+            path,
+            seats=set(config.seats),
+            profiles=set((recipes.get("execution_profiles") or {}).keys()),
+            persist=persist,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        _project_error(400, "invalid_recipe_library", str(exc))
+
+
+def _require_project_flag(runtime: dict[str, Any], flag: str) -> None:
+    if not runtime.get("enabled") or not runtime.get(flag):
+        _project_error(403, "feature_disabled", f"Projects feature {flag} is disabled")
+
+
+def _recipe_summary(recipe: Any, default_key: str | None) -> dict[str, Any]:
+    document = recipe.document
+    budgets = document.get("budgets") or {}
+    caps = budgets.get("step_activation_caps")
+    steps = []
+    for step in document.get("steps", []):
+        params = step.get("params") or {}
+        steps.append({
+            "id": step["id"],
+            "title": step["title"],
+            "primitive": step["primitive"],
+            "needs": step["needs"],
+            "optional": step["optional"],
+            "seat": params.get("seat"),
+            "execution_profile": params.get("execution_profile"),
+            "access_mode": params.get("access_mode"),
+            "environment": params.get("environment"),
+            "instructions": params.get("instructions"),
+            "inputs": step.get("inputs", []),
+            "outputs": step.get("outputs", []),
+            "activation_cap": caps.get(step["id"]) if isinstance(caps, dict) else None,
+        })
+    return {
+        "key": recipe.key,
+        "id": document["id"],
+        "version": document["version"],
+        "status": document["status"],
+        "recipe_hash": recipe.hash,
+        "description": document["description"],
+        "parameters": document["parameters"],
+        "budgets": {
+            "max_activations": budgets.get("max_activations"),
+            "step_activation_caps": caps,
+        },
+        "steps": steps,
+        "optional_steps": [
+            {"id": step["id"], "title": step["title"]}
+            for step in document.get("steps", []) if step["optional"]
+        ],
+        "default": recipe.key == default_key,
+    }
+
+
+def _validate_project_policy(policy: dict[str, Any] | None, library: Any) -> None:
+    if policy is None:
+        return
+    allowed = policy["allowed_recipe_keys"]
+    default = policy["default_recipe_key"]
+    if allowed and default is None:
+        _project_error(
+            400, "invalid_policy",
+            "a non-empty recipe policy requires a default recipe",
+            "default_recipe_key",
+        )
+    if default is not None and default not in allowed:
+        _project_error(
+            400, "invalid_policy", "default_recipe_key must be allowed",
+            "default_recipe_key",
+        )
+    for key in allowed:
+        try:
+            recipe = library.get(key)
+        except RecipeError as exc:
+            _project_error(400, "invalid_policy", str(exc), "allowed_recipe_keys")
+        if recipe.document.get("status") != "active":
+            _project_error(
+                400, "invalid_policy", f"recipe {key!r} is not active",
+                "allowed_recipe_keys",
+            )
+
+
+def _row_skip_steps(db: Any, instance_id: str) -> list[str]:
+    return sorted(
+        str(row[0]) for row in db.execute(
+            "SELECT step_id FROM recipe_steps WHERE instance_id=? AND state='skipped'",
+            (instance_id,),
+        ).fetchall()
+    )
+
+
+def _flight_fingerprint(project_id: str, recipe: Any, parameters: dict[str, Any],
+                        skip_steps: list[str], linear_issue_id: str | None,
+                        idempotency_key: str) -> str:
+    payload = {
+        "project_id": project_id,
+        "recipe": recipe.key,
+        "recipe_hash": recipe.hash,
+        "parameters": parameters,
+        "skip_steps": sorted(skip_steps),
+        "linear_issue_id": linear_issue_id,
+        "idempotency_key": idempotency_key,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _flight_matches(db: Any, row: dict[str, Any], project_id: str, recipe: Any,
+                    parameters: dict[str, Any], skip_steps: list[str],
+                    linear_issue_id: str | None, idempotency_key: str) -> bool:
+    try:
+        stored_parameters = json.loads(row["parameters_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    try:
+        version_matches = int(row.get("recipe_version")) == int(recipe.document["version"])
+    except (TypeError, ValueError):
+        version_matches = False
+    return (
+        row.get("project_id") == project_id
+        and row.get("launch_idempotency_key") == idempotency_key
+        and row.get("linear_issue_id") == linear_issue_id
+        and row.get("recipe_id") == recipe.document["id"]
+        and version_matches
+        and row.get("recipe_hash") == recipe.hash
+        and stored_parameters == parameters
+        and _row_skip_steps(db, row["id"]) == sorted(skip_steps)
+    )
+
+
+def _flight_identity_rows(
+    db: Any, project_id: str, linear_issue_id: str | None,
+    idempotency_key: str,
+) -> list[dict[str, Any]]:
+    """Probe both durable identity fences, preserving one row per identity."""
+    rows: list[dict[str, Any]] = []
+    for row in (
+        store.project_flight_by_idempotency_key(db, project_id, idempotency_key),
+        store.project_flight_by_linear_issue_id(db, linear_issue_id)
+        if linear_issue_id is not None else None,
+    ):
+        if row is not None and all(row["id"] != existing["id"] for existing in rows):
+            rows.append(row)
+    return rows
+
+
+def _replay_or_conflict(
+    db: Any, project_id: str, recipe: Any, parameters: dict[str, Any],
+    skip_steps: list[str], linear_issue_id: str | None, idempotency_key: str,
+) -> tuple[dict[str, Any], int] | None:
+    rows = _flight_identity_rows(db, project_id, linear_issue_id, idempotency_key)
+    if not rows:
+        return None
+    if len(rows) != 1 or not _flight_matches(
+        db, rows[0], project_id, recipe, parameters, skip_steps,
+        linear_issue_id, idempotency_key,
+    ):
+        _project_error(
+            409, "idempotency_conflict", "launch identity is already used",
+            "idempotency_key",
+        )
+    return _flight_response(rows[0], skip_steps), 200
+
+
+def _flight_response(row: dict[str, Any], skip_steps: list[str] | None = None) -> dict[str, Any]:
+    try:
+        parameters = json.loads(row["parameters_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        _project_error(409, "invalid_flight", "stored flight parameters are invalid")
+    if skip_steps is None:
+        skip_steps = []
+    return {
+        "instance_id": row["id"],
+        "project_id": row["project_id"],
+        "recipe": f"{row['recipe_id']}@{row['recipe_version']}",
+        "recipe_hash": row["recipe_hash"],
+        "parameters": parameters,
+        "skip_steps": sorted(skip_steps),
+        "linear_issue_id": row.get("linear_issue_id"),
+        "idempotency_key": row["launch_idempotency_key"],
+        "linear_backlink": {
+            "status": "unavailable",
+            "issue_id": row.get("linear_issue_id"),
+            "reason": "in-product backlink writer deferred",
+        },
+        "status": row["status"],
+        "created_at": row["created_at"],
+    }
+
+
+def _launch_project_flight(project_id: str, request: ProjectFlightRequest) -> tuple[dict[str, Any], int]:
+    config, runtime = _fresh_projects_runtime_config()
+    _require_project_flag(runtime, "launch_enabled")
+    issue_id = request.linear_issue_id
+    if not request.idempotency_key.strip():
+        _project_error(400, "invalid_request", "idempotency_key must be non-empty", "idempotency_key")
+    if issue_id is not None and not issue_id.strip():
+        _project_error(400, "invalid_request", "linear_issue_id must be non-empty", "linear_issue_id")
+    library = _library_for_config(config, persist=True)
+    recipe_key = f"{request.recipe}@{request.version}"
+    from shipfactory.recipes.loader import RecipeError, bind_parameters
+
+    try:
+        recipe = library.get(recipe_key)
+    except RecipeError as exc:
+        _project_error(404, "recipe_not_found", str(exc))
+    if recipe.document.get("status") != "active":
+        _project_error(400, "invalid_policy", "only active recipes may be launched")
+    try:
+        bound = bind_parameters(recipe, dict(request.parameters), list(request.skip_steps))
+    except (TypeError, ValueError) as exc:
+        _project_error(400, "invalid_parameters", str(exc))
+    skips = sorted(set(request.skip_steps))
+
+    # Probe both durable identity fences before reading the current project
+    # binding or policy.  A replay is an old flight and must retain its captured
+    # board/recipe/hash even after an operator changes Hermes or Factory policy.
+    store.init_db()
+    with store._connect() as db:
+        replay = _replay_or_conflict(
+            db, project_id, recipe, bound, skips, issue_id, request.idempotency_key,
+        )
+        if replay is not None:
+            return replay
+
+    projection = resolve_hermes_project(project_id)
+    if projection["binding"] != "bound":
+        _project_error(409, "project_binding_unavailable", "project has no unique active board binding")
+    board = projection["board_slug"]
+    if not isinstance(board, str) or not board.strip():
+        _project_error(409, "project_binding_unavailable", "project has no board binding")
+    with store._connect() as db:
+        policy = _policy_for(db, project_id)
+        allowed = policy["allowed_recipe_keys"] if policy else []
+        if recipe_key not in allowed:
+            _project_error(400, "recipe_not_allowed", "recipe is not attached to this project")
+    instance_id = "flight-" + _flight_fingerprint(
+        project_id, recipe, bound, skips, issue_id, request.idempotency_key,
+    )
+    from hermes_cli import kanban_db
+    from shipfactory.recipes.instantiate import instantiate
+
+    conn = kanban_db.connect(board=board)
+    try:
+        instantiate(
+            conn,
+            board=board,
+            recipe=recipe,
+            parameters=dict(request.parameters),
+            skip_steps=skips,
+            instance_id=instance_id,
+            project_id=project_id,
+            linear_issue_id=issue_id,
+            launch_idempotency_key=request.idempotency_key,
+        )
+    except sqlite3.IntegrityError:
+        with store._connect() as db:
+            replay = _replay_or_conflict(
+                db, project_id, recipe, bound, skips, issue_id,
+                request.idempotency_key,
+            )
+            if replay is not None:
+                return replay
+        _project_error(
+            409, "idempotency_conflict", "launch identity is already used",
+            "idempotency_key",
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        _project_error(400, "launch_failed", str(exc))
+    finally:
+        conn.close()
+    with store._connect() as db:
+        row = store.project_flight(db, instance_id)
+        if row is None:
+            _project_error(409, "launch_incomplete", "flight identity was not persisted")
+        return _flight_response(row, skips), 201
+
+
+def launch_project_flight(project_id: str, request: ProjectFlightRequest) -> dict[str, Any]:
+    return _launch_project_flight(project_id, request)[0]
+
+
 def _cancel_preview(instance_id: str, board: str) -> dict[str, Any]:
     from shipfactory.spawn import _RUNNING
     from hermes_cli import kanban_db
@@ -294,6 +755,115 @@ def _cancel_preview(instance_id: str, board: str) -> dict[str, Any]:
         return report
     finally:
         conn.close()
+
+
+@router.get("/projects", response_model=None)
+def list_projects() -> dict[str, Any] | JSONResponse:
+    try:
+        config, runtime = _fresh_projects_runtime_config()
+        _require_project_flag(runtime, "enabled")
+        project, projects = _project_registry()
+        del project
+        store.init_db()
+        with store._connect() as db:
+            rollups, unclassified_rollup = _project_rollups(
+                db, projects, int(runtime["recent_flight_limit"]),
+            )
+            summaries = []
+            for item in projects:
+                project_id = str(_project_value(item, "id"))
+                policy = _policy_for(db, project_id)
+                summaries.append(_project_summary(
+                    item, _project_binding(item, projects), policy, rollups[project_id],
+                ))
+        return {
+            "projects": summaries,
+            "runtime_config": runtime,
+            "unclassified": {
+                "id": "unclassified",
+                "label": "Unclassified",
+                "binding": "unclassified",
+                "rollup": unclassified_rollup,
+            },
+        }
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "projects_unavailable", str(exc)))
+
+
+@router.get("/projects/{project_id}/recipes", response_model=None)
+def project_recipes(project_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        config, runtime = _fresh_projects_runtime_config()
+        _require_project_flag(runtime, "enabled")
+        projection = resolve_hermes_project(project_id)
+        if projection["binding"] != "bound":
+            _project_error(409, "project_binding_unavailable", "project has no unique active board binding")
+        library = _library_for_config(config, persist=False)
+        store.init_db()
+        with store._connect() as db:
+            policy = _policy_for(db, project_id)
+        allowed = policy["allowed_recipe_keys"] if policy else []
+        _validate_project_policy(policy, library)
+        recipes = [
+            _recipe_summary(library.get(key), policy["default_recipe_key"] if policy else None)
+            for key in allowed
+        ]
+        return {
+            "project_id": project_id,
+            "recipes": recipes,
+            "default_recipe": policy["default_recipe_key"] if policy else None,
+        }
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "projects_unavailable", str(exc)))
+
+
+@router.put("/projects/{project_id}/recipe-policy", response_model=None)
+def update_project_recipe_policy(
+    project_id: str, request: ProjectRecipePolicyWrite,
+) -> dict[str, Any] | JSONResponse:
+    try:
+        config, runtime = _fresh_projects_runtime_config()
+        _require_project_flag(runtime, "policy_editing_enabled")
+        project, _ = _project_registry(project_id)
+        if project is None:
+            _project_error(404, "project_not_found", "unknown Hermes project")
+        library = _library_for_config(config, persist=False)
+        requested_policy = {
+            "allowed_recipe_keys": request.allowed_recipe_keys,
+            "default_recipe_key": request.default_recipe_key,
+        }
+        _validate_project_policy(requested_policy, library)
+        store.init_db()
+        with store._connect() as db:
+            try:
+                return store.save_project_recipe_policy(
+                    db, project_id, request.allowed_recipe_keys, request.default_recipe_key,
+                )
+            except (TypeError, ValueError) as exc:
+                _project_error(400, "invalid_policy", str(exc))
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "projects_unavailable", str(exc)))
+
+
+@router.post("/projects/{project_id}/flights", status_code=201, response_model=None)
+def create_project_flight(
+    project_id: str, request: ProjectFlightRequest,
+) -> dict[str, Any] | JSONResponse:
+    try:
+        response, status_code = _launch_project_flight(project_id, request)
+        if status_code == 201:
+            return response
+        return JSONResponse(status_code=status_code, content=response)
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "launch_failed", str(exc)))
 
 
 @router.get("/recipes")
