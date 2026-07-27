@@ -1,8 +1,7 @@
-"""Static contracts for the pre-renderer graph/conformance lane.
+"""Static contracts for the native SVG graph/conformance lane.
 
-These tests parse the deterministic fixture payload and inspect the owned CSS
-and harness source.  They do not claim that the not-yet-owned dashboard bundle
-renders graph UI.
+These tests parse the deterministic fixture payload and inspect the owned CSS,
+harness, and dashboard renderer source.
 """
 
 from __future__ import annotations
@@ -12,18 +11,21 @@ import re
 import subprocess
 from pathlib import Path
 
+from shipfactory.config import PROJECTS_VISUAL_RECIPES_DEFAULTS
 from shipfactory.recipes.loader import load_library
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CSS_PATH = ROOT / "dashboard" / "dist" / "style.css"
 HARNESS_PATH = ROOT / "dashboard" / "conformance-harness.js"
+BUNDLE_PATH = ROOT / "dashboard" / "dist" / "index.js"
 CSS = CSS_PATH.read_text(encoding="utf-8")
 HARNESS = HARNESS_PATH.read_text(encoding="utf-8")
+BUNDLE = BUNDLE_PATH.read_text(encoding="utf-8")
 
 
 def _fixtures() -> dict:
-    prefix = "const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`"
+    prefix = "const CONFORMANCE_FIXTURES = deepFreeze(JSON.parse(String.raw`"
     suffix = "`));"
     start = HARNESS.find(prefix)
     assert start >= 0, "harness must keep a parseable deterministic fixture block"
@@ -94,6 +96,10 @@ def test_harness_has_non_authoritative_recipe_card_summaries() -> None:
     response_project = fixtures["projects_response"]["projects"][0]
     assert response_project == bound
     assert fixtures["projects_response"]["unclassified"] == projects["unclassified"]
+    assert fixtures["projects_response"]["runtime_config"] == PROJECTS_VISUAL_RECIPES_DEFAULTS
+    assert set(fixtures["projects_response"]["runtime_config"]) == set(
+        PROJECTS_VISUAL_RECIPES_DEFAULTS
+    )
 
     recipes = fixtures["recipes"]
     assert set(recipes) == {"dev-pipeline@14", "creative-video@1"}
@@ -133,6 +139,16 @@ def test_scenarios_use_consistent_routes_and_matching_history_graph() -> None:
     assert "recipes: [publishedRecipeFixtures[\"dev-pipeline@14\"]]" not in HARNESS
 
     synthetic = fixtures["graphs"]["synthetic_parallel_join"]
+    expected_layout = {
+        "direction": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_direction"],
+        "rank_gap": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_rank_gap"],
+        "lane_gap": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_lane_gap"],
+        "node_width": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_node_width"],
+        "node_height": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_node_height"],
+        "diamond_size": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_diamond_size"],
+    }
+    assert synthetic["source"]["pinned"] is False
+    assert synthetic["layout"] == expected_layout
     assert [node["id"] for node in synthetic["nodes"]] == [
         "start", "lint", "test", "join", "approve"
     ]
@@ -143,6 +159,8 @@ def test_scenarios_use_consistent_routes_and_matching_history_graph() -> None:
 
     history = fixtures["history"]["folded_rework"]
     history_graph = fixtures["graphs"]["folded_rework"]
+    assert history_graph["source"]["pinned"] is False
+    assert history_graph["layout"] == expected_layout
     history_node_ids = {node["id"] for node in history_graph["nodes"]}
     assert {row["step_id"] for row in history["history"]} == history_node_ids
     assert history_graph is not synthetic
@@ -242,8 +260,41 @@ def test_harness_declares_future_dom_attributes_safe_text_and_valid_syntax() -> 
     assert "insertAdjacentHTML" not in HARNESS
     assert "document.write" not in HARNESS
 
+    assert "function deepFreeze(value)" in HARNESS
+    assert "Object.getOwnPropertyNames(value).forEach(key => deepFreeze(value[key]));" in HARNESS
+    assert "const CONFORMANCE_FIXTURES = deepFreeze(JSON.parse(String.raw`" in HARNESS
+    assert "const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`" not in HARNESS
+
     result = subprocess.run(
         ["node", "--check", str(HARNESS_PATH)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_harness_recursively_freezes_nested_fixture_state_without_browser_proof() -> None:
+    deep_freeze_start = HARNESS.index("function deepFreeze(value)")
+    deep_freeze_end = HARNESS.index("const CONFORMANCE_FIXTURES", deep_freeze_start)
+    deep_freeze_source = HARNESS[deep_freeze_start:deep_freeze_end]
+    fixture_json = json.dumps(_fixtures(), separators=(",", ":"))
+    script = f"""
+{deep_freeze_source}
+const fixtures = deepFreeze({fixture_json});
+const nested = [
+  fixtures,
+  fixtures.projects_response.runtime_config,
+  fixtures.graphs.synthetic_parallel_join,
+  fixtures.graphs.synthetic_parallel_join.nodes,
+  fixtures.graphs.synthetic_parallel_join.nodes[0].needs,
+  fixtures.graphs.folded_rework.layout,
+];
+if (nested.some(value => !Object.isFrozen(value))) process.exit(1);
+"""
+    result = subprocess.run(
+        ["node", "-e", script],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -263,3 +314,77 @@ def test_harness_exposes_named_static_fixture_groups() -> None:
         "const foldedReworkGraphFixture",
     ):
         assert declaration in HARNESS
+
+
+def test_bundle_implements_payload_driven_native_svg_graph_renderer() -> None:
+    """The renderer is source-checked until W3 provides rendered-browser proof."""
+    for symbol in (
+        "function GraphRenderer",
+        "function GraphInspector",
+        "function graphLayout",
+        "function graphRanks",
+        "function graphEdgePath",
+        "function graphEdges",
+    ):
+        assert symbol in BUNDLE
+
+    for svg_tag in ('"svg"', '"defs"', '"marker"', '"g"', '"rect"', '"polygon"', '"path"', '"text"'):
+        assert "h(" + svg_tag in BUNDLE
+
+    for attribute in (
+        "data-graph-node", "data-step-id", "data-activation",
+        "data-graph-edge", "data-edge-from", "data-edge-to", "data-edge-kind",
+    ):
+        assert attribute in BUNDLE
+
+    for semantic in (
+        "tabIndex: 0",
+        "aria-label",
+        "aria-labelledby",
+        "onKeyDown",
+        'event.key === "Enter"',
+        'event.key === " "',
+        'event.key === "Escape"',
+        "operator-only",
+        "review_rework",
+        "rework_edges",
+        "projection_only",
+        "factory-graph-node--unsupported",
+    ):
+        assert semantic in BUNDLE
+
+    for layout_field in (
+        "direction", "rank_gap", "lane_gap",
+        "node_width", "node_height", "diamond_size",
+    ):
+        assert "layout." + layout_field in BUNDLE
+
+    assert 'schema_version !== "shipfactory.graph/v1"' in BUNDLE
+    assert "Graph layout is unavailable" in BUNDLE
+    assert "dangerouslySetInnerHTML" not in BUNDLE
+    assert ".innerHTML" not in BUNDLE
+
+
+def test_bundle_locks_graph_geometry_and_payload_semantics() -> None:
+    """Lock the W2-D formulas/classes without claiming browser rendering proof."""
+    assert "if (index) totalMajor += layout.rank_gap;" in BUNDLE
+    assert "majorOffset[rank] = totalMajor;" in BUNDLE
+    assert "totalMajor += rankMajorSizes[rank];" in BUNDLE
+    assert "node.primitive === \"join\" ? \"factory-graph-join\" : \"\"" in BUNDLE
+    assert (
+        'points: (box.width / 2) + ",0 " + box.width + "," + (box.height / 2) + " " '
+        '+ (box.width / 2) + "," + box.height + " 0," + (box.height / 2)'
+    ) in BUNDLE
+
+
+def test_renderer_does_not_add_a_workflow_definition_or_mutation_surface() -> None:
+    renderer = BUNDLE[BUNDLE.index("function graphLayout"):BUNDLE.index("function useReportViewMeta")]
+    assert "agent_task" not in renderer
+    assert "approval_gate" not in renderer
+    assert "/projects" not in renderer
+    assert 'method: "POST"' not in renderer
+    assert 'method: "PUT"' not in renderer
+    assert 'method: "DELETE"' not in renderer
+    assert "graph_node_width" not in renderer
+    assert "graph_node_height" not in renderer
+    assert "graph_diamond_size" not in renderer

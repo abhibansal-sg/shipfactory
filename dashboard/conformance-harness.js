@@ -15,7 +15,13 @@ const scenario = new URLSearchParams(window.location.search);
 // W1-D fixtures are a frozen, clock-independent payload.  Keep this JSON
 // block separate from the older dashboard scenarios: the future Projects and
 // Graph views can consume it without making the existing harness less useful.
-const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`{
+function deepFreeze(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.getOwnPropertyNames(value).forEach(key => deepFreeze(value[key]));
+  return Object.freeze(value);
+}
+
+const CONFORMANCE_FIXTURES = deepFreeze(JSON.parse(String.raw`{
   "as_of": "2026-07-27T00:00:00+00:00",
   "projects": {
     "bound": {
@@ -34,6 +40,7 @@ const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`{
     }
   },
   "projects_response": {
+    "runtime_config": {"enabled": true, "policy_editing_enabled": true, "launch_enabled": true, "graph_enabled": true, "live_overlay_enabled": true, "history_enabled": true, "recent_flight_limit": 20, "ui_refresh_interval_seconds": 5, "graph_direction": "TB", "graph_rank_gap": 56, "graph_lane_gap": 28, "graph_node_width": 180, "graph_node_height": 64, "graph_diamond_size": 24, "history_fold_threshold": 5},
     "projects": [{
       "id": "p_bound",
       "slug": "factory",
@@ -71,7 +78,7 @@ const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`{
   "graphs": {
     "synthetic_parallel_join": {
       "schema_version": "shipfactory.graph/v1",
-      "source": {"recipe_id": "synthetic-parallel", "version": 1, "recipe_key": "synthetic-parallel@1", "recipe_hash": "48ac873c776ae5e1dfd13a350db9879f374e39188923ec2221d0944feb2acbd7", "pinned": true},
+      "source": {"recipe_id": "synthetic-parallel", "version": 1, "recipe_key": "synthetic-parallel@1", "recipe_hash": "48ac873c776ae5e1dfd13a350db9879f374e39188923ec2221d0944feb2acbd7", "pinned": false},
       "nodes": [
         {"id": "start", "title": "Start", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": [], "inputs": [], "outputs": [], "params": {}, "seat": "builder", "execution_profile": "build", "access_mode": "workspace_write", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
         {"id": "lint", "title": "Lint", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": ["start"], "inputs": [], "outputs": [], "params": {}, "seat": "lint", "execution_profile": "build", "access_mode": "readonly", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
@@ -86,17 +93,17 @@ const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`{
         {"id": "test->join:needs", "from": "test", "to": "join", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false},
         {"id": "join->approve:needs", "from": "join", "to": "approve", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false}
       ],
-      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28, "node_width": 180, "node_height": 64, "diamond_size": 24}
     },
     "folded_rework": {
       "schema_version": "shipfactory.graph/v1",
-      "source": {"recipe_id": "fixture-rework", "version": 1, "recipe_key": "fixture-rework@1", "recipe_hash": "40526429229bfd0550a40ca2e1d34ffa7149bf72d6194800aea30c009224b357", "pinned": true},
+      "source": {"recipe_id": "fixture-rework", "version": 1, "recipe_key": "fixture-rework@1", "recipe_hash": "40526429229bfd0550a40ca2e1d34ffa7149bf72d6194800aea30c009224b357", "pinned": false},
       "nodes": [
         {"id": "build", "title": "Build", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": [], "inputs": [], "outputs": [], "params": {}, "seat": "builder", "execution_profile": "build", "access_mode": "workspace_write", "environment": "source", "activation_cap": 2, "legal_rework_targets": []},
         {"id": "review", "title": "Review", "primitive": "review_gate", "shape": "diamond", "projection_only": false, "optional": false, "needs": ["build"], "inputs": [], "outputs": [], "params": {}, "seat": "reviewer", "execution_profile": "review", "access_mode": "readonly", "environment": "source", "activation_cap": 2, "legal_rework_targets": ["build"]}
       ],
       "edges": [{"id": "build->review:needs", "from": "build", "to": "review", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false}],
-      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28, "node_width": 180, "node_height": 64, "diamond_size": 24}
     }
   },
   "history": {
