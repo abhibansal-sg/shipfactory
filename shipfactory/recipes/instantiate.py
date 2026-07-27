@@ -110,7 +110,13 @@ def _validate_notify_targets(recipe: Recipe, parameters: dict[str, Any]) -> None
             )
 
 
-def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, Any], skip_steps: list[str] | None = None, parent_tasks: list[str] | None = None, instance_id: str | None = None, base_sha: str | None = None) -> dict[str, Any]:
+def instantiate(
+    conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, Any],
+    skip_steps: list[str] | None = None, parent_tasks: list[str] | None = None,
+    instance_id: str | None = None, base_sha: str | None = None,
+    project_id: str | None = None, linear_issue_id: str | None = None,
+    launch_idempotency_key: str | None = None,
+) -> dict[str, Any]:
     """Persist one pinned instance and its collector; the advancer creates work.
 
     No task is made ready by this function except the inert collector, which is
@@ -135,7 +141,18 @@ def instantiate(conn: Any, *, board: str, recipe: Recipe, parameters: dict[str, 
     collector = kanban_db.create_blocked_task(conn, title=collector_title, body=collector_body, parents=parent_tasks or (), idempotency_key=collector_key, board=board, block_kind="needs_input", reason="recipe_collector")
     now = store._now(); skips = set(skip_steps or [])
     with store._connect() as db:
-        db.execute("INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,parameters_json,parent_tasks_json,base_sha,updated_base_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (instance_id, board, collector, recipe.document["id"], recipe.document["version"], recipe.hash, "running", json.dumps(bound, sort_keys=True), json.dumps(sorted(parent_tasks or [])), base_sha, now, now, now))
+        db.execute(
+            "INSERT INTO recipe_instances(id,board,collector_task_id,recipe_id,recipe_version,"
+            "recipe_hash,status,parameters_json,parent_tasks_json,base_sha,updated_base_at,"
+            "created_at,updated_at,project_id,linear_issue_id,launch_idempotency_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                instance_id, board, collector, recipe.document["id"], recipe.document["version"],
+                recipe.hash, "running", json.dumps(bound, sort_keys=True),
+                json.dumps(sorted(parent_tasks or [])), base_sha, now, now, now,
+                project_id, linear_issue_id, launch_idempotency_key,
+            ),
+        )
         for step in recipe.document["steps"]:
             state = "skipped" if step["id"] in skips else "pending"
             db.execute("INSERT INTO recipe_steps(instance_id,step_id,activation,primitive,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (instance_id, step["id"], 1, step["primitive"], state, now, now))
