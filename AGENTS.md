@@ -876,6 +876,12 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   internal fresh-activation event must join back to its exact applied outer
   operator-release event by event key, and that outer payload's `step_id` must
   match. Instance and activation equality alone can collide across review steps.
+- A focused oracle test must fence unrelated host-wide observers without
+  weakening the production boundary it is testing (finding #118, SF-21). The
+  fabricated-pytest regression now removes ambient `process_iter()` noise in
+  the test fixture only, while a separate production-path regression proves an
+  unreadable live process-scope scan still fails closed as
+  `test_infrastructure_error`.
 
 ## Conventions
 
