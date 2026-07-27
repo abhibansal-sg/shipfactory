@@ -239,9 +239,6 @@
    separate owner; these classes are stable visual hooks for its native SVG
    nodes and edges. */
 :root {
-  --factory-graph-node-width: 13rem;
-  --factory-graph-node-height: 4.75rem;
-  --factory-graph-diamond-size: 5.5rem;
   --factory-graph-edge-color: color-mix(in srgb, currentColor 34%, transparent);
   --factory-graph-rework-color: var(--color-destructive, #dc2626);
   --factory-graph-focus-ring: var(--color-primary, #2563eb);

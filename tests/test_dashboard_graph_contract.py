@@ -187,9 +187,6 @@ def test_css_declares_native_svg_graph_visual_foundation() -> None:
         assert selector in CSS
 
     for token in (
-        "--factory-graph-node-width",
-        "--factory-graph-node-height",
-        "--factory-graph-diamond-size",
         "--factory-graph-edge-color",
         "--factory-graph-rework-color",
         "--factory-graph-focus-ring",
