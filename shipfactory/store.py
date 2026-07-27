@@ -372,6 +372,25 @@ _CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS = (
 _CONTAINMENT_OVERLAY_MIGRATION_TEXT = (
     ";\n".join(_CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS) + ";\n"
 )
+_PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS = (
+    """CREATE TABLE project_recipe_policies (
+  project_id TEXT PRIMARY KEY,
+  allowed_recipe_keys_json TEXT NOT NULL,
+  default_recipe_key TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)""",
+    "ALTER TABLE recipe_instances ADD COLUMN project_id TEXT",
+    "ALTER TABLE recipe_instances ADD COLUMN linear_issue_id TEXT",
+    "ALTER TABLE recipe_instances ADD COLUMN launch_idempotency_key TEXT",
+    "CREATE INDEX idx_project_recipe_policies_updated ON project_recipe_policies(updated_at)",
+    "CREATE INDEX idx_recipe_instances_project_updated ON recipe_instances(project_id, updated_at DESC)",
+    "CREATE UNIQUE INDEX uq_recipe_instances_linear_issue ON recipe_instances(linear_issue_id) WHERE linear_issue_id IS NOT NULL",
+    "CREATE UNIQUE INDEX uq_recipe_instances_launch_key ON recipe_instances(project_id, launch_idempotency_key) WHERE project_id IS NOT NULL AND launch_idempotency_key IS NOT NULL",
+)
+_PROJECT_RECIPE_POLICY_MIGRATION_TEXT = (
+    ";\n".join(_PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -388,6 +407,7 @@ _MIGRATIONS = (
     (13, "verification_production_identity_binding", _VERIFICATION_PRODUCTION_BINDING_MIGRATION_TEXT),
     (14, "app_session_expected_candidate_identity", _APP_SESSION_IDENTITY_MIGRATION_TEXT),
     (15, "sf17_containment_overlay", _CONTAINMENT_OVERLAY_MIGRATION_TEXT),
+    (16, "sf18_project_recipe_policy_and_flight_identity", _PROJECT_RECIPE_POLICY_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -405,6 +425,7 @@ _MIGRATION_STATEMENTS = {
     13: _VERIFICATION_PRODUCTION_BINDING_MIGRATION_STATEMENTS,
     14: _APP_SESSION_IDENTITY_MIGRATION_STATEMENTS,
     15: _CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS,
+    16: _PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS,
 }
 
 
@@ -631,11 +652,7 @@ def init_db() -> None:
                     migration_artifacts = bool(
                         {"expected_instance_id", "expected_head_sha"} & app_columns
                     )
-                else:
-                    # This bare else IS the version-15 detector. Adding
-                    # migration 16 requires converting it to `elif version
-                    # == 15:` first, or 16 inherits 15's artifact check and
-                    # falsely reports partial application on migrated DBs.
+                elif version == 15:
                     instance_columns = {row["name"] for row in conn.execute(
                         "PRAGMA table_info(recipe_instances)"
                     )}
@@ -646,6 +663,27 @@ def init_db() -> None:
                         "parent_tasks_json" in instance_columns
                         or {"rejected_by_step_id", "rejected_by_activation", "verdict_json"}
                         & step_columns
+                    )
+                elif version == 16:
+                    instance_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(recipe_instances)"
+                    )}
+                    indexes = {
+                        row[0] for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='index'"
+                        )
+                    }
+                    migration_artifacts = bool(
+                        "project_recipe_policies" in existing_tables
+                        or {"project_id", "linear_issue_id", "launch_idempotency_key"}
+                        & instance_columns
+                        or {
+                            "idx_project_recipe_policies_updated",
+                            "idx_recipe_instances_project_updated",
+                            "uq_recipe_instances_linear_issue",
+                            "uq_recipe_instances_launch_key",
+                        }
+                        & indexes
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -1002,6 +1040,175 @@ def set_policy(task_id, policy: dict) -> None:
     value = json.dumps(policy, sort_keys=True, separators=(",", ":"))
     with _connect() as conn:
         conn.execute("INSERT INTO policies VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET policy_json=excluded.policy_json", (task_id, value))
+
+
+def _policy_project_id(project_id: str) -> str:
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise TypeError("project_id must be a non-empty string")
+    return project_id
+
+
+def _canonical_recipe_keys(
+    allowed_recipe_keys: list[str], default_recipe_key: str | None,
+) -> tuple[list[str], str]:
+    if not isinstance(allowed_recipe_keys, list):
+        raise TypeError("allowed_recipe_keys must be a list")
+    if any(not isinstance(key, str) or not key for key in allowed_recipe_keys):
+        raise TypeError("allowed_recipe_keys must contain non-empty strings")
+    if len(set(allowed_recipe_keys)) != len(allowed_recipe_keys):
+        raise ValueError("allowed_recipe_keys must not contain duplicates")
+    keys = sorted(allowed_recipe_keys)
+    if default_recipe_key is not None and not isinstance(default_recipe_key, str):
+        raise TypeError("default_recipe_key must be a string or null")
+    if default_recipe_key is not None and default_recipe_key not in keys:
+        raise ValueError("default_recipe_key must be an allowed recipe key")
+    encoded = json.dumps(keys, ensure_ascii=False, separators=(",", ":"))
+    return keys, encoded
+
+
+def _policy_row_value(row: Any, name: str, index: int) -> Any:
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return row[index]
+
+
+def load_project_recipe_policy(db: Any, project_id: str) -> dict[str, Any] | None:
+    """Load one project policy and fail closed on malformed persisted data."""
+    project_id = _policy_project_id(project_id)
+    row = db.execute(
+        "SELECT project_id,allowed_recipe_keys_json,default_recipe_key,updated_at "
+        "FROM project_recipe_policies WHERE project_id=?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    stored_project_id = _policy_row_value(row, "project_id", 0)
+    raw_keys = _policy_row_value(row, "allowed_recipe_keys_json", 1)
+    default_recipe_key = _policy_row_value(row, "default_recipe_key", 2)
+    updated_at = _policy_row_value(row, "updated_at", 3)
+    if stored_project_id != project_id or not isinstance(raw_keys, str):
+        raise ValueError("stored project recipe policy has invalid shape")
+    try:
+        stored_keys = json.loads(raw_keys)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("stored project recipe policy has invalid JSON") from exc
+    keys, canonical_json = _canonical_recipe_keys(stored_keys, default_recipe_key)
+    if raw_keys != canonical_json or not isinstance(updated_at, str) or not updated_at:
+        raise ValueError("stored project recipe policy is not canonical")
+    return {
+        "project_id": project_id,
+        "allowed_recipe_keys": keys,
+        "default_recipe_key": default_recipe_key,
+        "updated_at": updated_at,
+    }
+
+
+def save_project_recipe_policy(
+    db: Any, project_id: str, allowed_recipe_keys: list[str],
+    default_recipe_key: str | None,
+) -> dict[str, Any]:
+    """Atomically replace a project's canonical recipe attachment policy."""
+    project_id = _policy_project_id(project_id)
+    _, encoded = _canonical_recipe_keys(allowed_recipe_keys, default_recipe_key)
+    now = _now()
+    db.execute(
+        "INSERT INTO project_recipe_policies("
+        "project_id,allowed_recipe_keys_json,default_recipe_key,created_at,updated_at) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET "
+        "allowed_recipe_keys_json=excluded.allowed_recipe_keys_json,"
+        "default_recipe_key=excluded.default_recipe_key,updated_at=excluded.updated_at",
+        (project_id, encoded, default_recipe_key, now, now),
+    )
+    result = load_project_recipe_policy(db, project_id)
+    if result is None:
+        raise RuntimeError("project recipe policy write did not persist")
+    return result
+
+
+def _project_flight_row(db: Any, where: str, parameters: tuple[Any, ...]) -> dict[str, Any] | None:
+    cursor = db.execute(f"SELECT * FROM recipe_instances WHERE {where}", parameters)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    return dict(zip((column[0] for column in cursor.description), row))
+
+
+def project_flight(db: Any, instance_id: str) -> dict[str, Any] | None:
+    """Return one immutable flight identity by Factory instance id."""
+    if not isinstance(instance_id, str) or not instance_id:
+        raise TypeError("instance_id must be a non-empty string")
+    return _project_flight_row(db, "id=?", (instance_id,))
+
+
+def project_flight_by_idempotency_key(
+    db: Any, project_id: str, launch_idempotency_key: str,
+) -> dict[str, Any] | None:
+    """Return the project-scoped flight bound to a launch idempotency key."""
+    project_id = _policy_project_id(project_id)
+    if not isinstance(launch_idempotency_key, str) or not launch_idempotency_key:
+        raise TypeError("launch_idempotency_key must be a non-empty string")
+    return _project_flight_row(
+        db, "project_id=? AND launch_idempotency_key=?",
+        (project_id, launch_idempotency_key),
+    )
+
+
+def project_flight_by_linear_issue_id(
+    db: Any, linear_issue_id: str,
+) -> dict[str, Any] | None:
+    """Return the globally unique flight bound to a Linear issue."""
+    if not isinstance(linear_issue_id, str) or not linear_issue_id:
+        raise TypeError("linear_issue_id must be a non-empty string")
+    return _project_flight_row(db, "linear_issue_id=?", (linear_issue_id,))
+
+
+def project_rollup(
+    db: Any, project_id: str | None, *, recent_limit: int,
+) -> dict[str, Any]:
+    """Return bounded project flight counts and stable recent summaries."""
+    if not isinstance(recent_limit, int) or isinstance(recent_limit, bool):
+        raise TypeError("recent_limit must be a positive integer")
+    if recent_limit < 1:
+        raise ValueError("recent_limit must be a positive integer")
+    if project_id is not None:
+        project_id = _policy_project_id(project_id)
+        rows = db.execute(
+            "SELECT id,recipe_id,recipe_version,status,updated_at,linear_issue_id "
+            "FROM recipe_instances WHERE project_id=? ORDER BY updated_at DESC,id DESC LIMIT ?",
+            (project_id, recent_limit),
+        ).fetchall()
+        count_rows = db.execute(
+            "SELECT status,COUNT(*) FROM recipe_instances WHERE project_id=? GROUP BY status",
+            (project_id,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id,recipe_id,recipe_version,status,updated_at,linear_issue_id "
+            "FROM recipe_instances WHERE project_id IS NULL ORDER BY updated_at DESC,id DESC LIMIT ?",
+            (recent_limit,),
+        ).fetchall()
+        count_rows = db.execute(
+            "SELECT status,COUNT(*) FROM recipe_instances WHERE project_id IS NULL GROUP BY status"
+        ).fetchall()
+    waiting_states = {"waiting_gate", "waiting_event"}
+    active = sum(int(count[1]) for count in count_rows if count[0] not in {
+        "done", "failed", "cancelled", *waiting_states,
+    })
+    waiting = sum(int(count[1]) for count in count_rows if count[0] in waiting_states)
+    recent = [
+        {
+            "instance_id": row[0],
+            "recipe": f"{row[1]}@{row[2]}",
+            "status": row[3],
+            "updated_at": row[4],
+            "linear_issue_id": row[5],
+        }
+        for row in rows
+    ]
+    return {"active": active, "waiting": waiting, "recent": recent}
 
 
 def record_decision(task_id, stage_id, stage_type, seat, outcome, body) -> None:
@@ -1543,4 +1750,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "load_project_recipe_policy", "save_project_recipe_policy", "project_flight", "project_flight_by_idempotency_key", "project_flight_by_linear_issue_id", "project_rollup", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]

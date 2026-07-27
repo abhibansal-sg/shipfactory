@@ -66,7 +66,8 @@ def test_init_db_applies_containment_overlay_migration_idempotently(tmp_path, mo
         version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
         instance_columns = {row[1] for row in conn.execute("PRAGMA table_info(recipe_instances)")}
         step_columns = {row[1] for row in conn.execute("PRAGMA table_info(recipe_steps)")}
-    assert version == 15
+    latest_migration = max(version for version, _, _ in store._MIGRATIONS)
+    assert version == latest_migration
     assert "parent_tasks_json" in instance_columns
     assert {"rejected_by_step_id", "rejected_by_activation", "verdict_json"} <= step_columns
 
