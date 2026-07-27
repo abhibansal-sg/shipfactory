@@ -419,6 +419,370 @@
     return usePollingResource("/recipes", refreshKey);
   }
 
+  var GRAPH_LAYOUT_DIRECTIONS = ["TB", "BT", "LR", "RL"];
+  var GRAPH_LAYOUT_FIELDS = ["rank_gap", "lane_gap", "node_width", "node_height", "diamond_size"];
+
+  function graphLayout(graph) {
+    var layout = graph && graph.layout;
+    if (!layout || GRAPH_LAYOUT_DIRECTIONS.indexOf(layout.direction) < 0) {
+      return { error: "Graph layout is unavailable or has an invalid direction." };
+    }
+    for (var index = 0; index < GRAPH_LAYOUT_FIELDS.length; index += 1) {
+      var field = GRAPH_LAYOUT_FIELDS[index];
+      if (typeof layout[field] !== "number" || !isFinite(layout[field]) || layout[field] <= 0) {
+        return { error: "Graph layout is unavailable or has an invalid " + field + "." };
+      }
+    }
+    return layout;
+  }
+
+  function graphRanks(nodes) {
+    var byId = {};
+    var ranks = {};
+    var marks = {};
+    var order = {};
+    (nodes || []).forEach(function (node, index) {
+      if (!node || typeof node.id !== "string" || byId[node.id]) {
+        return;
+      }
+      byId[node.id] = node;
+      order[node.id] = index;
+    });
+    if (Object.keys(byId).length !== (nodes || []).length) return null;
+
+    function visit(id) {
+      if (marks[id] === 1) return null;
+      if (marks[id] === 2) return ranks[id];
+      var node = byId[id];
+      if (!node || !Array.isArray(node.needs)) return null;
+      marks[id] = 1;
+      var highest = -1;
+      for (var index = 0; index < node.needs.length; index += 1) {
+        var parentId = node.needs[index];
+        if (typeof parentId !== "string" || !byId[parentId]) return null;
+        var parentRank = visit(parentId);
+        if (parentRank === null) return null;
+        highest = Math.max(highest, parentRank);
+      }
+      ranks[id] = highest + 1;
+      marks[id] = 2;
+      return ranks[id];
+    }
+
+    Object.keys(byId).forEach(function (id) { if (marks[id] !== 2) visit(id); });
+    for (var id in byId) {
+      if (Object.prototype.hasOwnProperty.call(byId, id) && marks[id] !== 2) return null;
+    }
+    return { byId: byId, ranks: ranks, order: order };
+  }
+
+  function graphNodeSize(node, layout) {
+    return node && node.shape === "diamond"
+      ? { width: layout.diamond_size, height: layout.diamond_size }
+      : { width: layout.node_width, height: layout.node_height };
+  }
+
+  function graphGeometry(graph, layout, rankData) {
+    var nodes = graph.nodes || [];
+    if (!nodes.length) return null;
+    var byRank = {};
+    nodes.forEach(function (node) {
+      var rank = rankData.ranks[node.id];
+      (byRank[rank] || (byRank[rank] = [])).push(node);
+    });
+    var ranks = Object.keys(byRank).map(Number).sort(function (left, right) { return left - right; });
+    var rankMajorSizes = {};
+    var rankMinorSizes = {};
+    ranks.forEach(function (rank) {
+      var major = 0;
+      var minor = 0;
+      byRank[rank].sort(function (left, right) {
+        return rankData.order[left.id] - rankData.order[right.id] || left.id.localeCompare(right.id);
+      });
+      byRank[rank].forEach(function (node, index) {
+        var size = graphNodeSize(node, layout);
+        var majorSize = layout.direction === "TB" || layout.direction === "BT" ? size.height : size.width;
+        var minorSize = layout.direction === "TB" || layout.direction === "BT" ? size.width : size.height;
+        major = Math.max(major, majorSize);
+        minor += minorSize + (index ? layout.lane_gap : 0);
+      });
+      rankMajorSizes[rank] = major;
+      rankMinorSizes[rank] = minor;
+    });
+
+    var majorOffset = {};
+    var totalMajor = 0;
+    ranks.forEach(function (rank, index) {
+      if (index) totalMajor += layout.rank_gap;
+      majorOffset[rank] = totalMajor;
+      totalMajor += rankMajorSizes[rank];
+    });
+    var positions = {};
+    ranks.forEach(function (rank) {
+      var minorOffset = 0;
+      byRank[rank].forEach(function (node) {
+        var size = graphNodeSize(node, layout);
+        var majorSize = layout.direction === "TB" || layout.direction === "BT" ? size.height : size.width;
+        var minorSize = layout.direction === "TB" || layout.direction === "BT" ? size.width : size.height;
+        var major = majorOffset[rank] + (rankMajorSizes[rank] - majorSize) / 2;
+        var minor = minorOffset;
+        minorOffset += minorSize + layout.lane_gap;
+        if (layout.direction === "BT" || layout.direction === "RL") major = totalMajor - major - majorSize;
+        positions[node.id] = layout.direction === "TB" || layout.direction === "BT"
+          ? { x: minor, y: major, width: size.width, height: size.height }
+          : { x: major, y: minor, width: size.width, height: size.height };
+      });
+    });
+    var totalMinor = 0;
+    ranks.forEach(function (rank) { totalMinor = Math.max(totalMinor, rankMinorSizes[rank]); });
+    return {
+      positions: positions,
+      width: layout.direction === "TB" || layout.direction === "BT" ? totalMinor : totalMajor,
+      height: layout.direction === "TB" || layout.direction === "BT" ? totalMajor : totalMinor,
+    };
+  }
+
+  function graphEdgePath(edge, positions, layout) {
+    var source = positions[edge.from];
+    var target = positions[edge.to];
+    if (!source || !target) return null;
+    var vertical = layout.direction === "TB" || layout.direction === "BT";
+    var sourceCenter = { x: source.x + source.width / 2, y: source.y + source.height / 2 };
+    var targetCenter = { x: target.x + target.width / 2, y: target.y + target.height / 2 };
+    var sourcePoint;
+    var targetPoint;
+    if (vertical) {
+      var down = targetCenter.y >= sourceCenter.y;
+      sourcePoint = { x: sourceCenter.x, y: down ? source.y + source.height : source.y };
+      targetPoint = { x: targetCenter.x, y: down ? target.y : target.y + target.height };
+    } else {
+      var right = targetCenter.x >= sourceCenter.x;
+      sourcePoint = { x: right ? source.x + source.width : source.x, y: sourceCenter.y };
+      targetPoint = { x: right ? target.x : target.x + target.width, y: targetCenter.y };
+    }
+    if (edge.kind === "review_rework" || (edge.kinds || []).indexOf("review_rework") >= 0) {
+      var bend = Math.max(layout.rank_gap, layout.lane_gap, layout.diamond_size);
+      if (vertical) {
+        return "M " + sourcePoint.x + " " + sourcePoint.y +
+          " C " + (sourcePoint.x - bend) + " " + (sourcePoint.y - bend) +
+          ", " + (targetPoint.x - bend) + " " + (targetPoint.y + bend) +
+          ", " + targetPoint.x + " " + targetPoint.y;
+      }
+      return "M " + sourcePoint.x + " " + sourcePoint.y +
+        " C " + (sourcePoint.x - bend) + " " + (sourcePoint.y - bend) +
+        ", " + (targetPoint.x + bend) + " " + (targetPoint.y - bend) +
+        ", " + targetPoint.x + " " + targetPoint.y;
+    }
+    return "M " + sourcePoint.x + " " + sourcePoint.y + " L " + targetPoint.x + " " + targetPoint.y;
+  }
+
+  function graphEdges(graph, overlay) {
+    var items = {};
+    var ordered = [];
+    (graph && Array.isArray(graph.edges) ? graph.edges : []).concat(
+      overlay && Array.isArray(overlay.rework_edges) ? overlay.rework_edges : []
+    ).forEach(function (edge) {
+      if (!edge || typeof edge.from !== "string" || typeof edge.to !== "string") return;
+      var key = edge.from + "->" + edge.to;
+      var current = items[key];
+      if (!current) {
+        current = Object.assign({}, edge, { kinds: [] });
+        items[key] = current;
+        ordered.push(current);
+      }
+      var kinds = Array.isArray(edge.kinds) && edge.kinds.length ? edge.kinds : [edge.kind];
+      kinds.forEach(function (kind) {
+        if (kind && current.kinds.indexOf(kind) < 0) current.kinds.push(kind);
+      });
+      if (edge.label) current.label = edge.label;
+      if (edge.id) current.id = edge.id;
+      current.kind = current.kind || edge.kind || current.kinds[0];
+    });
+    return ordered;
+  }
+
+  function graphNodeOverlay(overlay, nodeId) {
+    var rows = overlay && Array.isArray(overlay.nodes) ? overlay.nodes : [];
+    return rows.find(function (row) { return row && row.step_id === nodeId; }) || null;
+  }
+
+  function graphText(value, fallback) {
+    return value == null || value === "" ? (fallback || "unknown") : String(value);
+  }
+
+  function GraphUnsupportedState(props) {
+    return h("div", {
+      className: "factory-graph-error border border-destructive/30 bg-destructive/10 p-4 text-sm",
+      role: "alert",
+    },
+      h("strong", { className: "text-destructive" }, "Graph unavailable"),
+      h("p", { className: "mt-1 text-text-secondary" }, props.message)
+    );
+  }
+
+  function GraphInspector(props) {
+    if (!props.node) return null;
+    var node = props.node;
+    var state = props.state || {};
+    var actor = state.actor && (state.actor.id || state.actor.kind);
+    var blocker = state.blocker && (state.blocker.reason || state.blocker.kind);
+    return h("aside", {
+      className: "factory-graph-inspector border border-border bg-card p-3 text-sm",
+      role: "dialog",
+      "aria-label": "Graph node inspector",
+    },
+      h("h3", { className: "font-mondwest text-display text-xs tracking-wider text-foreground" }, node.title),
+      h("p", { className: "mt-1 text-xs text-text-secondary" }, graphText(node.primitive), " · ", graphText(state.state, node.state)),
+      h("dl", { className: "mt-3 grid gap-1 text-xs" },
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Actor"), h("dd", null, graphText(actor))),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Blocker"), h("dd", null, graphText(blocker)))
+      ),
+      h("button", {
+        type: "button",
+        className: "mt-3 border border-border px-2 py-1 text-xs",
+        onClick: props.onClose,
+        "aria-label": "Close graph node inspector",
+      }, "Close")
+    );
+  }
+
+  function GraphRenderer(props) {
+    var graph = props.graph;
+    var _a = useState(null), selectedId = _a[0], setSelectedId = _a[1];
+    useEffect(function () {
+      if (!selectedId) return undefined;
+      function close(event) { if (event.key === "Escape") setSelectedId(null); }
+      window.addEventListener("keydown", close);
+      return function () { window.removeEventListener("keydown", close); };
+    }, [selectedId]);
+
+    var layout = graphLayout(graph);
+    if (!graph || graph.schema_version !== "shipfactory.graph/v1") {
+      return h(GraphUnsupportedState, { message: "Unsupported graph schema." });
+    }
+    if (layout.error) return h(GraphUnsupportedState, { message: layout.error });
+    var rankData = graphRanks(graph.nodes);
+    if (!rankData) return h(GraphUnsupportedState, { message: "Graph dependencies are invalid or cyclic." });
+    var geometry = graphGeometry(graph, layout, rankData);
+    if (!geometry) return h(GraphUnsupportedState, { message: "Graph contains no renderable nodes." });
+    var source = graph.source || {};
+    var headingId = "factory-graph-heading-" + graphText(source.recipe_key, "graph");
+    var overlay = props.overlay;
+    var selectedNode = rankData.byId[selectedId];
+    var selectedState = selectedNode && graphNodeOverlay(overlay, selectedNode.id);
+    var nodes = graph.nodes || [];
+    var edges = graphEdges(graph, overlay);
+
+    function nodeClass(node, state) {
+      var current = normalizedState(state && state.state || node.state || "unknown");
+      var shape = node.shape === "diamond" ? "diamond" : "rectangle";
+      var unsupported = node.primitive === "unsupported" || node.unsupported || node.shape !== "diamond" && node.shape !== "rectangle";
+      return [
+        "factory-graph-node",
+        "factory-graph-node--" + shape,
+        node.primitive === "join" ? "factory-graph-join" : "",
+        current ? "factory-graph-node--state-" + current : "",
+        node.operator_only ? "factory-graph-node--operator-only" : "",
+        node.projection_only ? "factory-graph-node--projection-only" : "",
+        current === "skipped" || node.skipped ? "factory-graph-node--skipped" : "",
+        unsupported ? "factory-graph-node--unsupported" : "",
+        selectedId === node.id ? "factory-graph-node--selected" : "",
+      ].filter(Boolean).join(" ");
+    }
+
+    function renderNode(node) {
+      var box = geometry.positions[node.id];
+      var state = graphNodeOverlay(overlay, node.id) || {};
+      var current = graphText(state.state, node.state);
+      var actor = state.actor && (state.actor.id || state.actor.kind);
+      var blocker = state.blocker && (state.blocker.reason || state.blocker.kind);
+      var invalidShape = node.shape !== "diamond" && node.shape !== "rectangle";
+      var unsupportedNode = node.primitive === "unsupported" || node.unsupported || invalidShape;
+      var label = graphText(node.title, node.id) + " · " + graphText(node.primitive) +
+        " · " + current + " · actor " + graphText(actor) + " · blocker " + graphText(blocker);
+      var activation = state.current_activation == null ? state.activation : state.current_activation;
+      var shape = node.shape === "diamond"
+        ? h("polygon", {
+          className: "factory-graph-shape--polygon",
+          points: (box.width / 2) + ",0 " + box.width + "," + (box.height / 2) + " " + (box.width / 2) + "," + box.height + " 0," + (box.height / 2),
+        })
+        : h("rect", { className: "factory-graph-shape--rect", x: 0, y: 0, width: box.width, height: box.height });
+      return h("g", {
+        key: node.id,
+        className: nodeClass(node, state),
+        transform: "translate(" + box.x + " " + box.y + ")",
+        tabIndex: 0,
+        role: "button",
+        "aria-label": label,
+        "data-graph-node": node.id,
+        "data-step-id": node.id,
+        "data-activation": activation == null ? undefined : String(activation),
+        onClick: function () { setSelectedId(node.id); },
+        onKeyDown: function (event) {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setSelectedId(node.id);
+          }
+        },
+      },
+        h("title", null, label),
+        h("desc", null, node.unsupported_reason || (node.operator_only ? "operator-only" : node.projection_only ? "synthetic deterministic routing" : "Recipe graph node")),
+        shape,
+        h("text", { className: "factory-graph-node-label", x: box.width / 2, y: box.height / 2, textAnchor: "middle", dominantBaseline: "middle" }, graphText(node.title, node.id)),
+        node.operator_only ? h("text", { className: "factory-graph-operator-badge", x: box.width / 2, y: box.height - 4, textAnchor: "middle" }, "operator-only") : null,
+        current === "skipped" ? h("text", { className: "factory-graph-node-label", x: box.width / 2, y: box.height - 4, textAnchor: "middle" }, "skipped") : null,
+        unsupportedNode ? h("text", { className: "factory-graph-node-label", x: box.width / 2, y: box.height - 4, textAnchor: "middle" }, "unsupported") : null
+      );
+    }
+
+    return h("section", {
+      className: "factory-graph",
+      role: "group",
+      "aria-labelledby": headingId,
+    },
+      h("h2", { id: headingId, className: "font-mondwest text-display text-sm tracking-wider text-foreground" }, props.title || graphText(source.recipe_key, "Recipe graph")),
+      h("p", { className: "text-xs text-text-tertiary" }, "Recipe ", graphText(source.recipe_key), " · ", "hash ", graphText(source.recipe_hash)),
+      h("div", { className: "factory-graph-canvas" },
+        h("svg", {
+          role: "img",
+          width: geometry.width,
+          height: geometry.height,
+          viewBox: "0 0 " + geometry.width + " " + geometry.height,
+          "aria-labelledby": headingId,
+        },
+          h("defs", null,
+            h("marker", { id: "factory-graph-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" },
+              h("path", { d: "M 0 0 L 10 5 L 0 10 z" })
+            ),
+            h("marker", { id: "factory-graph-rework-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" },
+              h("path", { d: "M 0 0 L 10 5 L 0 10 z" })
+            )
+          ),
+          edges.map(function (edge) {
+            var d = graphEdgePath(edge, geometry.positions, layout);
+            if (!d) return null;
+            var kinds = Array.isArray(edge.kinds) && edge.kinds.length ? edge.kinds : [edge.kind];
+            var kind = edge.kind || kinds[0] || "unknown";
+            var edgeLabel = graphText(edge.label, kinds.join(", "));
+            return h("path", {
+              key: edge.id || edge.from + "->" + edge.to + ":" + kind,
+              className: "factory-graph-edge " + kinds.map(function (item) { return "factory-graph-edge--" + normalizedState(item); }).join(" "),
+              d: d,
+              "data-graph-edge": edge.id || edge.from + "->" + edge.to,
+              "data-edge-from": edge.from,
+              "data-edge-to": edge.to,
+              "data-edge-kind": kinds.join(","),
+              "aria-label": edge.from + " to " + edge.to + " · " + edgeLabel,
+              role: "img",
+            });
+          }),
+          nodes.map(renderNode)
+        )
+      ),
+      h(GraphInspector, { node: selectedNode, state: selectedState, onClose: function () { setSelectedId(null); } })
+    );
+  }
+
   function useReportViewMeta(props, resource, boards) {
     useEffect(function () {
       if (!resource.loadedAt || !props.onMeta) return;
