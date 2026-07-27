@@ -620,12 +620,35 @@
     );
   }
 
+  function GraphOverlayWarning(props) {
+    if (!props.message) return null;
+    return h("p", {
+      className: "factory-graph-overlay-warning border border-warning/30 bg-warning/10 p-2 text-xs",
+      role: "status",
+    }, "Live overlay refresh failed; showing the last frozen graph. ", props.message);
+  }
+
   function GraphInspector(props) {
     if (!props.node) return null;
     var node = props.node;
     var state = props.state || {};
-    var actor = state.actor && (state.actor.id || state.actor.kind);
-    var blocker = state.blocker && (state.blocker.reason || state.blocker.kind);
+    var overlay = props.overlay || {};
+    var actor = state.actor || {};
+    var blocker = state.blocker || null;
+    var historyPayload = overlay.history || {};
+    var historyRows = Array.isArray(historyPayload) ? historyPayload : (Array.isArray(historyPayload.items) ? historyPayload.items : []);
+    var historyStepId = node.primitive === "review_verdict_router"
+      ? String(node.id).replace(/:verdict$/, "") : node.id;
+    var exactHistory = historyRows.filter(function (row) { return row && row.step_id === historyStepId; });
+    var threshold = Number(historyPayload.fold_threshold || 0);
+    var folded = !!threshold && exactHistory.length > threshold;
+    var visibleHistory = folded ? exactHistory.slice(-threshold) : exactHistory;
+    var receipt = overlay.receipts || {};
+    var evidence = overlay.evidence || {};
+    var runId = actor.run_id;
+    var textValue = function (value, fallback) {
+      return value == null || value === "" ? (fallback || "unknown") : String(value);
+    };
     return h("aside", {
       className: "factory-graph-inspector border border-border bg-card p-3 text-sm",
       role: "dialog",
@@ -634,8 +657,37 @@
       h("h3", { className: "font-mondwest text-display text-xs tracking-wider text-foreground" }, node.title),
       h("p", { className: "mt-1 text-xs text-text-secondary" }, graphText(node.primitive), " · ", graphText(state.state, node.state)),
       h("dl", { className: "mt-3 grid gap-1 text-xs" },
-        h("div", null, h("dt", { className: "text-text-tertiary" }, "Actor"), h("dd", null, graphText(actor))),
-        h("div", null, h("dt", { className: "text-text-tertiary" }, "Blocker"), h("dd", null, graphText(blocker)))
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Actor"), h("dd", null, textValue(actor.label || actor.id || actor.kind))),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Blocker"), h("dd", null, blocker ? textValue(blocker.reason || blocker.kind) : "none")),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Activation"), h("dd", null, textValue(state.current_activation))),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Attempts"), h("dd", null, textValue(state.attempts, "0"))),
+        h("div", null, h("dt", { className: "text-text-tertiary" }, "Task"), h("dd", null, textValue(state.task_id, "not assigned")))
+      ),
+      actor.kind === "operator" ? h("p", { className: "mt-3 border border-primary/30 bg-primary/10 p-2 text-xs", role: "status" }, "Human operator approval required") : null,
+      h("section", { className: "mt-3 border-t border-border pt-3", "aria-label": "Node history" },
+        h("h4", { className: "text-xs font-medium text-foreground" }, "Activation history"),
+        historyPayload.enabled === false ? h("p", { className: "mt-1 text-xs text-text-tertiary" }, "History disabled by runtime configuration.") :
+        exactHistory.length === 0 ? h("p", { className: "mt-1 text-xs text-text-tertiary" }, "No persisted activation history.") :
+        h("div", { className: "mt-1 grid gap-1 text-xs text-text-secondary" },
+          folded ? h("p", { className: "text-text-tertiary" }, "Showing latest ", threshold, " of ", exactHistory.length, " activations; all rows remain in the server payload.") : null,
+          visibleHistory.map(function (row) {
+            return h("div", { key: row.step_id + ":" + row.activation, className: "border-l border-border pl-2" },
+              h("span", { className: "font-mono-ui" }, "#", textValue(row.activation), " · ", textValue(row.state)),
+              row.finding_count == null ? null : h("span", null, " · findings ", String(row.finding_count)),
+              row.verdict_status === "malformed" ? h("span", { className: "text-destructive" }, " · malformed verdict") :
+              row.verdict ? h("span", null, " · ", textValue(JSON.stringify(row.verdict))) : null
+            );
+          })
+        )
+      ),
+      h("section", { className: "mt-3 grid gap-1 border-t border-border pt-3 text-xs" },
+        h("div", null, h("span", { className: "text-text-tertiary" }, "Receipts: "), receipt.available ? "available" : "unavailable"),
+        receipt.endpoint ? h("a", { className: "underline", href: API + receipt.endpoint }, "Open exact receipts") : null,
+        h("div", null, h("span", { className: "text-text-tertiary" }, "Evidence: "), textValue(evidence.status, "unavailable")),
+        runId == null ? null : h("div", { className: "flex flex-wrap gap-2" },
+          h("a", { className: "underline", href: API + "/runs/" + encodeURIComponent(runId) + "/log" }, "Open run log"),
+          h("a", { className: "underline", href: API + "/runs/" + encodeURIComponent(runId) + "/prompt" }, "Open run prompt")
+        )
       ),
       h("button", {
         type: "button",
@@ -643,6 +695,20 @@
         onClick: props.onClose,
         "aria-label": "Close graph node inspector",
       }, "Close")
+    );
+  }
+
+  function GraphOverlaySummary(props) {
+    var overlay = props.overlay;
+    if (!overlay) return null;
+    var actor = overlay.next_actor;
+    var blocker = overlay.blocker;
+    return h("section", { className: "factory-graph-overlay-summary border border-border bg-background/30 p-3 text-xs", "aria-label": "Live overlay summary" },
+      h("div", { className: "grid gap-1 sm:grid-cols-2" },
+        h("div", null, h("span", { className: "text-text-tertiary" }, "Next actor: "), actor ? graphText(actor.label || actor.id || actor.kind) : "none"),
+        h("div", null, h("span", { className: "text-text-tertiary" }, "Blocker: "), blocker ? graphText(blocker.reason || blocker.kind) : "none")
+      ),
+      actor && actor.kind === "operator" ? h("p", { className: "mt-2 border border-primary/30 bg-primary/10 p-2", role: "status" }, "Human operator approval required.") : null
     );
   }
 
@@ -742,6 +808,8 @@
     },
       h("h2", { id: headingId, className: "font-mondwest text-display text-sm tracking-wider text-foreground" }, props.title || graphText(source.recipe_key, "Recipe graph")),
       h("p", { className: "text-xs text-text-tertiary" }, "Recipe ", graphText(source.recipe_key), " · ", "hash ", graphText(source.recipe_hash)),
+      h(GraphOverlayWarning, { message: props.overlayError }),
+      h(GraphOverlaySummary, { overlay: overlay }),
       h("div", { className: "factory-graph-canvas" },
         h("svg", {
           role: "img",
@@ -779,7 +847,7 @@
           nodes.map(renderNode)
         )
       ),
-      h(GraphInspector, { node: selectedNode, state: selectedState, onClose: function () { setSelectedId(null); } })
+      h(GraphInspector, { node: selectedNode, state: selectedState, overlay: overlay, onClose: function () { setSelectedId(null); } })
     );
   }
 
@@ -2074,8 +2142,10 @@
     var _i = useState(null), launchResult = _i[0], setLaunchResult = _i[1];
     var _j = useState(null), graph = _j[0], setGraph = _j[1];
     var _k = useState(""), graphError = _k[0], setGraphError = _k[1];
-    var _l = useState(false), graphLoading = _l[0], setGraphLoading = _l[1];
-    var _m = useState(newNonce()), idempotencyKey = _m[0], setIdempotencyKey = _m[1];
+    var _l = useState(""), overlayError = _l[0], setOverlayError = _l[1];
+    var _m = useState(false), graphLoading = _m[0], setGraphLoading = _m[1];
+    var _n = useState(null), livePayload = _n[0], setLivePayload = _n[1];
+    var _o = useState(newNonce()), idempotencyKey = _o[0], setIdempotencyKey = _o[1];
     var policy = canonicalRecipePolicy(project.recipes && project.recipes.allowed, project.recipes && project.recipes.default);
     var attached = policy.allowed_recipe_keys;
     var responseRecipes = recipeResource.data && Array.isArray(recipeResource.data.recipes) ? recipeResource.data.recipes : [];
@@ -2106,31 +2176,54 @@
       setLaunchResult(null);
       setLaunchError("");
       setGraph(null);
+      setLivePayload(null);
       setGraphError("");
+      setOverlayError("");
       setGraphLoading(false);
     }, [project.id, selected && selected.id, selected && selected.version, selected && selected.recipe_hash]);
     useEffect(function () {
-      if (!selected || !runtime.graph_enabled) {
+      if (!selected || !runtime.enabled || !runtime.graph_enabled) {
         setGraph(null);
         setGraphError("");
+        setOverlayError("");
         return undefined;
       }
       var active = true;
       setGraphLoading(true);
       setGraphError("");
       request("/recipes/" + encodeURIComponent(selected.id) + "/versions/" + encodeURIComponent(selected.version) + "/graph").then(function (payload) {
-        if (active) setGraph(payload && payload.graph ? payload.graph : payload);
+        if (active) {
+          setGraph(payload && payload.graph ? payload.graph : payload);
+          setLivePayload(null);
+          setOverlayError("");
+        }
       }).catch(function (err) { if (active) setGraphError(errorText(err)); }).finally(function () { if (active) setGraphLoading(false); });
       return function () { active = false; };
     }, [selected && selected.id, selected && selected.version, selected && selected.recipe_hash, runtime.graph_enabled]);
     useEffect(function () {
-      if (!launchResult || !launchResult.instance_id || !runtime.graph_enabled || !runtime.live_overlay_enabled) return undefined;
+      var instanceId = launchResult && launchResult.instance_id;
+      if (!instanceId || !selected || !runtime.enabled || !runtime.graph_enabled || !runtime.live_overlay_enabled) {
+        setLivePayload(null);
+        setOverlayError("");
+        return undefined;
+      }
       var active = true;
-      request("/instances/" + encodeURIComponent(launchResult.instance_id) + "/graph").then(function (payload) {
-        if (active) setGraph(payload && payload.graph ? payload.graph : payload);
-      }).catch(function (err) { if (active) setGraphError(errorText(err)); });
-      return function () { active = false; };
-    }, [launchResult && launchResult.instance_id, runtime.graph_enabled]);
+      var timer = null;
+      function loadOverlay() {
+        request("/instances/" + encodeURIComponent(launchResult.instance_id) + "/graph").then(function (payload) {
+          if (active && payload && payload.graph) {
+            setLivePayload(payload);
+            setOverlayError("");
+          }
+        }).catch(function (err) { if (active) setOverlayError(errorText(err)); });
+      }
+      loadOverlay();
+      timer = setInterval(loadOverlay, runtime.ui_refresh_interval_seconds * 1000);
+      return function () {
+        active = false;
+        if (timer !== null) clearInterval(timer);
+      };
+    }, [launchResult && launchResult.instance_id, selected && selected.id, selected && selected.version, runtime.enabled, runtime.graph_enabled, runtime.live_overlay_enabled, runtime.ui_refresh_interval_seconds]);
 
     function reloadAfterPolicy() {
       props.onProjectsRefresh();
@@ -2206,7 +2299,7 @@
             graphLoading ? h(LoadingState, { label: "Loading frozen recipe graph…" }) :
             !runtime.graph_enabled ? h("p", { className: "text-xs text-text-tertiary", role: "status" }, "Graph display is disabled by runtime configuration.") :
             graphError ? h(GraphUnsupportedState, { message: graphError }) :
-            graph ? h(GraphRenderer, { graph: graph, title: key + " graph" }) : h("p", { className: "text-xs text-text-tertiary" }, "Graph projection is not available yet."),
+            graph ? h(GraphRenderer, { graph: livePayload && livePayload.graph ? livePayload.graph : graph, overlay: livePayload, overlayError: overlayError, title: key + " graph" }) : h("p", { className: "text-xs text-text-tertiary" }, "Graph projection is not available yet."),
             !runtime.live_overlay_enabled ? h("p", { className: "text-xs text-text-tertiary" }, "Live flight overlay is disabled by runtime configuration.") : null,
             h(ProjectLaunchPanel, { projectId: project.id, recipe: selected, launchEnabled: runtime.launch_enabled, formValid: formIsValid(), parameters: parameters, linearIssueId: linearIssueId, onLinearIssueChange: setLinearIssueId, busy: launchBusy, error: launchError, onSubmit: submitLaunch })
           ) : null });
