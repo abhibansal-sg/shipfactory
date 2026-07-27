@@ -26,8 +26,9 @@ if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
 from shipfactory import store
+from shipfactory.recipe_graph import project_graph
 from shipfactory.recipes import advancer
-from shipfactory.recipes.loader import RecipeError
+from shipfactory.recipes.loader import Recipe, RecipeError, validate
 
 
 router = APIRouter()
@@ -306,6 +307,132 @@ def _fresh_projects_runtime_config() -> tuple[Any, dict[str, Any]]:
 
     config = load_seats()
     return config, projects_visual_recipes_config(config.recipes)
+
+
+def _fresh_graph_runtime_config() -> tuple[Any, dict[str, Any]]:
+    """Load and validate Stage-0 graph configuration for one request."""
+    try:
+        config, runtime = _fresh_projects_runtime_config()
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        _project_error(400, "projects_unavailable", str(exc))
+    _require_project_flag(runtime, "graph_enabled")
+    return config, runtime
+
+
+def _graph_library(config: Any) -> Any:
+    """Load configured recipes without publishing or repairing identity rows."""
+    from shipfactory.recipes.loader import load_library
+
+    recipes = config.recipes or {}
+    path = recipes.get("library_path")
+    if not path:
+        _project_error(400, "invalid_recipe_library", "recipes.library_path is not configured")
+    try:
+        return load_library(
+            path,
+            seats=set(config.seats),
+            profiles=set((recipes.get("execution_profiles") or {}).keys()),
+            verification_profiles=set(
+                (recipes.get("verification_profiles") or {}).keys()
+            ),
+            persist=False,
+        )
+    except (FileNotFoundError, OSError, TypeError, UnicodeError, RecipeError) as exc:
+        _project_error(400, "invalid_recipe_library", str(exc))
+
+
+def _graph_version(version: str) -> int:
+    if (
+        not isinstance(version, str)
+        or not version.isascii()
+        or not version.isdigit()
+        or version.startswith("0")
+    ):
+        _project_error(400, "invalid_recipe_version", "version must be a positive integer", "version")
+    return int(version)
+
+
+def _invalid_instance_identity(message: str) -> None:
+    _project_error(409, "instance_identity_conflict", message)
+
+
+def _pinned_instance_recipe(config: Any, instance_id: str) -> Recipe:
+    """Authenticate one instance against its exact persisted recipe bytes."""
+    recipes = config.recipes or {}
+    seats = set(config.seats)
+    profiles = set((recipes.get("execution_profiles") or {}).keys())
+    verification_profiles = set((recipes.get("verification_profiles") or {}).keys())
+
+    try:
+        with store._connect() as db:
+            instance = db.execute(
+                "SELECT id,recipe_id,recipe_version,recipe_hash "
+                "FROM recipe_instances WHERE id=?",
+                (instance_id,),
+            ).fetchone()
+            if instance is None:
+                _project_error(404, "instance_not_found", "unknown recipe instance")
+            if (
+                not isinstance(instance["recipe_id"], str)
+                or not isinstance(instance["recipe_version"], int)
+                or isinstance(instance["recipe_version"], bool)
+                or instance["recipe_version"] < 1
+                or not isinstance(instance["recipe_hash"], str)
+            ):
+                _invalid_instance_identity("stored instance recipe identity is invalid")
+            version = db.execute(
+                "SELECT id,version,hash,status,normalized_yaml "
+                "FROM recipe_versions WHERE id=? AND version=?",
+                (instance["recipe_id"], instance["recipe_version"]),
+            ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            _project_error(404, "instance_not_found", "unknown recipe instance")
+        raise
+
+    if version is None:
+        _invalid_instance_identity("the instance recipe version is not persisted")
+    normalized = version["normalized_yaml"]
+    if not isinstance(normalized, str):
+        _invalid_instance_identity("persisted recipe bytes are not text")
+    try:
+        document = json.loads(normalized)
+        if not isinstance(document, dict):
+            raise ValueError("recipe document must be an object")
+        canonical = json.dumps(
+            document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+    except (TypeError, ValueError, UnicodeError) as exc:
+        _invalid_instance_identity(f"persisted recipe bytes are invalid: {exc}")
+    if canonical != normalized:
+        _invalid_instance_identity("persisted recipe bytes are not canonical JSON")
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if (
+        version["id"] != instance["recipe_id"]
+        or version["version"] != instance["recipe_version"]
+        or document.get("id") != instance["recipe_id"]
+        or document.get("version") != instance["recipe_version"]
+        or version["hash"] != digest
+        or instance["recipe_hash"] != digest
+        or version["status"] != document.get("status")
+    ):
+        _invalid_instance_identity("instance and persisted recipe identity do not agree")
+    try:
+        validated = validate(
+            document,
+            seats=seats,
+            profiles=profiles,
+            verification_profiles=verification_profiles,
+        )
+    except RecipeError as exc:
+        _invalid_instance_identity(f"persisted recipe bytes fail validation: {exc}")
+    return Recipe(
+        validated,
+        digest,
+        frozenset(seats),
+        frozenset(profiles),
+        frozenset(verification_profiles),
+    )
 
 
 def _project_value(project: Any, name: str, default: Any = None) -> Any:
@@ -909,6 +1036,41 @@ def list_recipes() -> list[dict[str, Any]]:
             ],
         })
     return sorted(items, key=lambda item: (item["id"], item["version"]))
+
+
+@router.get("/recipes/{recipe_id}/versions/{version}/graph", response_model=None)
+def recipe_graph(recipe_id: str, version: str) -> dict[str, Any] | JSONResponse:
+    try:
+        config, runtime = _fresh_graph_runtime_config()
+        version_number = _graph_version(version)
+        library = _graph_library(config)
+        try:
+            recipe = library.get(f"{recipe_id}@{version_number}")
+        except RecipeError as exc:
+            _project_error(404, "recipe_not_found", str(exc))
+        return project_graph(
+            recipe.document,
+            recipe_hash=recipe.hash,
+            pinned=True,
+            config=runtime,
+        )
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+
+
+@router.get("/instances/{instance_id}/graph", response_model=None)
+def instance_graph(instance_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        config, runtime = _fresh_graph_runtime_config()
+        recipe = _pinned_instance_recipe(config, instance_id)
+        return project_graph(
+            recipe.document,
+            recipe_hash=recipe.hash,
+            pinned=True,
+            config=runtime,
+        )
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
 
 
 @router.post("/instances")
