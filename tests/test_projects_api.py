@@ -104,8 +104,20 @@ def _projects(monkeypatch, projects: list[SimpleNamespace]) -> None:
     )
 
 
-def _project(project_id: str, slug: str, board_slug: str | None) -> SimpleNamespace:
-    return SimpleNamespace(id=project_id, slug=slug, name=slug.title(), board_slug=board_slug)
+def _project(
+    project_id: str,
+    slug: str,
+    board_slug: str | None,
+    *,
+    primary_path: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=project_id,
+        slug=slug,
+        name=slug.title(),
+        board_slug=board_slug,
+        primary_path=primary_path or str(PLUGIN_API.parents[1]),
+    )
 
 
 def _attach(client, project_id: str = "p-1", *, allowed=None, default="route-a@1"):
@@ -171,7 +183,9 @@ def test_launch_resolves_hidden_board_and_replays_project_scoped_identity(
     tmp_path, monkeypatch
 ):
     _configure(tmp_path, monkeypatch)
-    project = _project("p-1", "factory", "board-a")
+    project = _project(
+        "p-1", "factory", "board-a", primary_path="/trusted/project/workspace"
+    )
     _projects(monkeypatch, [project])
     client = _client()
     assert client.put(
@@ -208,6 +222,13 @@ def test_launch_resolves_hidden_board_and_replays_project_scoped_identity(
         return {"instance_id": instance_id}
 
     instantiate_module = importlib.import_module("shipfactory.recipes.instantiate")
+    resolved_workspaces: list[str] = []
+
+    def fake_current_base_sha(workspace):
+        resolved_workspaces.append(str(workspace))
+        return "a" * 40
+
+    monkeypatch.setattr(instantiate_module, "current_base_sha", fake_current_base_sha)
     monkeypatch.setattr(instantiate_module, "instantiate", fake_instantiate)
     request = {
         "recipe": "route-a", "version": 1, "parameters": {"request": "ship"},
@@ -221,6 +242,8 @@ def test_launch_resolves_hidden_board_and_replays_project_scoped_identity(
     assert replay.json() == created.json()
     assert captured["board"] == "board-a"
     assert captured["project_id"] == "p-1"
+    assert captured["base_sha"] == "a" * 40
+    assert resolved_workspaces == ["/trusted/project/workspace"]
     assert "board" not in created.json()
     assert created.json()["linear_backlink"]["status"] == "unavailable"
     assert created.json()["skip_steps"] == ["extra"]

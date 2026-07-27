@@ -903,6 +903,13 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   runtime could still expire first and report `test_timeout`. Its test-only
   profile now has a bounded 30-second runtime; production supervision and the
   required `test_failed` evidence assertion remain unchanged.
+- Project launches must resolve their pinned base from the selected Hermes
+  project's `primary_path`, never from the dashboard server's process CWD
+  (finding #122, SF-26). Unit tests ran with the repository as CWD, masking that
+  the managed dashboard runs from `$HERMES_HOME`; the first real Projects Start
+  therefore failed before persistence with `base_sha requires a Git workspace`.
+  The launch boundary now opens the project's primary Git workspace, derives
+  the exact base SHA there, and passes it explicitly into instantiation.
 
 ## Conventions
 

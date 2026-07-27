@@ -1220,6 +1220,13 @@ def _launch_project_flight(project_id: str, request: ProjectFlightRequest) -> tu
     board = projection["board_slug"]
     if not isinstance(board, str) or not board.strip():
         _project_error(409, "project_binding_unavailable", "project has no board binding")
+    workspace = _project_value(projection["project"], "primary_path")
+    if not isinstance(workspace, str) or not workspace.strip():
+        _project_error(
+            409,
+            "project_workspace_unavailable",
+            "project has no primary Git workspace",
+        )
     with store._connect() as db:
         policy = _policy_for(db, project_id)
         allowed = policy["allowed_recipe_keys"] if policy else []
@@ -1229,7 +1236,9 @@ def _launch_project_flight(project_id: str, request: ProjectFlightRequest) -> tu
         project_id, recipe, bound, skips, issue_id, request.idempotency_key,
     )
     from hermes_cli import kanban_db
-    from shipfactory.recipes.instantiate import instantiate
+    from shipfactory.recipes.instantiate import current_base_sha, instantiate
+
+    base_sha = current_base_sha(Path(workspace).expanduser())
 
     conn = kanban_db.connect(board=board)
     try:
@@ -1240,6 +1249,7 @@ def _launch_project_flight(project_id: str, request: ProjectFlightRequest) -> tu
             parameters=dict(request.parameters),
             skip_steps=skips,
             instance_id=instance_id,
+            base_sha=base_sha,
             project_id=project_id,
             linear_issue_id=issue_id,
             launch_idempotency_key=request.idempotency_key,
