@@ -117,6 +117,26 @@ const CONFORMANCE_FIXTURES = deepFreeze(JSON.parse(String.raw`{
       ],
       "rework_edges": [{"id": "review->build:rework", "from": "review", "to": "build", "kind": "review_rework", "kinds": ["review_rework"], "label": "rework → build", "projection_only": true}]
     }
+  },
+  "live_overlay": {
+    "instance": {"instance_id": "fixture-flight-created", "project_id": "p_bound", "status": "waiting_gate", "linear_issue_id": null},
+    "next_actor": {"kind": "operator", "label": "Operator", "step_id": "approve", "activation": 1},
+    "blocker": {"kind": "human_action", "reason": "human action required", "step_id": "approve", "activation": 1},
+    "nodes": [
+      {"step_id": "start", "current_activation": 1, "state": "done", "attempts": 1, "task_id": null, "actor": {"kind": "seat", "label": "builder"}, "blocker": null},
+      {"step_id": "lint", "current_activation": 1, "state": "done", "attempts": 1, "task_id": null, "actor": {"kind": "seat", "label": "lint"}, "blocker": null},
+      {"step_id": "test", "current_activation": 1, "state": "done", "attempts": 1, "task_id": null, "actor": {"kind": "seat", "label": "tester"}, "blocker": null},
+      {"step_id": "approve", "current_activation": 1, "state": "waiting", "attempts": 1, "task_id": null, "actor": {"kind": "operator", "label": "Operator"}, "blocker": {"kind": "human_action", "reason": "human action required", "step_id": "approve", "activation": 1}}
+    ],
+    "history": {"enabled": true, "fold_threshold": 5, "items": [
+      {"step_id": "start", "activation": 1, "state": "done", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": null, "finding_count": null},
+      {"step_id": "lint", "activation": 1, "state": "done", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": null, "finding_count": null},
+      {"step_id": "test", "activation": 1, "state": "done", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": null, "finding_count": null},
+      {"step_id": "approve", "activation": 1, "state": "waiting", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": null, "finding_count": null}
+    ]},
+    "rework_edges": [],
+    "receipts": {"available": false, "endpoint": "/instances/fixture-flight-created/receipts"},
+    "evidence": {"status": "unavailable", "items": []}
   }
 }`));
 
@@ -127,6 +147,7 @@ const publishedRecipeFixtures = CONFORMANCE_FIXTURES.recipes;
 const syntheticParallelJoinFixture = CONFORMANCE_FIXTURES.graphs.synthetic_parallel_join;
 const foldedReworkFixture = CONFORMANCE_FIXTURES.history.folded_rework;
 const foldedReworkGraphFixture = CONFORMANCE_FIXTURES.graphs.folded_rework;
+const liveOverlayFixture = CONFORMANCE_FIXTURES.live_overlay;
 // The W3-E browser lane needs the same frozen recipe identities with the
 // immutable parameter/step fields that the real Projects API returns.  Keep
 // the older compact summaries above unchanged for the static fixture contract.
@@ -212,7 +233,10 @@ function browserMockFetch(url, options = {}) {
     return Promise.resolve(browserJsonResponse(browserProjectGraph()));
   }
   if (method === "GET" && path === "/api/plugins/shipfactory/instances/fixture-flight-created/graph") {
-    return Promise.resolve(browserJsonResponse(browserProjectGraph()));
+    return Promise.resolve(browserJsonResponse({
+      graph: browserProjectGraph(),
+      ...JSON.parse(JSON.stringify(liveOverlayFixture)),
+    }));
   }
   if (method === "PUT" && path === "/api/plugins/shipfactory/projects/p_bound/recipe-policy") {
     browserPolicy = JSON.parse(options.body || "{}");

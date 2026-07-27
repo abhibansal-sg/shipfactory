@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+# Preload the nested package before pytest imports this module from a checkout
+# directory named ``shipfactory``.  This is import-only and does not alter
+# production package loading; it prevents the repository root plugin from
+# circular-importing itself during focused collection.
+from shipfactory import store as _shipfactory_store
+
 import asyncio
 import functools
 import http.server
@@ -31,6 +37,7 @@ def _no_board(value: object) -> bool:
 def test_projects_and_graph_rendered_browser_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    assert _shipfactory_store.__name__ == "shipfactory.store"
     try:
         from playwright.async_api import async_playwright
     except Exception as error:  # pragma: no cover - exact environment blocker
@@ -193,6 +200,23 @@ def test_projects_and_graph_rendered_browser_contract(
                     await page.locator('[data-project-launch="p_bound"]').click()
                     await wait_for_request("POST", "/api/plugins/shipfactory/projects/p_bound/flights")
                     await page.wait_for_selector('[data-flight-instance-id="fixture-flight-created"]', state="visible")
+                    await wait_for_request("GET", "/api/plugins/shipfactory/instances/fixture-flight-created/graph")
+                    await page.wait_for_selector('[data-step-id="start"].factory-graph-node--state-done', state="visible")
+                    await page.wait_for_selector('[data-step-id="approve"].factory-graph-node--state-waiting', state="visible")
+                    overlay = page.locator('[aria-label="Live overlay summary"]')
+                    await overlay.wait_for(state="visible")
+                    overlay_text = await overlay.text_content()
+                    assert "Next actor: Operator" in (overlay_text or "")
+                    assert "Blocker: human action required" in (overlay_text or "")
+                    assert "Human operator approval required." in (overlay_text or "")
+                    await page.locator('[data-step-id="approve"]').click()
+                    inspector = page.locator('[role="dialog"][aria-label="Graph node inspector"]')
+                    await inspector.wait_for(state="visible")
+                    inspector_text = await inspector.text_content()
+                    assert "Activation history" in (inspector_text or "")
+                    assert "#1 · waiting" in (inspector_text or "")
+                    assert "Receipts: unavailable" in (inspector_text or "")
+                    assert "Evidence: unavailable" in (inspector_text or "")
                     requests = await page.evaluate("window.__SHIPFACTORY_CONFORMANCE_REQUESTS__")
                     launch_requests = [
                         item for item in requests

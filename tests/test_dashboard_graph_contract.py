@@ -178,6 +178,50 @@ def test_scenarios_use_consistent_routes_and_matching_history_graph() -> None:
     assert {node["id"] for node in synthetic["nodes"]}.isdisjoint(history_node_ids)
 
 
+def test_live_overlay_fixture_matches_the_instance_graph_wrapper() -> None:
+    fixtures = _fixtures()
+    overlay = fixtures["live_overlay"]
+    assert set(overlay) == {
+        "instance", "next_actor", "blocker", "nodes", "history",
+        "rework_edges", "receipts", "evidence",
+    }
+    assert overlay["instance"] == {
+        "instance_id": "fixture-flight-created",
+        "project_id": "p_bound",
+        "status": "waiting_gate",
+        "linear_issue_id": None,
+    }
+    assert overlay["next_actor"] == {
+        "kind": "operator", "label": "Operator", "step_id": "approve", "activation": 1,
+    }
+    assert overlay["blocker"] == {
+        "kind": "human_action", "reason": "human action required",
+        "step_id": "approve", "activation": 1,
+    }
+    node_states = {node["step_id"]: node["state"] for node in overlay["nodes"]}
+    assert node_states == {"start": "done", "lint": "done", "test": "done", "approve": "waiting"}
+    assert overlay["history"]["fold_threshold"] == fixtures["projects_response"]["runtime_config"]["history_fold_threshold"]
+    assert overlay["receipts"] == {
+        "available": False,
+        "endpoint": "/instances/fixture-flight-created/receipts",
+    }
+    assert overlay["evidence"] == {"status": "unavailable", "items": []}
+    serialized = json.dumps(overlay)
+    assert "board" not in serialized
+    assert "model" not in serialized
+    assert "provider" not in serialized
+
+
+def test_instance_graph_mock_returns_the_exact_live_overlay_wrapper() -> None:
+    route_start = HARNESS.index('path === "/api/plugins/shipfactory/instances/fixture-flight-created/graph"')
+    route_end = HARNESS.index('\n  }', route_start)
+    route = HARNESS[route_start:route_end]
+    assert "graph: browserProjectGraph()" in route
+    assert "...JSON.parse(JSON.stringify(liveOverlayFixture))" in route
+    assert "return Promise.resolve(browserJsonResponse(browserProjectGraph()))" not in route
+    assert 'payload.runtime_config.ui_refresh_interval_seconds = 3600;' in HARNESS
+
+
 def test_css_declares_native_svg_graph_visual_foundation() -> None:
     required = [
         ".factory-graph",
