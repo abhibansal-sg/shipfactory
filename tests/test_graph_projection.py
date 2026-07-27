@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+from shipfactory.config import PROJECTS_VISUAL_RECIPES_DEFAULTS, projects_visual_recipes_config
 from shipfactory.recipe_graph import project_graph
 from shipfactory.recipes.loader import load_library, validate
 from shipfactory.recipes.primitives import review_verdict_targets
@@ -108,7 +109,14 @@ def test_published_recipe_projection_preserves_source_and_recipe_order():
     declared = [step["id"] for step in recipe["steps"]]
     projected_declared = [node["id"] for node in graph["nodes"] if not node["projection_only"]]
     assert projected_declared == declared
-    assert graph["layout"] == {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+    assert graph["layout"] == {
+        "direction": "TB",
+        "rank_gap": 56,
+        "lane_gap": 28,
+        "node_width": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_node_width"],
+        "node_height": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_node_height"],
+        "diamond_size": PROJECTS_VISUAL_RECIPES_DEFAULTS["graph_diamond_size"],
+    }
 
     for step in recipe["steps"]:
         node = next(node for node in graph["nodes"] if node["id"] == step["id"])
@@ -185,3 +193,28 @@ def test_projection_does_not_mutate_recipe_and_creative_video_is_supported():
     ]
     approval = next(node for node in graph["nodes"] if node["id"] == "approval")
     assert approval["operator_only"] is True
+
+
+def test_graph_uses_runtime_layout_config_instead_of_owned_magic_values():
+    recipe = _synthetic_recipe()
+    config = projects_visual_recipes_config({
+        "projects_visual_recipes": {
+            "graph_direction": "RL",
+            "graph_rank_gap": 101,
+            "graph_lane_gap": 43,
+            "graph_node_width": 222,
+            "graph_node_height": 77,
+            "graph_diamond_size": 35,
+        },
+    })
+
+    graph = project_graph(recipe, recipe_hash="d" * 64, pinned=False, config=config)
+
+    assert graph["layout"] == {
+        "direction": "RL",
+        "rank_gap": 101,
+        "lane_gap": 43,
+        "node_width": 222,
+        "node_height": 77,
+        "diamond_size": 35,
+    }

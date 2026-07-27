@@ -36,6 +36,37 @@ ENVIRONMENT_RUNTIME_DEFAULTS = {
     "healthcheck_timeout_seconds": 2,
     "healthcheck_probe_concurrency": 8,
 }
+# Stage-0 Projects and visual-recipes controls.  These are intentionally a
+# single flat, closed block: the block is operator configuration, while safety
+# decisions such as Unclassified launch refusal and human-only approval are
+# Factory invariants and therefore have no settings here.
+PROJECTS_VISUAL_RECIPES_DEFAULTS: dict[str, bool | int | str] = {
+    "enabled": True,
+    "policy_editing_enabled": True,
+    "launch_enabled": True,
+    "graph_enabled": True,
+    "live_overlay_enabled": True,
+    "history_enabled": True,
+    "recent_flight_limit": 20,
+    "ui_refresh_interval_seconds": 5,
+    "graph_direction": "TB",
+    "graph_rank_gap": 56,
+    "graph_lane_gap": 28,
+    "graph_node_width": 180,
+    "graph_node_height": 64,
+    "graph_diamond_size": 24,
+    "history_fold_threshold": 5,
+}
+_PROJECTS_VISUAL_RECIPES_BOOLEAN_FIELDS = frozenset({
+    "enabled", "policy_editing_enabled", "launch_enabled", "graph_enabled",
+    "live_overlay_enabled", "history_enabled",
+})
+_PROJECTS_VISUAL_RECIPES_POSITIVE_FIELDS = frozenset({
+    "recent_flight_limit", "ui_refresh_interval_seconds", "graph_rank_gap",
+    "graph_lane_gap", "graph_node_width", "graph_node_height",
+    "graph_diamond_size", "history_fold_threshold",
+})
+PROJECTS_VISUAL_RECIPES_DIRECTIONS = frozenset({"TB", "BT", "LR", "RL"})
 VERIFICATION_PROFILE_FIELDS = frozenset({
     "max_runtime_seconds", "infrastructure_retries", "max_evidence_bytes",
     "max_log_bytes", "capture_video", "capture_trace", "capture_har",
@@ -180,6 +211,49 @@ def load_seats(path=None) -> FactoryConfig:
     cfg = FactoryConfig(str(raw.get("company", "")), seats, raw.get("hierarchy_gates", {}) or {}, recipes)
     validate(cfg)
     return cfg
+
+
+def projects_visual_recipes_config(recipes: dict[str, Any] | None) -> dict[str, bool | int | str]:
+    """Return the validated Projects/visual-recipes settings.
+
+    The seats file is read by :func:`load_seats` on every call, so callers
+    should invoke this helper for each request or daemon tick rather than
+    caching its result.  Defaults live here, outside the graph projection, so
+    a graph caller can pass the fresh effective configuration explicitly.
+    """
+    if recipes is None:
+        configured: Any = {}
+    elif not isinstance(recipes, dict):
+        raise FactoryConfigError("recipes must be a mapping")
+    else:
+        configured = recipes.get("projects_visual_recipes", {})
+    if configured is None or not isinstance(configured, dict):
+        raise FactoryConfigError("recipes.projects_visual_recipes must be a mapping")
+    unknown = set(configured) - set(PROJECTS_VISUAL_RECIPES_DEFAULTS)
+    if unknown:
+        raise FactoryConfigError(
+            "recipes.projects_visual_recipes has unknown keys: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    effective = {**PROJECTS_VISUAL_RECIPES_DEFAULTS, **configured}
+    for key in _PROJECTS_VISUAL_RECIPES_BOOLEAN_FIELDS:
+        if not isinstance(effective[key], bool):
+            raise FactoryConfigError(
+                f"recipes.projects_visual_recipes.{key} must be boolean"
+            )
+    for key in _PROJECTS_VISUAL_RECIPES_POSITIVE_FIELDS:
+        value = effective[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise FactoryConfigError(
+                f"recipes.projects_visual_recipes.{key} must be a positive integer"
+            )
+    direction = effective["graph_direction"]
+    if not isinstance(direction, str) or direction not in PROJECTS_VISUAL_RECIPES_DIRECTIONS:
+        raise FactoryConfigError(
+            "recipes.projects_visual_recipes.graph_direction must be one of "
+            + ", ".join(sorted(PROJECTS_VISUAL_RECIPES_DIRECTIONS))
+        )
+    return effective
 
 
 def reviewer_shares_builder_provider(cfg: FactoryConfig, builder_seat: str, reviewer_seat: str) -> bool:
@@ -347,6 +421,7 @@ def validate(cfg) -> None:
         runtime.get("port_min", ENVIRONMENT_RUNTIME_DEFAULTS["port_min"])
     ):
         raise FactoryConfigError("recipes.runtime.port_max must be >= port_min")
+    projects_visual_recipes_config(recipes)
 
 
 def environment_runtime_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
@@ -377,8 +452,9 @@ def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, int]:
 
 __all__ = [
     "FactoryConfig", "FactoryConfigError", "SELECTOR_DEFAULTS",
-    "ENVIRONMENT_RUNTIME_DEFAULTS", "Seat",
+    "ENVIRONMENT_RUNTIME_DEFAULTS", "PROJECTS_VISUAL_RECIPES_DEFAULTS",
+    "PROJECTS_VISUAL_RECIPES_DIRECTIONS", "Seat",
     "load_seats", "recipe_runtime_config", "environment_runtime_config",
     "reviewer_shares_builder_provider", "selector_config",
-    "verification_profiles_config", "validate",
+    "verification_profiles_config", "projects_visual_recipes_config", "validate",
 ]
