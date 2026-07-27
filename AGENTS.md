@@ -891,6 +891,19 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   The new daemon row and initial payload commit atomically with a required OS
   start token, and the clean `finally` path still owns normal completion.
 
+- Additive migrations expose duplicated “latest version” test contracts
+  immediately (finding #120, SF-21). Migration 16 was correct, but four older
+  schema tests still named 15 and failed before reaching their own column/index
+  oracles. Advance every normative latest-version assertion in the same landing
+  as a new migration while leaving each subsystem's exact schema assertions
+  intact; a green migration unit alone does not prove suite-wide contract drift.
+- A focused adversarial test must budget enough time to reach the oracle it
+  names under full-file load (finding #121, SF-21). The fabricated-pytest test
+  already fenced unrelated host-wide process scans, but the generic action
+  runtime could still expire first and report `test_timeout`. Its test-only
+  profile now has a bounded 30-second runtime; production supervision and the
+  required `test_failed` evidence assertion remain unchanged.
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.

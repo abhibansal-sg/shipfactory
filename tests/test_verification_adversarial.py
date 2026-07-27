@@ -516,7 +516,12 @@ def test_fabricated_pass_text_and_exit_zero_without_real_pytest_evidence_fails_c
     )
     repo, head, tree = _repo(tmp_path, document)
     manifest = verify.load_verification_manifest(repo, head)
-    bundle = _run(repo, head, tree, manifest)
+    # The distinct oracle is fabricated pytest evidence, so allow this case a
+    # bounded 30-second runtime to reach it under loaded-host scheduling.
+    bundle = _run(
+        repo, head, tree, manifest,
+        profile=_profile(max_runtime_seconds=30),
+    )
     assert bundle["state"] == "blocked"
     assert bundle["invalid_reason"] == "test_failed"
 
