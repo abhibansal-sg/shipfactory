@@ -117,6 +117,73 @@ published recipe. A Hermes modification becomes justified only if source
 inspection proves the plugin cannot read the native project registry; current
 source inspection proves it can.
 
+## Stage 0 runtime configuration contract
+
+Stage 0 is landed in `aed92f1` and is the global runtime-config law for this
+feature. The only configuration source is the existing
+`$HERMES_HOME/shipfactory/seats.yaml`; there is no second Projects config file,
+no feature-specific watcher, and no cached copy that outlives a request or
+daemon tick. The block is nested under the existing `recipes` mapping:
+
+```yaml
+recipes:
+  projects_visual_recipes:
+    enabled: true
+    policy_editing_enabled: true
+    launch_enabled: true
+    graph_enabled: true
+    live_overlay_enabled: true
+    history_enabled: true
+    recent_flight_limit: 20
+    ui_refresh_interval_seconds: 5
+    graph_direction: TB
+    graph_rank_gap: 56
+    graph_lane_gap: 28
+    graph_node_width: 180
+    graph_node_height: 64
+    graph_diamond_size: 24
+    history_fold_threshold: 5
+```
+
+`load_seats()` reads and validates this same file on every request/tick, and
+`projects_visual_recipes_config(cfg.recipes)` returns the effective closed
+block. The exact landed defaults are: `enabled`, `policy_editing_enabled`,
+`launch_enabled`, `graph_enabled`, `live_overlay_enabled`, and
+`history_enabled` are `true`; `recent_flight_limit` is `20`,
+`ui_refresh_interval_seconds` is `5`, `graph_direction` is `TB`,
+`graph_rank_gap` is `56`, `graph_lane_gap` is `28`, `graph_node_width` is
+`180`, `graph_node_height` is `64`, `graph_diamond_size` is `24`, and
+`history_fold_threshold` is `5`. Numeric settings are positive integers and
+`graph_direction` is one of `TB`, `BT`, `LR`, or `RL`; unknown keys and invalid
+values fail closed. All six boolean flags default ON.
+
+Unclassified launch refusal and human-only approval are non-configurable
+Factory safety invariants. No setting may enable an Unclassified launch,
+automatic approval, agent approval, or a route that bypasses the operator gate.
+
+`GET /projects` is the explicit runtime-config read contract. Its response
+includes the fresh effective block as `runtime_config` with exactly the keys
+above. The UI takes refresh cadence, history behavior/folding, recent-flight
+limits, feature flags, and graph dimensions from that object; it does not own
+parallel defaults. Every state-changing, launch, graph, and overlay request
+loads and validates the same file again at the server authorization point:
+
+- `PUT /projects/{project_id}/recipe-policy` requires `enabled` and
+  `policy_editing_enabled`.
+- `POST /projects/{project_id}/flights` requires `enabled` and
+  `launch_enabled`.
+- Recipe and instance graph routes require `enabled` and `graph_enabled`.
+- Instance overlay/history reads require `enabled`, `graph_enabled`, and
+  `live_overlay_enabled`; `history_enabled` controls history exposure and
+  `history_fold_threshold` controls its projection.
+
+Disabled features return a stable explicit error and perform no mutation or
+launch. A malformed or unreadable seats file fails closed; the server never
+falls back to a stale effective config. The daemon follows the same rule by
+loading the block at each tick. This section records implementation and API
+contract only; it does not claim rendered UI, live daemon, or other runtime
+proof.
+
 ## Backend API contract
 
 All routes below are mounted below the existing plugin prefix. JSON field names
@@ -139,6 +206,14 @@ Response:
       "linear_issue_id": "SF-123"
     }]}
   }],
+  "runtime_config": {
+    "enabled": true, "policy_editing_enabled": true, "launch_enabled": true,
+    "graph_enabled": true, "live_overlay_enabled": true, "history_enabled": true,
+    "recent_flight_limit": 20, "ui_refresh_interval_seconds": 5,
+    "graph_direction": "TB", "graph_rank_gap": 56, "graph_lane_gap": 28,
+    "graph_node_width": 180, "graph_node_height": 64,
+    "graph_diamond_size": 24, "history_fold_threshold": 5
+  },
   "unclassified": {
     "id": "unclassified", "label": "Unclassified", "binding": "unclassified",
     "rollup": {"active": 0, "waiting": 0, "recent": []}
@@ -148,7 +223,10 @@ Response:
 
 `binding` is `bound`, `unbound`, or `ambiguous` for a project and is
 `unclassified` for the bucket. The response deliberately omits board names.
-`recent` is bounded and read-only; it is not a ledger.
+`recent` is bounded by fresh `runtime_config.recent_flight_limit` and
+read-only; it is not a ledger. `runtime_config` is the server-authoritative
+effective Stage 0 block, and the UI must consume it for polling, history,
+feature visibility, and graph layout.
 
 ### `GET /projects/{project_id}/recipes`
 
@@ -257,6 +335,14 @@ FlightSummary = {
   linear_issue_id: string | null
 }
 ProjectRollup = {active: int, waiting: int, recent: FlightSummary[]}
+ProjectsRuntimeConfig = {
+  enabled: bool, policy_editing_enabled: bool, launch_enabled: bool,
+  graph_enabled: bool, live_overlay_enabled: bool, history_enabled: bool,
+  recent_flight_limit: int, ui_refresh_interval_seconds: int,
+  graph_direction: "TB" | "BT" | "LR" | "RL", graph_rank_gap: int,
+  graph_lane_gap: int, graph_node_width: int, graph_node_height: int,
+  graph_diamond_size: int, history_fold_threshold: int
+}
 ProjectSummary = {
   id: string, slug: string, name: string,
   binding: "bound" | "unbound" | "ambiguous",
@@ -291,6 +377,7 @@ ProjectFlightResponse = {
 ```
 
 `GET /projects` returns `ProjectsResponse={projects: ProjectSummary[],
+runtime_config: ProjectsRuntimeConfig,
 unclassified: {id: "unclassified", label: "Unclassified",
 binding: "unclassified", rollup: ProjectRollup}}`. `PUT` returns
 `ProjectRecipePolicy={project_id: string, allowed_recipe_keys: string[],
@@ -364,7 +451,7 @@ The graph is generated from validated recipe bytes and has this exact shape:
     "activation_cap": 3, "legal_rework_targets": []
   }],
   "edges": [{"id": "plan-draft->build:needs", "from": "plan-draft", "to": "build", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false}],
-  "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+  "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28, "node_width": 180, "node_height": 64, "diamond_size": 24}
 }
 ```
 
@@ -392,6 +479,11 @@ state transition.
 
 Use local deterministic rank/lane layout and native SVG created by the existing
 React IIFE. Do not add Dagre, React Flow, canvas, or another graph framework.
+The graph projection receives the fresh effective Stage 0 config and its
+`layout` is exactly `{direction, rank_gap, lane_gap, node_width, node_height,
+diamond_size}` from that config. The values in the example above are the
+landed defaults, not renderer-owned magic values; a caller must not silently
+substitute another default or reuse a prior request's config.
 Rank is `0` for a node with no `needs`, otherwise one plus the maximum parent
 rank. Within a rank, retain recipe order, then id. Siblings share a rank; a
 multi-parent consumer receives converging edges and may have a decorative,
@@ -454,6 +546,13 @@ instance/activation and sealed hash, never to an instance-wide latest artifact.
 - Approval gates remain operator-only. Dashboard/API agents never approve,
   reject, release, or complete a gate; state-changing calls remain queued and
   the daemon is the single writer.
+- Stage 0 configuration is read from the single seats file on every request or
+  daemon tick. No second config file, watcher, stale cache, or configurable
+  safety bypass is allowed.
+- Mutation, launch, graph, and overlay routes enforce the fresh effective
+  feature flags server-side; the UI's disabled controls are not an authority
+  boundary. Unclassified launch refusal and human-only approval cannot be
+  changed by configuration.
 - Project lookup uses explicit Hermes `board_slug`; no cwd, title, current
   daemon board, or Linear inference. No Factory project-board table exists.
 - Launch validates active attachment, immutable recipe hash, parameters,
@@ -565,7 +664,10 @@ def launch_project_flight(
 ) -> ProjectFlightResponse:
     ...
 
-def project_graph(recipe: Mapping[str, Any], *, recipe_hash: str, pinned: bool) -> GraphProjection:
+def project_graph(
+    recipe: Mapping[str, Any], *, recipe_hash: str, pinned: bool,
+    config: Mapping[str, Any] | None = None,
+) -> GraphProjection:
     ...
 
 def instance_graph_overlay(db: Any, instance_id: str) -> GraphOverlay:

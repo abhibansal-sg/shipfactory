@@ -55,6 +55,46 @@ Rollback checkpoint: before any implementation work, restore only the two docs
 from the orchestrator's reviewed checkpoint if the contract changes. Do not
 reset the worktree globally.
 
+## Stage 0 — global runtime config (completed at `aed92f1`)
+
+Stage 0 is a completed prerequisite for every Projects policy, API, graph,
+overlay, and UI lane below. The landed implementation is in
+`shipfactory/config.py` (with the graph consumer in
+`shipfactory/recipe_graph.py`) and is covered by the landed config/graph tests;
+this status does not claim rendered UI, live daemon, or other runtime proof.
+
+The contract is one operator-owned block in the existing
+`$HERMES_HOME/shipfactory/seats.yaml` at
+`recipes.projects_visual_recipes`. `load_seats()` reads that same file on each
+request or daemon tick, and `projects_visual_recipes_config(cfg.recipes)`
+returns the fresh effective closed block. No second config file, watcher, or
+long-lived feature-config cache is allowed. The exact landed defaults are:
+
+| Key | Default |
+|---|---:|
+| `enabled` | `true` |
+| `policy_editing_enabled` | `true` |
+| `launch_enabled` | `true` |
+| `graph_enabled` | `true` |
+| `live_overlay_enabled` | `true` |
+| `history_enabled` | `true` |
+| `recent_flight_limit` | `20` |
+| `ui_refresh_interval_seconds` | `5` |
+| `graph_direction` | `TB` |
+| `graph_rank_gap` | `56` |
+| `graph_lane_gap` | `28` |
+| `graph_node_width` | `180` |
+| `graph_node_height` | `64` |
+| `graph_diamond_size` | `24` |
+| `history_fold_threshold` | `5` |
+
+Unknown keys and invalid values fail closed. Unclassified launch refusal and
+human-only approval are Factory safety invariants, not settings. Stage 0's
+acceptance check for every later lane is: inspect the fresh config seam, prove
+the lane uses the exact effective values rather than local defaults, and prove
+the relevant server-side flag is enforced; never treat a UI toggle or a stale
+cached config as authority.
+
 ## Wave 1 — parallel green foundations with no shared-file collisions
 
 These four lanes start together. Each worker owns exactly the files listed in
@@ -82,6 +122,10 @@ child. This is TEST-ONLY isolation, not a fail-open supervision change. End
 with focused green tests, no commit attempt, and
 `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: confirm this test-only lane leaves the
+single `seats.yaml` source, fresh-load rule, Unclassified refusal, and
+human-only approval invariant unchanged.
+
 ### W1-B — SF-21 daemon bookkeeping
 
 Owner: Projects. Files: `shipfactory/store.py`, `shipfactory/daemon.py`, and
@@ -99,6 +143,10 @@ before board access; reuse existing start-token/crash/start/end seams. End
 with focused green tests, no commit attempt, and `LANE_RESULT: done` (or
 `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: confirm daemon work reads the effective
+Projects block per tick when relevant and introduces no watcher, second file,
+stale cache, or configurable safety bypass.
+
 ### W1-C — pure recipe graph projection
 
 Owner: Graph. Files: new `shipfactory/recipe_graph.py` and
@@ -113,6 +161,11 @@ Implement `project_graph()` for exact source/hash metadata, stable nodes and
 coalesced edges, typed fan-in, review-verdict diamonds, legal rework targets,
 and visible unsupported states. End with focused green tests, no commit
 attempt, and `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: pass the fresh effective Stage 0 config into
+the projection and assert all six layout fields (`direction`, `rank_gap`,
+`lane_gap`, `node_width`, `node_height`, `diamond_size`) without renderer-owned
+magic values.
 
 ### W1-D — CSS and deterministic conformance fixtures
 
@@ -132,12 +185,20 @@ stable attribute declarations, and safe-text source rules only; they must not
 claim the future bundle renders them. End with focused green tests, no commit
 attempt, and `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: fixtures and selectors may not encode a
+second config source; refresh, history, feature, and layout assertions must
+remain driven by the effective Stage 0 response.
+
 Wave 1 integration order is any order among the four green branches, followed
 by the orchestrator's focused green checkpoint. W1-B must integrate before
 W2-A touches `store.py`; W1-C's pure helper is consumed later by the graph
 routes. Every Wave 1 integration checkpoint is green.
 
 ## Wave 2 — backend launch and frozen SVG renderer
+
+Entry gate: Stage 0 at `aed92f1` is complete and reviewed before W2-A policy
+storage or W2-B/W2-C/W2-D API, graph, and UI work starts. No W2 lane may
+invent a runtime-config source or defer server-side flag enforcement.
 
 ### W2-A — project policy persistence and migration
 
@@ -160,6 +221,10 @@ naming migration 16 and the policy persistence command. Focused command:
    query seams. Policy writes must survive reload/restart. Run the focused
    command; expected green plus migration checksum idempotence. End with
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: policy persistence does not create a second
+runtime-config store; the policy mutation path re-loads and enforces fresh
+`enabled` plus `policy_editing_enabled` before writing.
 
 ### W2-B — Projects API, rollups, and idempotent launch
 
@@ -192,6 +257,10 @@ naming the policy and launch cases. Focused command:
    frozen field. End with focused green tests, no commit attempt, and
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: `GET /projects` exposes the fresh effective
+`runtime_config`; launch and policy routes re-load it server-side and enforce
+their flags, with no UI-only gate or board-level fallback.
+
 ### W2-C — graph projection backend
 
 Owner: same backend owner as W2-B, after its API changes are green. Files:
@@ -212,6 +281,10 @@ naming the graph routes and pure helper. Focused command:
    malformed/hash-drifted documents fail closed. End with focused green tests,
    no commit attempt, and `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: each graph request re-loads the effective
+config, enforces `enabled` and `graph_enabled`, and emits all six configured
+layout values rather than magic constants.
+
 ### W2-D — native SVG renderer
 
 Owner: Dashboard bundle owner. Exclusive file: `dashboard/dist/index.js`.
@@ -231,6 +304,10 @@ naming the SVG contract. Focused command:
    review loop, skipped, unsupported, and operator-only shapes render with no
    unsafe HTML. End with focused green tests, no commit attempt, and
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: the renderer consumes the API's effective
+refresh/feature/history settings and graph layout; it does not duplicate
+defaults or weaken Unclassified and human-only safety invariants.
 
 Wave 2 checkpoint: orchestrator integrates W2-A, W2-B/W2-C, then W2-D in that
 order; W1-D already owns the CSS foundation. Commit separately: `feat: add project recipe policy storage`,
@@ -268,6 +345,10 @@ naming the overlay cases. Focused command:
    React text only. End with focused green tests, no commit attempt, and
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: overlay requests re-load and enforce
+`enabled`, `graph_enabled`, and `live_overlay_enabled`; history visibility and
+folding follow fresh `history_enabled` and `history_fold_threshold` values.
+
 ### W3-B — rendered Projects flow
 
 Owner: the same Dashboard bundle owner, immediately after W3-A. Exclusive file:
@@ -294,6 +375,11 @@ naming the Projects and policy-control cases. Focused command:
    Expected green: rendered Projects flow and prior plugin registration both
    pass. End with focused green tests, no commit attempt, and
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: the UI consumes `GET /projects`'s fresh
+`runtime_config` for refresh, history, feature visibility, and layout; server
+flags remain authoritative for policy mutation and launch, including the
+non-configurable Unclassified and human-only rules.
 
 ### W3-C — conformance and screenshot harness
 
@@ -323,6 +409,10 @@ naming the DOM and screenshot scenarios. Focused command:
    blocked/skipped with the missing tool, while DOM/unit proof remains valid.
 End with focused green tests, no worker commit attempt, and
 `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: conformance checks the effective config
+contract and server-side flag responses, without treating static fixtures or
+browser controls as proof of live runtime behavior.
 
 Wave 3 checkpoint: integrate W3-A then W3-B serially; integrate W3-C after the
 bundle is stable. Commit `feat: add graph live inspector`,
@@ -358,6 +448,10 @@ Focused command form:
    `test: integrate projects visual recipes evidence`. Emit
    `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: integration proves every exercised request
+uses a fresh effective Stage 0 block, exposes `runtime_config` from
+`GET /projects`, and preserves the non-configurable safety invariants.
+
 ### W4-B — known-flake repetition and full suite
 
 Owner: orchestrator. Files read: `tests/` and the two verification test files;
@@ -377,6 +471,10 @@ failure must distinguish the deterministic unrelated-ambient regression from a
 known-child infrastructure error; no test is weakened to make the suite green
 and production unreadable-scan classification remains infrastructure error.
 Emit `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: the full-suite review includes invalid,
+hot-reloaded, and default-on Projects config cases and confirms no test relies
+on a second file, watcher, or stale cache.
 
 ### W4-C — real dashboard button and graph smoke
 
@@ -399,6 +497,10 @@ With the documented Vite harness and an approved screenshot/browser tool:
    rather than treating DOM fixtures as a screenshot.
 Emit `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: browser checks consume the server's fresh
+`runtime_config`; a rendered control is never accepted as a substitute for
+server-side mutation, launch, graph, or overlay flag enforcement.
+
 ### W4-D — live daemon smoke
 
 Owner: orchestrator. Files read: `tests/test_daemon_run_record.py` and the
@@ -415,6 +517,10 @@ rows, and no approval activity. Stale-row reconciliation must be observed
 only after lock acquisition and must not adopt or close a provably live PID /
 start-token identity.
 Emit `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
+
+Runtime-config review acceptance: the daemon smoke observes per-tick config
+loading and fail-closed invalid-config behavior without installing a watcher or
+changing the Unclassified/human-only invariants.
 
 ### W4-E — Linear reconciliation
 
@@ -434,9 +540,13 @@ in-product Linear backlink writer remains deferred; do not claim its
 `linear_backlink.status="unavailable"` field is the closeout reconciliation.
 Emit `LANE_RESULT: done` (or `LANE_RESULT: blocked <reason>`).
 
+Runtime-config review acceptance: reconciliation reports config-contract
+review separately from focused, browser, and live proof and does not claim
+runtime/UI behavior merely because Stage 0 is landed.
+
 ## Merge order, ownership, and rollback matrix
 
-1. Docs checkpoint (W0).
+1. Docs checkpoint (W0), with Stage 0 already landed at `aed92f1`.
 2. W1-A verification tests and W1-B daemon tests/code in parallel;
    orchestrator commits separately.
 3. W1-C pure graph helper and W1-D CSS/fixture foundations; orchestrator

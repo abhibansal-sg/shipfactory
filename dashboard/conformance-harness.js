@@ -12,6 +12,123 @@ const now = Date.now();
 const isoAgo = seconds => new Date(now - seconds * 1000).toISOString();
 const scenario = new URLSearchParams(window.location.search);
 
+// W1-D fixtures are a frozen, clock-independent payload.  Keep this JSON
+// block separate from the older dashboard scenarios: the future Projects and
+// Graph views can consume it without making the existing harness less useful.
+const CONFORMANCE_FIXTURES = Object.freeze(JSON.parse(String.raw`{
+  "as_of": "2026-07-27T00:00:00+00:00",
+  "projects": {
+    "bound": {
+      "id": "p_bound",
+      "slug": "factory",
+      "name": "Factory",
+      "binding": "bound",
+      "recipes": {"allowed": ["creative-video@1", "dev-pipeline@14"], "default": "dev-pipeline@14"},
+      "rollup": {"active": 1, "waiting": 1, "recent": [{"instance_id": "fixture-flight-1", "recipe": "dev-pipeline@14", "status": "waiting_gate", "updated_at": "2026-07-27T00:00:00+00:00", "linear_issue_id": "SF-1400"}]}
+    },
+    "unclassified": {
+      "id": "unclassified",
+      "label": "Unclassified",
+      "binding": "unclassified",
+      "rollup": {"active": 0, "waiting": 0, "recent": []}
+    }
+  },
+  "projects_response": {
+    "projects": [{
+      "id": "p_bound",
+      "slug": "factory",
+      "name": "Factory",
+      "binding": "bound",
+      "recipes": {"allowed": ["creative-video@1", "dev-pipeline@14"], "default": "dev-pipeline@14"},
+      "rollup": {"active": 1, "waiting": 1, "recent": [{"instance_id": "fixture-flight-1", "recipe": "dev-pipeline@14", "status": "waiting_gate", "updated_at": "2026-07-27T00:00:00+00:00", "linear_issue_id": "SF-1400"}]}
+    }],
+    "unclassified": {"id": "unclassified", "label": "Unclassified", "binding": "unclassified", "rollup": {"active": 0, "waiting": 0, "recent": []}}
+  },
+  "policy": {
+    "default": {"project_id": "p_bound", "allowed_recipe_keys": ["creative-video@1", "dev-pipeline@14"], "default_recipe_key": "dev-pipeline@14", "updated_at": "2026-07-27T00:00:00+00:00"},
+    "attached": {"project_id": "p_bound", "allowed_recipe_keys": ["creative-video@1", "dev-pipeline@14"], "default_recipe_key": "dev-pipeline@14", "updated_at": "2026-07-27T00:01:00+00:00"}
+  },
+  "recipes": {
+    "dev-pipeline@14": {
+      "fixture_kind": "non-authoritative-api-projection",
+      "authoritative_source": "recipes/dev-pipeline@14.yaml",
+      "key": "dev-pipeline@14", "id": "dev-pipeline", "version": 14,
+      "recipe_hash": "06ae8dc40d59a3e18083802cc4dcbbd5c0da91c792c2a7ca28114a335fed82e6",
+      "description": "Representative projection for the software-change recipe.",
+      "default": true,
+      "representative_step_ids": ["explore", "build", "approval"]
+    },
+    "creative-video@1": {
+      "fixture_kind": "non-authoritative-api-projection",
+      "authoritative_source": "recipes/creative-video@1.yaml",
+      "key": "creative-video@1", "id": "creative-video", "version": 1,
+      "recipe_hash": "160fbd9f41466da0a714e0cb2f275fe4644589b397441b1e7733834bfce9aa6a",
+      "description": "Representative projection for the creative-video recipe.",
+      "default": false,
+      "representative_step_ids": ["research", "motion-build", "approval"]
+    }
+  },
+  "graphs": {
+    "synthetic_parallel_join": {
+      "schema_version": "shipfactory.graph/v1",
+      "source": {"recipe_id": "synthetic-parallel", "version": 1, "recipe_key": "synthetic-parallel@1", "recipe_hash": "48ac873c776ae5e1dfd13a350db9879f374e39188923ec2221d0944feb2acbd7", "pinned": true},
+      "nodes": [
+        {"id": "start", "title": "Start", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": [], "inputs": [], "outputs": [], "params": {}, "seat": "builder", "execution_profile": "build", "access_mode": "workspace_write", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
+        {"id": "lint", "title": "Lint", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": ["start"], "inputs": [], "outputs": [], "params": {}, "seat": "lint", "execution_profile": "build", "access_mode": "readonly", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
+        {"id": "test", "title": "Test", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": ["start"], "inputs": [], "outputs": [], "params": {}, "seat": "tester", "execution_profile": "build", "access_mode": "readonly", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
+        {"id": "join", "title": "Join lint and test", "primitive": "join", "shape": "diamond", "projection_only": true, "optional": false, "needs": ["lint", "test"], "inputs": [], "outputs": [], "params": {}, "seat": null, "execution_profile": null, "access_mode": "readonly", "environment": "source", "activation_cap": 1, "legal_rework_targets": []},
+        {"id": "approve", "title": "Operator approval", "primitive": "approval_gate", "shape": "diamond", "projection_only": false, "optional": false, "needs": ["join"], "inputs": [], "outputs": [], "params": {}, "seat": null, "execution_profile": null, "access_mode": "readonly", "environment": "source", "activation_cap": 1, "legal_rework_targets": [], "operator_only": true}
+      ],
+      "edges": [
+        {"id": "start->lint:needs", "from": "start", "to": "lint", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false},
+        {"id": "start->test:needs", "from": "start", "to": "test", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false},
+        {"id": "lint->join:needs", "from": "lint", "to": "join", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false},
+        {"id": "test->join:needs", "from": "test", "to": "join", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false},
+        {"id": "join->approve:needs", "from": "join", "to": "approve", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false}
+      ],
+      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+    },
+    "folded_rework": {
+      "schema_version": "shipfactory.graph/v1",
+      "source": {"recipe_id": "fixture-rework", "version": 1, "recipe_key": "fixture-rework@1", "recipe_hash": "40526429229bfd0550a40ca2e1d34ffa7149bf72d6194800aea30c009224b357", "pinned": true},
+      "nodes": [
+        {"id": "build", "title": "Build", "primitive": "agent_task", "shape": "rectangle", "projection_only": false, "optional": false, "needs": [], "inputs": [], "outputs": [], "params": {}, "seat": "builder", "execution_profile": "build", "access_mode": "workspace_write", "environment": "source", "activation_cap": 2, "legal_rework_targets": []},
+        {"id": "review", "title": "Review", "primitive": "review_gate", "shape": "diamond", "projection_only": false, "optional": false, "needs": ["build"], "inputs": [], "outputs": [], "params": {}, "seat": "reviewer", "execution_profile": "review", "access_mode": "readonly", "environment": "source", "activation_cap": 2, "legal_rework_targets": ["build"]}
+      ],
+      "edges": [{"id": "build->review:needs", "from": "build", "to": "review", "kind": "needs", "kinds": ["needs"], "label": "needs", "projection_only": false}],
+      "layout": {"direction": "TB", "rank_gap": 56, "lane_gap": 28}
+    }
+  },
+  "history": {
+    "folded_rework": {
+      "instance": {"instance_id": "fixture-rework-1", "project_id": "p_bound", "status": "waiting_gate", "linear_issue_id": "SF-1401"},
+      "history": [
+        {"step_id": "build", "activation": 1, "state": "done", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": null, "finding_count": null},
+        {"step_id": "build", "activation": 2, "state": "done", "rejected_by_step_id": "review", "rejected_by_activation": 1, "verdict": {"outcome": "request_changes", "target": "build", "finding_ids": ["F-1"]}, "finding_count": 1},
+        {"step_id": "review", "activation": 1, "state": "changes_requested", "rejected_by_step_id": null, "rejected_by_activation": null, "verdict": {"outcome": "request_changes", "target": "build", "finding_ids": ["F-1"]}, "finding_count": 1},
+        {"step_id": "review", "activation": 2, "state": "done", "rejected_by_step_id": "review", "rejected_by_activation": 1, "verdict": {"outcome": "approve", "target": null, "finding_ids": []}, "finding_count": 0}
+      ],
+      "rework_edges": [{"id": "review->build:rework", "from": "review", "to": "build", "kind": "review_rework", "kinds": ["review_rework"], "label": "rework → build", "projection_only": true}]
+    }
+  }
+}`));
+
+const boundProjectFixture = CONFORMANCE_FIXTURES.projects.bound;
+const unclassifiedProjectFixture = CONFORMANCE_FIXTURES.projects.unclassified;
+const policyFixtures = CONFORMANCE_FIXTURES.policy;
+const publishedRecipeFixtures = CONFORMANCE_FIXTURES.recipes;
+const syntheticParallelJoinFixture = CONFORMANCE_FIXTURES.graphs.synthetic_parallel_join;
+const foldedReworkFixture = CONFORMANCE_FIXTURES.history.folded_rework;
+const foldedReworkGraphFixture = CONFORMANCE_FIXTURES.graphs.folded_rework;
+const STABLE_DOM_ATTRIBUTES = Object.freeze([
+  "data-project-id", "data-project-launch", "data-recipe-key",
+  "data-recipe-attach", "data-recipe-detach", "data-recipe-default",
+  "data-flight-instance-id", "data-unclassified", "data-graph-node",
+  "data-step-id", "data-activation", "data-graph-edge", "data-edge-from",
+  "data-edge-to", "data-edge-kind",
+]);
+window.__SHIPFACTORY_CONFORMANCE_FIXTURES__ = CONFORMANCE_FIXTURES;
+
 // Verdict contract v2 payload: explicit clean/findings/target fields. Carried
 // by rework rows (rejected_by_step_id set) and by the gate activation that
 // produced it — the journey view's "rework ordered by …" annotation.
@@ -229,6 +346,27 @@ window.__HERMES_PLUGIN_SDK__ = {
   components: { Badge, Button, Card, CardContent },
   utils: {},
   fetchJSON(url, options = {}) {
+    if (url.endsWith("/projects")) return Promise.resolve(CONFORMANCE_FIXTURES.projects_response);
+    if (url.includes("/projects/p_bound/recipes")) return Promise.resolve({
+      project_id: "p_bound",
+      recipes: policyFixtures.attached.allowed_recipe_keys.map(key => publishedRecipeFixtures[key]),
+      default_recipe: policyFixtures.attached.default_recipe_key,
+    });
+    if (url.includes("/projects/p_bound/recipe-policy") && options.method === "PUT") {
+      return Promise.resolve({ ...policyFixtures.attached });
+    }
+    if (url.includes("/projects/unclassified/recipes")) {
+      return Promise.reject(new Error("400: Unclassified projects cannot launch recipes"));
+    }
+    if (url.includes("/instances/fixture-rework-1/graph")) {
+      return Promise.resolve({
+        ...foldedReworkFixture,
+        graph: foldedReworkGraphFixture,
+      });
+    }
+    if (url.includes("/graphs/synthetic-parallel@1")) {
+      return Promise.resolve(syntheticParallelJoinFixture);
+    }
     if (url.endsWith("/profiles")) return Promise.resolve(["default", "architect", "dev-backend-codex", "verifier"]);
     if (options.method === "POST" && url.endsWith("/seats")) return Promise.resolve({ name: JSON.parse(options.body).name });
     if (options.method === "PUT" && url.includes("/seats/")) return Promise.resolve({ name: decodeURIComponent(url.split("/seats/")[1]) });

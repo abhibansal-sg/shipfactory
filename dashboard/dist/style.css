@@ -234,3 +234,155 @@
   .factory-toast,
   .factory-drawer { animation: none; }
 }
+
+/* Frozen recipe graph foundation.  The SVG renderer is deliberately a
+   separate owner; these classes are stable visual hooks for its native SVG
+   nodes and edges. */
+:root {
+  --factory-graph-edge-color: color-mix(in srgb, currentColor 34%, transparent);
+  --factory-graph-rework-color: var(--color-destructive, #dc2626);
+  --factory-graph-focus-ring: var(--color-primary, #2563eb);
+}
+
+.factory-graph {
+  min-width: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.factory-graph-canvas {
+  min-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.5rem;
+  scrollbar-gutter: stable both-edges;
+}
+.factory-graph-canvas > svg {
+  display: block;
+  min-width: max-content;
+  overflow: visible;
+}
+.factory-graph-node {
+  color: var(--color-card-foreground, currentColor);
+  transition: opacity 140ms ease, filter 140ms ease;
+}
+.factory-graph-shape--rect {
+  fill: var(--color-card, #fff);
+  stroke: currentColor;
+  vector-effect: non-scaling-stroke;
+}
+.factory-graph-shape--polygon {
+  fill: var(--color-card, #fff);
+  stroke: currentColor;
+  vector-effect: non-scaling-stroke;
+}
+.factory-graph-shape--path {
+  fill: none;
+  stroke: currentColor;
+  vector-effect: non-scaling-stroke;
+}
+.factory-graph-node--rectangle > rect.factory-graph-shape--rect,
+.factory-graph-node--diamond > polygon.factory-graph-shape--polygon {
+  stroke-width: 0.1rem;
+}
+.factory-graph-node--rectangle > text.factory-graph-node-label,
+.factory-graph-node--diamond > text.factory-graph-node-label,
+.factory-graph-node-label {
+  fill: currentColor;
+  font-size: 0.8rem;
+  font-weight: 600;
+  pointer-events: none;
+  user-select: none;
+}
+.factory-graph-node--operator-only > text.factory-graph-operator-badge,
+.factory-graph-operator-badge {
+  fill: var(--color-warning, #d97706);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  pointer-events: none;
+  text-transform: uppercase;
+}
+.factory-graph-node--operator-only > .factory-graph-shape--rect,
+.factory-graph-node--operator-only > .factory-graph-shape--polygon {
+  stroke: var(--color-warning, #d97706);
+  stroke-dasharray: 0.2rem 0.15rem;
+}
+.factory-graph-node--selected {
+  filter: drop-shadow(0 0 0.35rem color-mix(in srgb, var(--color-primary, #2563eb) 42%, transparent));
+}
+.factory-graph-node:focus-visible,
+.factory-graph [data-graph-node]:focus-visible {
+  outline: 0.15rem solid var(--factory-graph-focus-ring);
+  outline-offset: 0.2rem;
+}
+.factory-graph-node:focus-visible > .factory-graph-shape--rect,
+.factory-graph-node:focus-visible > .factory-graph-shape--polygon {
+  stroke: var(--factory-graph-focus-ring);
+  stroke-width: 0.18rem;
+}
+.factory-graph-node--skipped {
+  opacity: 0.48;
+}
+.factory-graph-node--skipped > .factory-graph-shape--rect,
+.factory-graph-node--skipped > .factory-graph-shape--polygon {
+  stroke-dasharray: 0.25rem 0.2rem;
+}
+.factory-graph-node--unsupported {
+  opacity: 0.72;
+}
+.factory-graph-node--unsupported > .factory-graph-shape--rect,
+.factory-graph-node--unsupported > .factory-graph-shape--polygon {
+  stroke: var(--color-destructive, #dc2626);
+  stroke-dasharray: 0.35rem 0.2rem;
+}
+.factory-graph-node--state-pending,
+.factory-graph-node--state-ready { opacity: 0.78; }
+.factory-graph-node--state-running > .factory-graph-shape--rect,
+.factory-graph-node--state-running > .factory-graph-shape--polygon {
+  stroke: var(--color-primary, #2563eb);
+  stroke-width: 0.15rem;
+}
+.factory-graph-node--state-waiting > .factory-graph-shape--rect,
+.factory-graph-node--state-waiting > .factory-graph-shape--polygon {
+  stroke: var(--color-warning, #d97706);
+  stroke-width: 0.15rem;
+}
+.factory-graph-node--state-blocked > .factory-graph-shape--rect,
+.factory-graph-node--state-blocked > .factory-graph-shape--polygon,
+.factory-graph-node--state-failed > .factory-graph-shape--rect,
+.factory-graph-node--state-failed > .factory-graph-shape--polygon {
+  stroke: var(--color-destructive, #dc2626);
+}
+.factory-graph-node--state-done > .factory-graph-shape--rect,
+.factory-graph-node--state-done > .factory-graph-shape--polygon {
+  stroke: var(--color-success, #16a34a);
+}
+.factory-graph-node--state-skipped > .factory-graph-shape--rect,
+.factory-graph-node--state-skipped > .factory-graph-shape--polygon,
+.factory-graph-node--state-unsupported > .factory-graph-shape--rect,
+.factory-graph-node--state-unsupported > .factory-graph-shape--polygon {
+  stroke: color-mix(in srgb, currentColor 42%, transparent);
+}
+
+.factory-graph-edge {
+  fill: none;
+  stroke: var(--factory-graph-edge-color);
+  stroke-width: 0.12rem;
+  transition: opacity 140ms ease, stroke 140ms ease;
+}
+.factory-graph-edge--needs,
+.factory-graph-edge--input { marker-end: url("#factory-graph-arrow"); }
+.factory-graph-edge--rework {
+  stroke: var(--factory-graph-rework-color);
+  stroke-dasharray: 0.35rem 0.22rem;
+  marker-end: url("#factory-graph-rework-arrow");
+}
+.factory-graph-join > .factory-graph-shape--polygon {
+  fill: color-mix(in srgb, var(--factory-graph-edge-color) 32%, transparent);
+  stroke: var(--factory-graph-edge-color);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .factory-graph-node,
+  .factory-graph-edge { transition: none; }
+}

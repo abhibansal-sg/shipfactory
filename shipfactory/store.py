@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import errno
 import os
 import sqlite3
 import uuid
@@ -765,31 +766,57 @@ def nonterminal_daemon_runs() -> list[dict[str, Any]]:
         ))
 
 
+def _pid_liveness(pid: int) -> bool | None:
+    """Return PID liveness, preserving an indeterminate OS probe as ``None``."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        return None
+    return True
+
+
 def reconcile_daemon_runs(start_token_for_pid) -> list[dict[str, Any]]:
     """Close stale daemon rows, returning rows whose exact identity is live.
 
-    A daemon row is recoverable only when its PID is absent/dead or its
-    persisted start token no longer matches the observed process. An exact
-    match is deliberately left untouched so the caller can fail closed rather
+    Tokenless legacy rows are stale under the exclusive daemon lock. A
+    token-bearing row is recoverable only when its PID is absent/dead or its
+    persisted start token no longer matches a non-null observation. An exact
+    match, or an unavailable identity probe for a PID that cannot be proven
+    dead, is deliberately left untouched so the caller can fail closed rather
     than adopting or silently closing a still-live daemon.
     """
     live: list[dict[str, Any]] = []
     for row in nonterminal_daemon_runs():
         pid = int(row["pid"]) if row.get("pid") is not None else 0
         token = row.get("process_start_token")
-        observed = start_token_for_pid(pid) if pid > 0 and token else None
-        if pid > 0 and token and observed == token:
-            live.append(row)
-            continue
-
         if pid <= 0:
             reason = "pid missing"
         elif not token:
             reason = "start token missing"
-        elif observed is None:
-            reason = "pid dead or start token unavailable"
         else:
-            reason = "pid reused: start token mismatched"
+            try:
+                observed = start_token_for_pid(pid)
+            except Exception:
+                observed = None
+            if observed == token:
+                live.append(row)
+                continue
+            if observed is None:
+                liveness = _pid_liveness(pid)
+                if liveness is not False:
+                    protected = dict(row)
+                    protected["_identity_probe_unavailable"] = True
+                    live.append(protected)
+                    continue
+                reason = "pid dead; start token probe unavailable"
+            else:
+                reason = "pid reused: start token mismatched"
         record_run_crashed(int(row["id"]), reason)
     return live
 
@@ -890,16 +917,26 @@ def record_daemon_start(
 ) -> int:
     """Insert a durable Factory-daemon run record for all served boards."""
     names = list(dict.fromkeys(boards or [board]))
-    run_id = record_run_start(
-        DAEMON_RUN_TASK_ID, names[0], "shipfactory-daemon", "", pid,
-        process_start_token=process_start_token,
-    )
-    payload = _daemon_payload(
-        names,
-        {name: None for name in names},
-        tick_interval=float(tick_interval),
-    )
+    init_db()
     with _connect() as conn:
+        # Keep the run insert and initial liveness payload in one transaction.
+        # A payload/serialization/update failure must not leave a live row
+        # behind that blocks the next singleton startup.
+        cur = conn.execute(
+            "INSERT INTO runs(task_id,seat,executor,model,pid,started_at,tokens_in,tokens_out,"
+            "tokens_total,board,workspace_path,log_path,prompt_path,provider,resolved_model,"
+            "executor_version,process_start_token,task_attempt_id,access_enforcement_level,"
+            "recipe_activation) VALUES(?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?)",
+            (DAEMON_RUN_TASK_ID, names[0], "shipfactory-daemon", "", pid, _now(),
+             names[0], None, None, None, None, None, None, process_start_token,
+             None, None, None),
+        )
+        run_id = int(cur.lastrowid)
+        payload = _daemon_payload(
+            names,
+            {name: None for name in names},
+            tick_interval=float(tick_interval),
+        )
         conn.execute(
             "UPDATE runs SET result=? WHERE id=?",
             (json.dumps(payload, sort_keys=True, separators=(",", ":")), run_id),

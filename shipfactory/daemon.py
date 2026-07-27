@@ -43,7 +43,10 @@ def _process_start_token(pid: int) -> str | None:
     try:
         from shipfactory.spawn import _process_start_token as process_start_token
     except (ImportError, AttributeError):
-        return _process_start_identity() if int(pid) == os.getpid() else None
+        # A synthetic token is not an OS identity and cannot safely authorize
+        # singleton ownership. The caller must fail closed when the shared
+        # spawn probe is unavailable.
+        return None
 
     return process_start_token(pid)
 
@@ -67,14 +70,25 @@ def daemon_lock(boards: Sequence[str]):
         # and operators use the non-empty lock record as the daemon-ready
         # signal; migration 9 made the old lock-before-schema race observable.
         store.init_db()
+        try:
+            process_start_token = _process_start_token(os.getpid())
+        except Exception as exc:
+            raise RuntimeError(
+                "ShipFactory daemon start blocked: current process identity unavailable"
+            ) from exc
+        if not process_start_token:
+            raise RuntimeError(
+                "ShipFactory daemon start blocked: current process identity unavailable"
+            )
         live = store.reconcile_daemon_runs(_process_start_token)
         if live:
             ids = ", ".join(str(row["id"]) for row in live)
+            unavailable = [row for row in live if row.get("_identity_probe_unavailable")]
+            detail = " (identity probe unavailable)" if unavailable else ""
             logger.error("ShipFactory daemon start blocked by live daemon run(s): %s", ids)
             raise RuntimeError(
-                "ShipFactory daemon start blocked by live daemon run(s): " + ids
+                "ShipFactory daemon start blocked by live daemon run(s)" + detail + ": " + ids
             )
-        process_start_token = _process_start_token(os.getpid())
         record = {
             "pid": os.getpid(),
             "process_start_identity": _process_start_identity(),
@@ -535,12 +549,22 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
     else:
         raise ValueError("multi-board daemon requires a connection mapping or conn=None")
 
+    try:
+        process_start_token = _process_start_token(os.getpid())
+    except Exception as exc:
+        raise RuntimeError(
+            "ShipFactory daemon start blocked: current process identity unavailable"
+        ) from exc
+    if not process_start_token:
+        raise RuntimeError(
+            "ShipFactory daemon start blocked: current process identity unavailable"
+        )
     run_id = store.record_daemon_start(
         first_board,
         os.getpid(),
         boards=board_names,
         tick_interval=interval,
-        process_start_token=_process_start_token(os.getpid()),
+        process_start_token=process_start_token,
     )
     last_sync = 0.0
     try:

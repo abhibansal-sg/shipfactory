@@ -42,7 +42,7 @@ def test_daemon_start_reconciles_stale_row_and_persists_current_token(monkeypatc
     stale = store.run_row(stale_id)
     assert stale["ended_at"]
     assert stale["exit_code"] == -1
-    assert stale["result"] == "crashed: pid dead or start token unavailable"
+    assert stale["result"] == "crashed: pid dead; start token probe unavailable"
     current = store.latest_daemon_run("default")
     assert current["process_start_token"] == "current-token"
 
@@ -80,6 +80,55 @@ def test_daemon_start_fails_closed_for_matching_live_identity(monkeypatch):
     stale = store.run_row(stale_id)
     assert stale["ended_at"] is None
     assert store.latest_daemon_run("old")["id"] == stale_id
+
+
+def test_daemon_start_fails_closed_when_current_identity_is_unavailable(monkeypatch):
+    monkeypatch.setattr(daemon, "_process_start_token", lambda pid: None)
+
+    with pytest.raises(RuntimeError, match="current process identity unavailable"):
+        daemon.run(object(), board="default", once=True)
+
+    assert store.nonterminal_daemon_runs() == []
+
+
+def test_daemon_start_preserves_historical_row_when_identity_probe_is_unavailable(
+    monkeypatch,
+):
+    current_pid = os.getpid()
+    stale_id = store.record_daemon_start(
+        "old", current_pid, process_start_token="old-token",
+    )
+    calls = 0
+
+    def token(pid):
+        nonlocal calls
+        calls += 1
+        return "current-token" if calls == 1 else None
+
+    monkeypatch.setattr(daemon, "_process_start_token", token)
+
+    with pytest.raises(RuntimeError, match="identity probe unavailable"):
+        daemon.run(object(), board="default", once=True)
+
+    stale = store.run_row(stale_id)
+    assert stale["ended_at"] is None
+
+
+def test_record_daemon_start_rolls_back_orphan_row_on_payload_failure(monkeypatch):
+    original_dumps = store.json.dumps
+
+    def fail_dumps(*args, **kwargs):
+        raise RuntimeError("payload serialization failed")
+
+    monkeypatch.setattr(store.json, "dumps", fail_dumps)
+
+    with pytest.raises(RuntimeError, match="payload serialization failed"):
+        store.record_daemon_start(
+            "default", os.getpid(), process_start_token="current-token",
+        )
+
+    assert store.nonterminal_daemon_runs() == []
+    monkeypatch.setattr(store.json, "dumps", original_dumps)
 
 
 def test_daemon_reconciliation_happens_after_lock_and_before_board_open(
@@ -127,6 +176,14 @@ def test_empty_board_once_tick_has_no_workers_or_approval_action(monkeypatch):
         conn.close()
 
     assert task_count == 0
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM runs WHERE task_id<>?", (store.DAEMON_RUN_TASK_ID,)
+        ).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM action_intents").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM gate_decisions").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
     assert result["dispatch"].spawned == []
     assert result["dispatch"].crashed == []
     assert result["dispatch"].auto_blocked == []

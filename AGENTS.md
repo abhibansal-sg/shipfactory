@@ -886,14 +886,16 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   (finding #119, SF-21). The singleton lock is acquired before reconciliation;
   dead, tokenless, or token-mismatched historical daemon rows close as audited
   crashes, while an exact live PID/start-token match blocks startup rather than
-  being adopted or silently rewritten. The new daemon row persists its own OS
-  start token and the clean `finally` path still owns normal completion.
+  being adopted or silently rewritten. An unavailable identity probe for a PID
+  that cannot be proved dead also blocks rather than being relabeled as stale.
+  The new daemon row and initial payload commit atomically with a required OS
+  start token, and the clean `finally` path still owns normal completion.
 
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.
   No AI co-author trailers. Public repo — no secrets, tokens, or private
   paths in commits; screenshots/evidence must be scrubbed before adding.
-- Findings get numbers (#22–#117 so far). When you fix one: commit message
+- Findings get numbers (#22–#119 so far). When you fix one: commit message
   cites it, and the lesson lands in this file **in the same run**.
 - All tests green before claiming done. `python -m pytest tests/ -q`.
