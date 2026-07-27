@@ -717,6 +717,45 @@ def nonterminal_verification_runs() -> list[dict[str, Any]]:
         ))
 
 
+def nonterminal_daemon_runs() -> list[dict[str, Any]]:
+    """Return daemon rows which still need singleton-start reconciliation."""
+    init_db()
+    with _connect() as conn:
+        return _rows(conn.execute(
+            "SELECT * FROM runs WHERE ended_at IS NULL AND task_id=? ORDER BY id",
+            (DAEMON_RUN_TASK_ID,),
+        ))
+
+
+def reconcile_daemon_runs(start_token_for_pid) -> list[dict[str, Any]]:
+    """Close stale daemon rows, returning rows whose exact identity is live.
+
+    A daemon row is recoverable only when its PID is absent/dead or its
+    persisted start token no longer matches the observed process. An exact
+    match is deliberately left untouched so the caller can fail closed rather
+    than adopting or silently closing a still-live daemon.
+    """
+    live: list[dict[str, Any]] = []
+    for row in nonterminal_daemon_runs():
+        pid = int(row["pid"]) if row.get("pid") is not None else 0
+        token = row.get("process_start_token")
+        observed = start_token_for_pid(pid) if pid > 0 and token else None
+        if pid > 0 and token and observed == token:
+            live.append(row)
+            continue
+
+        if pid <= 0:
+            reason = "pid missing"
+        elif not token:
+            reason = "start token missing"
+        elif observed is None:
+            reason = "pid dead or start token unavailable"
+        else:
+            reason = "pid reused: start token mismatched"
+        record_run_crashed(int(row["id"]), reason)
+    return live
+
+
 def workspace_path_for_task(task_id: str) -> str | None:
     """Return the most recently recorded workspace for a real shipfactory run.
 
@@ -809,10 +848,14 @@ def record_daemon_start(
     *,
     boards: list[str] | None = None,
     tick_interval: float = 5.0,
+    process_start_token: str | None = None,
 ) -> int:
     """Insert a durable Factory-daemon run record for all served boards."""
     names = list(dict.fromkeys(boards or [board]))
-    run_id = record_run_start(DAEMON_RUN_TASK_ID, names[0], "shipfactory-daemon", "", pid)
+    run_id = record_run_start(
+        DAEMON_RUN_TASK_ID, names[0], "shipfactory-daemon", "", pid,
+        process_start_token=process_start_token,
+    )
     payload = _daemon_payload(
         names,
         {name: None for name in names},
@@ -1463,4 +1506,4 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]

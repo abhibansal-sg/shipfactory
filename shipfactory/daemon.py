@@ -38,6 +38,16 @@ def _process_start_identity() -> str:
         return f"python-start:{time.time_ns()}"
 
 
+def _process_start_token(pid: int) -> str | None:
+    """Return the shared PID-reuse-resistant identity for a process."""
+    try:
+        from shipfactory.spawn import _process_start_token as process_start_token
+    except (ImportError, AttributeError):
+        return _process_start_identity() if int(pid) == os.getpid() else None
+
+    return process_start_token(pid)
+
+
 @contextmanager
 def daemon_lock(boards: Sequence[str]):
     """Hold the process-wide ShipFactory daemon advisory lock."""
@@ -57,9 +67,18 @@ def daemon_lock(boards: Sequence[str]):
         # and operators use the non-empty lock record as the daemon-ready
         # signal; migration 9 made the old lock-before-schema race observable.
         store.init_db()
+        live = store.reconcile_daemon_runs(_process_start_token)
+        if live:
+            ids = ", ".join(str(row["id"]) for row in live)
+            logger.error("ShipFactory daemon start blocked by live daemon run(s): %s", ids)
+            raise RuntimeError(
+                "ShipFactory daemon start blocked by live daemon run(s): " + ids
+            )
+        process_start_token = _process_start_token(os.getpid())
         record = {
             "pid": os.getpid(),
             "process_start_identity": _process_start_identity(),
+            "process_start_token": process_start_token,
             "boards": list(boards),
             "executable": str(Path(sys.executable).resolve()),
         }
@@ -521,6 +540,7 @@ def run(conn, *, board: str | None = None, boards: Sequence[str] | None = None,
         os.getpid(),
         boards=board_names,
         tick_interval=interval,
+        process_start_token=_process_start_token(os.getpid()),
     )
     last_sync = 0.0
     try:
