@@ -882,6 +882,12 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   the test fixture only, while a separate production-path regression proves an
   unreadable live process-scope scan still fails closed as
   `test_infrastructure_error`.
+- Daemon run rows need the same PID-reuse identity discipline as worker runs
+  (finding #119, SF-21). The singleton lock is acquired before reconciliation;
+  dead, tokenless, or token-mismatched historical daemon rows close as audited
+  crashes, while an exact live PID/start-token match blocks startup rather than
+  being adopted or silently rewritten. The new daemon row persists its own OS
+  start token and the clean `finally` path still owns normal completion.
 
 ## Conventions
 
