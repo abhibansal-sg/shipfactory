@@ -171,7 +171,7 @@
         h("strong", { className: "font-mondwest normal-case text-sm font-medium text-destructive" }, props.title || "ShipFactory data could not be loaded"),
         h("p", { className: "mt-1 text-xs text-text-secondary" }, props.message)
       ),
-      h(Button, { size: "sm", ghost: true, onClick: props.onRetry }, "Retry")
+      props.onRetry ? h(Button, { size: "sm", ghost: true, onClick: props.onRetry }, "Retry") : null
     );
   }
 
@@ -1793,7 +1793,461 @@
     );
   }
 
+  var PROJECTS_RUNTIME_BOOLEAN_FIELDS = [
+    "enabled", "policy_editing_enabled", "launch_enabled", "graph_enabled",
+    "live_overlay_enabled", "history_enabled",
+  ];
+  var PROJECTS_RUNTIME_NUMBER_FIELDS = [
+    "recent_flight_limit", "ui_refresh_interval_seconds", "graph_rank_gap",
+    "graph_lane_gap", "graph_node_width", "graph_node_height",
+    "graph_diamond_size", "history_fold_threshold",
+  ];
+  var PROJECTS_RUNTIME_KEYS = PROJECTS_RUNTIME_BOOLEAN_FIELDS.concat(PROJECTS_RUNTIME_NUMBER_FIELDS, ["graph_direction"]);
+
+  function validateProjectsRuntimeConfig(config) {
+    if (!config || typeof config !== "object" || Array.isArray(config)) return "runtime_config is missing.";
+    var keys = Object.keys(config).sort();
+    var expected = PROJECTS_RUNTIME_KEYS.slice().sort();
+    if (keys.length !== expected.length || keys.some(function (key, index) { return key !== expected[index]; })) {
+      return "runtime_config has an unexpected or missing field.";
+    }
+    for (var booleanIndex = 0; booleanIndex < PROJECTS_RUNTIME_BOOLEAN_FIELDS.length; booleanIndex += 1) {
+      var booleanField = PROJECTS_RUNTIME_BOOLEAN_FIELDS[booleanIndex];
+      if (typeof config[booleanField] !== "boolean") return "runtime_config." + booleanField + " is invalid.";
+    }
+    for (var numberIndex = 0; numberIndex < PROJECTS_RUNTIME_NUMBER_FIELDS.length; numberIndex += 1) {
+      var numberField = PROJECTS_RUNTIME_NUMBER_FIELDS[numberIndex];
+      if (!Number.isInteger(config[numberField]) || config[numberField] <= 0) return "runtime_config." + numberField + " is invalid.";
+    }
+    if (["TB", "BT", "LR", "RL"].indexOf(config.graph_direction) < 0) return "runtime_config.graph_direction is invalid.";
+    return null;
+  }
+
+  function canonicalRecipeKeys(keys) {
+    return Array.from(new Set((Array.isArray(keys) ? keys : []).filter(function (key) { return typeof key === "string" && key.length > 0; }))).sort();
+  }
+
+  function canonicalRecipePolicy(keys, defaultKey) {
+    var allowed = canonicalRecipeKeys(keys);
+    return {
+      allowed_recipe_keys: allowed,
+      default_recipe_key: allowed.indexOf(defaultKey) >= 0 ? defaultKey : (allowed[0] || null),
+    };
+  }
+
+  function useProjectsResource(refreshKey) {
+    var _a = useState(null), data = _a[0], setData = _a[1];
+    var _b = useState(true), loading = _b[0], setLoading = _b[1];
+    var _c = useState(""), error = _c[0], setError = _c[1];
+    var _d = useState(null), loadedAt = _d[0], setLoadedAt = _d[1];
+    var load = useCallback(function () {
+      setLoading(true);
+      return request("/projects").then(function (payload) {
+        var configError = validateProjectsRuntimeConfig(payload && payload.runtime_config);
+        if (configError) throw new Error(configError);
+        if (!payload || !Array.isArray(payload.projects) || !payload.unclassified) throw new Error("Projects response is incomplete.");
+        setData(payload);
+        setError("");
+        setLoadedAt(new Date().toISOString());
+        return payload;
+      }).catch(function (err) {
+        setError(errorText(err));
+        throw err;
+      }).finally(function () { setLoading(false); });
+    }, []);
+    useEffect(function () {
+      load().catch(function () {});
+    }, [refreshKey, load]);
+    var intervalSeconds = data && data.runtime_config && data.runtime_config.ui_refresh_interval_seconds;
+    var enabled = data && data.runtime_config && data.runtime_config.enabled;
+    useEffect(function () {
+      if (!enabled || !Number.isInteger(intervalSeconds) || intervalSeconds <= 0) return undefined;
+      var active = true;
+      var timer = window.setInterval(function () {
+        if (active && document.visibilityState !== "hidden") load().catch(function () {});
+      }, intervalSeconds * 1000);
+      return function () { active = false; window.clearInterval(timer); };
+    }, [enabled, intervalSeconds, load, refreshKey]);
+    return { data: data, loading: loading, error: error, loadedAt: loadedAt, reload: load };
+  }
+
+  function useProjectRecipesResource(projectId, refreshKey) {
+    var _a = useState(null), data = _a[0], setData = _a[1];
+    var _b = useState(true), loading = _b[0], setLoading = _b[1];
+    var _c = useState(""), error = _c[0], setError = _c[1];
+    var load = useCallback(function () {
+      if (!projectId) return Promise.resolve(null);
+      setLoading(true);
+      return request("/projects/" + encodeURIComponent(projectId) + "/recipes").then(function (payload) {
+        if (!payload || !Array.isArray(payload.recipes)) throw new Error("Project recipe response is incomplete.");
+        setData(payload);
+        setError("");
+        return payload;
+      }).catch(function (err) {
+        setError(errorText(err));
+        throw err;
+      }).finally(function () { setLoading(false); });
+    }, [projectId]);
+    useEffect(function () {
+      setData(null);
+      setError("");
+      load().catch(function () {});
+    }, [projectId, refreshKey, load]);
+    return { data: data, loading: loading, error: error, reload: load };
+  }
+
+  function useProjectRecipeCatalogResource(refreshKey, enabled) {
+    var _a = useState(null), data = _a[0], setData = _a[1];
+    var _b = useState(!!enabled), loading = _b[0], setLoading = _b[1];
+    var _c = useState(""), error = _c[0], setError = _c[1];
+    var load = useCallback(function () {
+      if (!enabled) return Promise.resolve(null);
+      setLoading(true);
+      return request("/recipes").then(function (payload) {
+        if (!Array.isArray(payload)) throw new Error("Recipe catalog response is incomplete.");
+        setData(payload);
+        setError("");
+        return payload;
+      }).catch(function (err) {
+        setError(errorText(err));
+        throw err;
+      }).finally(function () { setLoading(false); });
+    }, [enabled]);
+    useEffect(function () {
+      if (!enabled) {
+        setData(null);
+        setLoading(false);
+        setError("");
+        return undefined;
+      }
+      load().catch(function () {});
+      return undefined;
+    }, [refreshKey, enabled, load]);
+    return { data: data, loading: loading, error: error, reload: load, enabled: !!enabled };
+  }
+
+  function ProjectRow(props) {
+    var project = props.project;
+    var unclassified = project.binding === "unclassified";
+    return h("button", {
+      type: "button",
+      className: "factory-project-row flex w-full flex-col gap-2 border-b border-border/60 p-4 text-left last:border-b-0 hover:bg-secondary/20 " + (props.selected ? "is-selected" : ""),
+      "data-project-id": project.id,
+      "data-unclassified": unclassified ? "true" : undefined,
+      "aria-pressed": props.selected,
+      onClick: function () { props.onSelect(project); },
+    },
+      h("div", { className: "flex flex-wrap items-center justify-between gap-3" },
+        h("span", { className: "min-w-0" },
+          h("strong", { className: "block truncate text-sm font-medium text-foreground" }, project.name || project.label || project.slug || project.id),
+          project.slug ? h("span", { className: "block text-xs text-text-tertiary" }, project.slug) : null
+        ),
+        h(StatePill, { value: unclassified ? "unclassified" : project.binding })
+      ),
+      h("div", { className: "flex flex-wrap items-center gap-3 text-xs text-text-secondary" },
+        h("span", null, formatNumber(project.rollup && project.rollup.active) + " active"),
+        h("span", null, formatNumber(project.rollup && project.rollup.waiting) + " waiting"),
+        h("span", null, canonicalRecipeKeys(project.recipes && project.recipes.allowed).length + " attached recipes")
+      )
+    );
+  }
+
+  function ProjectRecentFlights(props) {
+    var recent = props.project.rollup && Array.isArray(props.project.rollup.recent) ? props.project.rollup.recent : [];
+    if (props.historyEnabled === false) return h("p", { className: "text-xs text-text-tertiary" }, "Flight history is disabled by runtime configuration.");
+    if (Number.isInteger(props.recentLimit) && props.recentLimit > 0) recent = recent.slice(0, props.recentLimit);
+    if (!recent.length) return h("p", { className: "text-xs text-text-tertiary" }, "No recent flights.");
+    return h("div", { className: "grid gap-2" }, recent.map(function (flight) {
+      return h("article", { key: flight.instance_id, className: "border border-border bg-background/20 p-3", "data-flight-instance-id": flight.instance_id },
+        h("div", { className: "flex flex-wrap items-center justify-between gap-2" },
+          h("strong", { className: "font-mono-ui text-xs text-foreground" }, flight.recipe),
+          h(StatePill, { value: flight.status }),
+        ),
+        h("div", { className: "mt-2 flex flex-wrap gap-3 text-xs text-text-tertiary" },
+          h("span", null, flight.instance_id),
+          flight.linear_issue_id ? h("span", null, "Issue ", flight.linear_issue_id) : null,
+          flight.updated_at ? h(Ago, { value: flight.updated_at }) : null
+        )
+      );
+    }));
+  }
+
+  function ProjectPolicyControls(props) {
+    var recipe = props.recipe;
+    var key = recipeKey(recipe);
+    var attached = props.allowed.indexOf(key) >= 0;
+    var inactive = !attached && recipe.status !== "active";
+    var disabled = !props.enabled || props.busy || inactive;
+    return h("div", { className: "flex flex-wrap items-center gap-2" },
+      attached
+        ? h(Button, { type: "button", size: "xs", ghost: true, disabled: disabled, "data-recipe-detach": key, onClick: function () { props.onDetach(key); } }, "Detach")
+        : h(Button, { type: "button", size: "xs", ghost: true, disabled: disabled, title: inactive ? "Attach disabled: recipe is inactive." : undefined, "data-recipe-attach": key, onClick: function () { props.onAttach(key); } }, "Attach"),
+      inactive ? h("span", { className: "text-xs text-text-tertiary", role: "note" }, "Inactive — cannot attach") : null,
+      attached ? h(Button, { type: "button", size: "xs", ghost: true, disabled: disabled || props.defaultKey === key, "data-recipe-default": key, onClick: function () { props.onDefault(key); } }, props.defaultKey === key ? "Default" : "Set default") : null
+    );
+  }
+
+  function ProjectRecipeCard(props) {
+    var recipe = props.recipe;
+    var key = recipeKey(recipe);
+    var selected = props.selected;
+    var attached = props.allowed.indexOf(key) >= 0;
+    var optionalSteps = Array.isArray(recipe.optional_steps) ? recipe.optional_steps : (recipe.steps || []).filter(function (step) { return step.optional; });
+    var caps = recipe.budgets && recipe.budgets.step_activation_caps || {};
+    return h("article", { className: "factory-project-recipe border border-border bg-card", "data-recipe-key": key },
+      h("div", { className: "flex flex-col gap-3 p-4" },
+        h("div", { className: "flex flex-wrap items-start justify-between gap-3" },
+          h("button", { type: "button", className: "min-w-0 text-left", onClick: function () { if (attached) props.onSelect(key); }, "aria-pressed": selected, disabled: !attached },
+            h("strong", { className: "block font-mono-ui text-sm text-primary" }, key),
+            h("span", { className: "mt-1 block text-xs text-text-secondary" }, recipe.description || "No description declared."),
+            recipe.recipe_hash ? h("span", { className: "mt-1 block font-mono-ui text-[0.68rem] text-text-tertiary" }, "hash ", recipe.recipe_hash) : null
+          ),
+          h(ProjectPolicyControls, { recipe: recipe, allowed: props.allowed, defaultKey: props.defaultKey, enabled: props.policyEditingEnabled, busy: props.policyBusy, onAttach: props.onAttach, onDetach: props.onDetach, onDefault: props.onDefault })
+        ),
+        h("div", { className: "flex flex-wrap gap-2 text-xs text-text-secondary" },
+          h(StatePill, { value: recipe.status }),
+          recipe.default ? h(Badge, { className: "factory-pill text-xs", tone: "secondary" }, "project default") : null
+        )
+      ),
+      selected ? h("div", { className: "grid gap-4 border-t border-border p-4" },
+        h("section", { className: "grid gap-2" },
+          h(SectionHeading, { title: "Launch parameters", description: "Immutable schema and defaults from the selected recipe." }),
+          h(ParameterFields, { prefix: "project-" + recipe.id + "-" + recipe.version, recipe: recipe, values: props.parameters, onChange: props.onParameterChange })
+        ),
+        h("section", { className: "grid gap-2" },
+          h(SectionHeading, { title: "Budget and caps" }),
+          h("div", { className: "flex flex-wrap gap-2 text-xs text-text-secondary" },
+            h(MonoChip, null, "max activations: " + (recipe.budgets && recipe.budgets.max_activations == null ? "unbounded" : recipe.budgets && recipe.budgets.max_activations)),
+            Object.keys(caps).sort().map(function (stepId) { return h(MonoChip, { key: stepId }, stepId + ": " + caps[stepId]); })
+          )
+        ),
+        optionalSteps.length ? h("fieldset", { className: "grid gap-2 border border-border p-3" },
+          h("legend", { className: "px-1 text-xs text-text-secondary" }, "Skip optional steps"),
+          optionalSteps.map(function (step) { return h("label", { key: step.id, className: "flex items-center gap-2 text-sm text-text-secondary" },
+            h("input", { type: "checkbox", checked: props.skips.indexOf(step.id) >= 0, onChange: function (event) { props.onSkipChange(step.id, event.target.checked); } }),
+            h("span", null, step.title || step.id), h(MonoChip, null, step.id)
+          ); })
+        ) : h("p", { className: "text-xs text-text-tertiary" }, "No optional steps declared."),
+        h("section", { className: "grid gap-2" },
+          h(SectionHeading, { title: "Recipe steps", description: "The graph is loaded from the pinned server projection." }),
+          h("ol", { className: "grid gap-1 text-xs text-text-secondary" }, (recipe.steps || []).map(function (step) {
+            return h("li", { key: step.id, className: "flex flex-wrap items-center gap-2 border-b border-border/50 py-1 last:border-b-0" },
+              h("strong", { className: "font-mono-ui text-foreground" }, step.id), h("span", null, step.title), h(MonoChip, null, step.primitive), step.optional ? h(Badge, { className: "factory-pill text-xs", tone: "secondary" }, "optional") : null
+            );
+          }))
+        ),
+        props.children
+      ) : null
+    );
+  }
+
+  function ProjectLaunchPanel(props) {
+    var recipe = props.recipe;
+    if (!recipe) return null;
+    var valid = props.formValid;
+    var disabled = !props.launchEnabled || !valid || props.busy;
+    return h("form", { className: "grid gap-3 border-t border-border pt-4", onSubmit: props.onSubmit },
+      h(FieldLabel, { htmlFor: "project-linear-issue", control: h("input", { id: "project-linear-issue", className: FIELD_CLASS, value: props.linearIssueId, onChange: function (event) { props.onLinearIssueChange(event.target.value); }, placeholder: "Optional issue id" }) }, "Linear issue (optional)"),
+      !props.launchEnabled ? h("p", { className: "text-xs text-destructive", role: "alert" }, "Launch is disabled by runtime configuration.") : null,
+      !valid ? h("p", { className: "text-xs text-destructive", role: "alert" }, "Complete the required and valid recipe parameters before starting.") : null,
+      props.error ? h("p", { className: "text-xs text-destructive", role: "alert" }, props.error) : null,
+      h("div", { className: "flex flex-wrap items-center justify-between gap-3" },
+        h("span", { className: "text-xs text-text-tertiary" }, "One click creates one flight request."),
+        h(Button, { type: "submit", size: "sm", disabled: disabled, "data-project-launch": props.projectId }, props.busy ? h(Spinner, { label: "Starting" }) : "Start")
+      )
+    );
+  }
+
+  function ProjectDetails(props) {
+    var project = props.project;
+    var runtime = props.runtime;
+    var recipeResource = useProjectRecipesResource(project.binding === "bound" ? project.id : "", props.refreshKey);
+    var catalogResource = useProjectRecipeCatalogResource(props.refreshKey, project.binding === "bound" && runtime.policy_editing_enabled);
+    var _a = useState(null), selectedKey = _a[0], setSelectedKey = _a[1];
+    var _b = useState({}), parameters = _b[0], setParameters = _b[1];
+    var _c = useState([]), skips = _c[0], setSkips = _c[1];
+    var _d = useState(""), linearIssueId = _d[0], setLinearIssueId = _d[1];
+    var _e = useState(""), policyError = _e[0], setPolicyError = _e[1];
+    var _f = useState(""), launchError = _f[0], setLaunchError = _f[1];
+    var _g = useState(""), policyBusy = _g[0], setPolicyBusy = _g[1];
+    var _h = useState(false), launchBusy = _h[0], setLaunchBusy = _h[1];
+    var _i = useState(null), launchResult = _i[0], setLaunchResult = _i[1];
+    var _j = useState(null), graph = _j[0], setGraph = _j[1];
+    var _k = useState(""), graphError = _k[0], setGraphError = _k[1];
+    var _l = useState(false), graphLoading = _l[0], setGraphLoading = _l[1];
+    var _m = useState(newNonce()), idempotencyKey = _m[0], setIdempotencyKey = _m[1];
+    var policy = canonicalRecipePolicy(project.recipes && project.recipes.allowed, project.recipes && project.recipes.default);
+    var attached = policy.allowed_recipe_keys;
+    var responseRecipes = recipeResource.data && Array.isArray(recipeResource.data.recipes) ? recipeResource.data.recipes : [];
+    var selected = responseRecipes.find(function (recipe) { return recipeKey(recipe) === selectedKey && attached.indexOf(recipeKey(recipe)) >= 0; }) || null;
+    var catalog = responseRecipes.slice();
+    function addCatalog(items) {
+      (Array.isArray(items) ? items : []).forEach(function (item) {
+        var key = recipeKey(item);
+        if (key && !catalog.some(function (candidate) { return recipeKey(candidate) === key; })) catalog.push(item);
+      });
+    }
+    addCatalog(recipeResource.data && recipeResource.data.available_recipes);
+    addCatalog(recipeResource.data && recipeResource.data.recipe_catalog);
+    addCatalog(catalogResource.enabled ? catalogResource.data : null);
+
+    useEffect(function () {
+      var initial = policy.default_recipe_key || policy.allowed_recipe_keys[0] || "";
+      setSelectedKey(function (current) { return current && responseRecipes.some(function (recipe) { return recipeKey(recipe) === current; }) ? current : initial; });
+    }, [project.id, project.recipes && project.recipes.default, (project.recipes && project.recipes.allowed || []).join("|"), recipeResource.data && recipeResource.data.recipes && recipeResource.data.recipes.map(recipeKey).join("|")]);
+    useEffect(function () {
+      if (!selected) return;
+      setParameters(defaultParameters(selected));
+      setSkips([]);
+      setLinearIssueId("");
+      setLaunchError("");
+    }, [selectedKey, selected && selected.recipe_hash]);
+    useEffect(function () {
+      setLaunchResult(null);
+      setLaunchError("");
+      setGraph(null);
+      setGraphError("");
+      setGraphLoading(false);
+    }, [project.id, selected && selected.id, selected && selected.version, selected && selected.recipe_hash]);
+    useEffect(function () {
+      if (!selected || !runtime.graph_enabled) {
+        setGraph(null);
+        setGraphError("");
+        return undefined;
+      }
+      var active = true;
+      setGraphLoading(true);
+      setGraphError("");
+      request("/recipes/" + encodeURIComponent(selected.id) + "/versions/" + encodeURIComponent(selected.version) + "/graph").then(function (payload) {
+        if (active) setGraph(payload && payload.graph ? payload.graph : payload);
+      }).catch(function (err) { if (active) setGraphError(errorText(err)); }).finally(function () { if (active) setGraphLoading(false); });
+      return function () { active = false; };
+    }, [selected && selected.id, selected && selected.version, selected && selected.recipe_hash, runtime.graph_enabled]);
+    useEffect(function () {
+      if (!launchResult || !launchResult.instance_id || !runtime.graph_enabled || !runtime.live_overlay_enabled) return undefined;
+      var active = true;
+      request("/instances/" + encodeURIComponent(launchResult.instance_id) + "/graph").then(function (payload) {
+        if (active) setGraph(payload && payload.graph ? payload.graph : payload);
+      }).catch(function (err) { if (active) setGraphError(errorText(err)); });
+      return function () { active = false; };
+    }, [launchResult && launchResult.instance_id, runtime.graph_enabled]);
+
+    function reloadAfterPolicy() {
+      props.onProjectsRefresh();
+      recipeResource.reload().catch(function () {});
+    }
+    function writePolicy(nextAllowed, nextDefault) {
+      var next = canonicalRecipePolicy(nextAllowed, nextDefault);
+      setPolicyBusy(nextDefault || "policy");
+      setPolicyError("");
+      request("/projects/" + encodeURIComponent(project.id) + "/recipe-policy", { method: "PUT", body: JSON.stringify(next) }).then(function () {
+        reloadAfterPolicy();
+      }).catch(function (err) { setPolicyError(errorText(err)); }).finally(function () { setPolicyBusy(""); });
+    }
+    function attach(key) { writePolicy(attached.concat([key]), policy.default_recipe_key || key); }
+    function detach(key) { writePolicy(attached.filter(function (item) { return item !== key; }), key === policy.default_recipe_key ? null : policy.default_recipe_key); }
+    function setDefault(key) { writePolicy(attached, key); }
+    function formIsValid() {
+      if (!selected) return false;
+      var specs = selected.parameters || {};
+      return Object.keys(specs).every(function (name) {
+        var spec = specs[name] || {};
+        var value = parameters[name];
+        if (spec.required && (value == null || value === "")) return false;
+        if (value == null || value === "") return !spec.required;
+        if (spec.type === "integer" && (!Number.isInteger(Number(value)) || !isFinite(Number(value)))) return false;
+        if (spec.type === "enum" && Array.isArray(spec.values) && spec.values.indexOf(value) < 0) return false;
+        return true;
+      });
+    }
+    function submitLaunch(event) {
+      event.preventDefault();
+      if (!selected || !runtime.launch_enabled || !formIsValid() || launchBusy) return;
+      setLaunchBusy(true); setLaunchError(""); setLaunchResult(null);
+      request("/projects/" + encodeURIComponent(project.id) + "/flights", { method: "POST", body: JSON.stringify({
+        recipe: selected.id,
+        version: selected.version,
+        parameters: parameters,
+        skip_steps: skips.slice().sort(),
+        linear_issue_id: linearIssueId.trim() || null,
+        idempotency_key: idempotencyKey,
+      }) }).then(function (result) {
+        setLaunchResult(result);
+        setIdempotencyKey(newNonce());
+      }).catch(function (err) {
+        setLaunchError(errorText(err));
+      }).finally(function () { setLaunchBusy(false); });
+    }
+    if (project.binding === "unclassified") {
+      return h("section", { className: "factory-project-detail grid gap-4", "data-unclassified": "true" },
+        h(ViewHeading, { title: project.label || "Unclassified", description: "Legacy work without one unambiguous project binding. It remains read-only here." }),
+        h(ProjectRecentFlights, { project: project, historyEnabled: runtime.history_enabled, recentLimit: runtime.recent_flight_limit })
+      );
+    }
+    if (project.binding !== "bound") {
+      return h("section", { className: "factory-project-detail grid gap-4" },
+        h(ViewHeading, { title: project.name || project.id, description: "This project does not have one unambiguous execution binding." }),
+        h(ErrorState, { title: "Project launch unavailable", message: "An unambiguous project execution binding is required before launching a flight." })
+      );
+    }
+    return h("section", { className: "factory-project-detail grid gap-4" },
+      h(ViewHeading, { title: project.name || project.id, description: "Choose an attached recipe, configure its immutable inputs, and start one flight." }),
+      policyError ? h("div", { className: "border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive", role: "alert" }, policyError) : null,
+      !runtime.policy_editing_enabled ? h("p", { className: "border border-border bg-background/20 p-3 text-xs text-text-tertiary" }, "Recipe policy editing is disabled by runtime configuration.") : null,
+      recipeResource.loading && recipeResource.data === null ? h(LoadingState, { label: "Loading project recipes…" }) :
+      recipeResource.error && recipeResource.data === null ? h(ErrorState, { message: recipeResource.error, onRetry: recipeResource.reload }) :
+      h("div", { className: "grid gap-3" },
+        catalogResource.enabled && catalogResource.error ? h(ErrorState, { title: "Recipe catalog unavailable", message: catalogResource.error, onRetry: catalogResource.reload }) : null,
+        catalogResource.enabled && catalogResource.loading && catalogResource.data === null ? h("p", { className: "text-xs text-text-tertiary", role: "status" }, "Loading attachable recipes…") : null,
+        catalog.length ? catalog.map(function (recipe) {
+          var key = recipeKey(recipe);
+          if (attached.indexOf(key) < 0 && !runtime.policy_editing_enabled) return null;
+          return h(ProjectRecipeCard, { key: key, recipe: recipe, selected: selectedKey === key, allowed: attached, defaultKey: policy.default_recipe_key, policyEditingEnabled: runtime.policy_editing_enabled, policyBusy: !!policyBusy, onAttach: attach, onDetach: detach, onDefault: setDefault, onSelect: setSelectedKey, parameters: parameters, onParameterChange: function (name, value) { setParameters(function (current) { var next = Object.assign({}, current); next[name] = value; return next; }); }, skips: skips, onSkipChange: function (stepId, checked) { setSkips(function (current) { return checked ? current.concat([stepId]) : current.filter(function (item) { return item !== stepId; }); }); }, children: selectedKey === key ? h("div", { className: "grid gap-4" },
+            graphLoading ? h(LoadingState, { label: "Loading frozen recipe graph…" }) :
+            !runtime.graph_enabled ? h("p", { className: "text-xs text-text-tertiary", role: "status" }, "Graph display is disabled by runtime configuration.") :
+            graphError ? h(GraphUnsupportedState, { message: graphError }) :
+            graph ? h(GraphRenderer, { graph: graph, title: key + " graph" }) : h("p", { className: "text-xs text-text-tertiary" }, "Graph projection is not available yet."),
+            !runtime.live_overlay_enabled ? h("p", { className: "text-xs text-text-tertiary" }, "Live flight overlay is disabled by runtime configuration.") : null,
+            h(ProjectLaunchPanel, { projectId: project.id, recipe: selected, launchEnabled: runtime.launch_enabled, formValid: formIsValid(), parameters: parameters, linearIssueId: linearIssueId, onLinearIssueChange: setLinearIssueId, busy: launchBusy, error: launchError, onSubmit: submitLaunch })
+          ) : null });
+        }) : catalogResource.enabled && catalogResource.error ? null : h(EmptyState, { title: "No project recipes", description: "No immutable recipe versions are attached to this project." }),
+        launchResult ? h("div", { className: "border border-success/30 bg-success/10 p-3 text-sm text-success", role: "status", "data-flight-instance-id": launchResult.instance_id }, "Started flight ", launchResult.instance_id, " for ", launchResult.recipe, ".") : null
+      ),
+      h("section", { className: "grid gap-2" }, h(SectionHeading, { title: "Recent flights", description: "History folding threshold: " + runtime.history_fold_threshold }), h(ProjectRecentFlights, { project: project, historyEnabled: runtime.history_enabled, recentLimit: runtime.recent_flight_limit }))
+    );
+  }
+
+  function ProjectsView(props) {
+    var resource = useProjectsResource(props.refreshKey);
+    var _a = useState(null), selectedId = _a[0], setSelectedId = _a[1];
+    var projects = resource.data && Array.isArray(resource.data.projects) ? resource.data.projects : [];
+    var runtime = resource.data && resource.data.runtime_config;
+    var selected = projects.find(function (project) { return project.id === selectedId; }) || (resource.data && resource.data.unclassified && resource.data.unclassified.id === selectedId ? resource.data.unclassified : null);
+    useEffect(function () {
+      if (!selected && projects.length) setSelectedId(projects[0].id);
+    }, [resource.data && resource.data.projects && resource.data.projects.map(function (project) { return project.id; }).join("|"), selectedId]);
+    if (resource.loading && resource.data === null) return h("section", { className: "factory-projects-view flex min-w-0 flex-col gap-4" }, h(LoadingState, { label: "Loading projects…" }));
+    if (resource.error && resource.data === null) return h("section", { className: "factory-projects-view flex min-w-0 flex-col gap-4" }, h(ErrorState, { title: "Projects unavailable", message: resource.error, onRetry: resource.reload }));
+    if (!runtime || !runtime.enabled) return h("section", { className: "factory-projects-view flex min-w-0 flex-col gap-4" }, h(ErrorState, { title: "Projects disabled", message: "Projects are disabled by the server runtime configuration.", onRetry: resource.reload }));
+    return h("section", { className: "factory-projects-view grid min-w-0 gap-4" },
+      h(ProjectsHeader, { runtime: runtime }),
+      resource.error ? h(ErrorState, { title: "Projects refresh failed", message: resource.error, onRetry: resource.reload }) : null,
+      h("div", { className: "factory-projects-layout" },
+        h("section", { className: "factory-project-list border border-border bg-card", "aria-label": "Projects" },
+          h("div", { className: "border-b border-border p-4" },
+            h("h2", { className: "font-mondwest text-display text-base tracking-wider text-foreground" }, "Projects"),
+            h("p", { className: "mt-1 text-xs text-text-tertiary" }, "Choose a bound project to configure and start a flight." )
+          ),
+          projects.map(function (project) { return h(ProjectRow, { key: project.id, project: project, selected: selectedId === project.id, onSelect: function (value) { setSelectedId(value.id); } }); }),
+          resource.data.unclassified ? h(ProjectRow, { key: "unclassified", project: resource.data.unclassified, selected: selectedId === "unclassified", onSelect: function () { setSelectedId("unclassified"); } }) : null
+        ),
+        selected ? h(ProjectDetails, { project: selected, runtime: runtime, refreshKey: props.refreshKey, onProjectsRefresh: function () { resource.reload().catch(function () {}); } }) : h(EmptyState, { title: "No project selected", description: "Select a project to continue." })
+      )
+    );
+  }
+
   var VIEW_REGISTRY = [
+    { id: "projects", label: "Projects", component: ProjectsView },
     { id: "journey", label: "Journeys", component: JourneyView },
     { id: "waiting", label: "Waiting gates", component: WaitingView },
     { id: "instances", label: "Instances", component: InstancesView },
@@ -1859,36 +2313,54 @@
     }));
   }
 
-  function FactoryPage() {
-    var _a = useState(VIEW_REGISTRY[0].id), activeId = _a[0], setActiveId = _a[1];
-    var _b = useState(0), refreshKey = _b[0], setRefreshKey = _b[1];
-    var _c = useState({ board: "All boards", loadedAt: null }), meta = _c[0], setMeta = _c[1];
-    var statusResource = usePollingResource("/status", refreshKey);
+  function ProjectsHeader(props) {
+    var runtime = props.runtime;
+    return h("header", { className: "factory-projects-header flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between" },
+      h("div", null,
+        h("h1", { className: "font-mondwest text-display text-lg tracking-wider text-foreground" }, "Projects"),
+        h("p", { className: "mt-1 text-xs text-text-tertiary" }, "Choose a project, configure an attached recipe, and start a flight." )
+      ),
+      runtime ? h("span", { className: "font-mono-ui text-xs text-text-tertiary" }, "Refreshes every ", runtime.ui_refresh_interval_seconds, "s") : null
+    );
+  }
+
+  function LegacyFactoryShell(props) {
+    var statusResource = usePollingResource("/status", props.refreshKey);
+    var _a = useState({ board: "All boards", loadedAt: null }), meta = _a[0], setMeta = _a[1];
     var active = useMemo(function () {
-      return VIEW_REGISTRY.find(function (view) { return view.id === activeId; }) || VIEW_REGISTRY[0];
-    }, [activeId]);
+      return VIEW_REGISTRY.find(function (view) { return view.id === props.activeId && view.id !== "projects"; }) || VIEW_REGISTRY[1];
+    }, [props.activeId]);
     var ActiveView = active.component;
     var onMeta = useCallback(function (next) { setMeta(next); }, []);
-
-    useEffect(function () {
-      var timer = window.setInterval(function () {
-        setMeta(function (current) { return { board: current.board, loadedAt: current.loadedAt }; });
-      }, 30000);
-      return function () { window.clearInterval(timer); };
-    }, []);
-
     return h("main", { className: "hermes-factory flex flex-col gap-4" },
       h(FactoryHeader, {
         board: meta.board, loadedAt: meta.loadedAt,
         status: statusResource.data, statusError: statusResource.error,
-        onRefresh: function () { setRefreshKey(function (value) { return value + 1; }); },
+        onRefresh: props.onRefresh,
       }),
-      h(SegmentedNav, {
-        value: activeId,
-        onChange: function (id) { setActiveId(id); setMeta({ board: "All boards", loadedAt: null }); },
-      }),
-      h(ActiveView, { refreshKey: refreshKey, onMeta: onMeta, status: statusResource.data })
+      h(SegmentedNav, { value: props.activeId, onChange: props.onChange }),
+      h(ActiveView, { refreshKey: props.refreshKey, onMeta: onMeta, status: statusResource.data })
     );
+  }
+
+  function FactoryPage() {
+    var _a = useState("projects"), activeId = _a[0], setActiveId = _a[1];
+    var _b = useState(0), refreshKey = _b[0], setRefreshKey = _b[1];
+    var active = useMemo(function () {
+      return VIEW_REGISTRY.find(function (view) { return view.id === activeId; }) || VIEW_REGISTRY[0];
+    }, [activeId]);
+    if (active.id === "projects") {
+      return h("main", { className: "hermes-factory flex flex-col gap-4" },
+        h(SegmentedNav, { value: activeId, onChange: setActiveId }),
+        h(ProjectsView, { refreshKey: refreshKey })
+      );
+    }
+    return h(LegacyFactoryShell, {
+      activeId: activeId,
+      refreshKey: refreshKey,
+      onChange: setActiveId,
+      onRefresh: function () { setRefreshKey(function (value) { return value + 1; }); },
+    });
   }
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
