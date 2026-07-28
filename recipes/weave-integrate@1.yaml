@@ -1,0 +1,105 @@
+schema: shipfactory.recipe/v2
+id: weave-integrate
+version: 1
+status: active
+description: Weave wave-close lane — one flight per wave, submitted by the orchestrator after every weave-fast packet in the wave has landed. The integrator merges the listed packet candidate commits into one wave branch, resolves cross-packet friction, and runs the FULL verification command the request names (the suite no packet ran). A cross-executor adversarial review attacks the whole wave diff, then the operator's single approval card parks the wave for merge to main. Approval parks; it does not merge.
+intent_tags: [software-change, weave-wave-integration]
+supersedes: null
+verdict_contract: shipfactory.verdict/v2
+parameters:
+  request: {type: string, required: true, default: null}
+  notify_target: {type: string, required: false, default: telegram:Abhinav}
+budgets:
+  max_activations: 8
+  step_activation_caps:
+    integrate: 3
+    wave-review: 3
+steps:
+  - id: integrate
+    primitive: agent_task
+    title: Integrate the wave
+    needs: []
+    optional: false
+    inputs: []
+    outputs:
+      - {kind: change-set, schema: shipfactory.change-set/v1, path: .shipfactory-output/change-set.json}
+    params:
+      seat: weave-integrator
+      instructions: |
+        Integrate the wave defined in ${request}. The request lists the
+        wave's packet candidate commits (exact SHAs), the wave's parent Linear
+        issue context, and the FULL verification command(s) for this repo.
+        In your assigned worktree: apply the listed packet commits in the
+        stated order (cherry-pick or merge as the request directs), resolve
+        any cross-packet conflicts strictly within the packets' declared
+        scopes and frozen interfaces, and then run the COMPLETE verification
+        command(s) named in the request — this is the full-suite gate no
+        packet ran; a failing suite is your rework signal, not something to
+        skip or narrow. Fix integration-caused failures only; if a failure
+        traces to a defect inside one packet's own scope, report it precisely
+        instead of rewriting that packet's logic. Add no capability, no new
+        files beyond conflict resolution, and no configuration changes the
+        packets did not already carry. Do not stage or commit and do not
+        invent Git identities: after your successful exit, Factory creates the
+        canonical commit and shipfactory.change-set/v1 artifact from your
+        assigned worktree.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: wave-review
+    primitive: review_gate
+    title: Adversarially review the integrated wave
+    needs: [integrate]
+    optional: false
+    inputs:
+      - {from: integrate, kind: change-set, required: true}
+    outputs: []
+    params:
+      seat: weave-adversary
+      instructions: |
+        Adversarially review the Factory-opened exact integrated change-set
+        and binary diff for the whole wave against ${request}. Judge from the
+        bytes, never integrator prose. Attack cross-packet seams: interface
+        drift between packets, conflict resolutions that silently changed
+        packet behavior, security and control-plane gaps, deletions and
+        configuration changes, and any claim the full verification run does
+        not actually support (check the reported suite results against what
+        the request required). A blocker exists ONLY for a concrete
+        exploitable or requirement-violating defect in the integrated
+        change-set or its verification story; hardening ideas that do not
+        name a violated requirement belong in the approve verdict's summary.
+        When no blocker exists you MUST approve. Request changes only against
+        the upstream integrate step, with cited findings. Finish with the
+        exact structured SHIPFACTORY_VERDICT v2 JSON sentinel.
+      execution_profile: review
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: approval
+    primitive: approval_gate
+    title: Approve the integrated wave
+    needs: [wave-review]
+    optional: false
+    inputs:
+      - {from: integrate, kind: change-set, required: true}
+    outputs: []
+    params:
+      approvers: [operator]
+      instructions: |
+        Human operator approval only — the single card for this wave. Review
+        the integrated change-set, the full-suite verification result the
+        integrator reported, and the adversarial review verdict. Approval
+        parks this reviewed wave candidate for operator action; it does not
+        merge, release, or deploy anything. Landing on main is a separate
+        explicit operator action.
+  - id: notify
+    primitive: notify
+    title: Notify that the wave is approved and parked
+    needs: [approval]
+    optional: true
+    inputs: []
+    outputs: []
+    params:
+      target: "${notify_target}"
+      message: "weave-integrate wave is human-approved and parked with its integrated change-set and review verdict. No merge occurred."

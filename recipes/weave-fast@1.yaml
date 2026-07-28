@@ -1,0 +1,89 @@
+schema: shipfactory.recipe/v2
+id: weave-fast
+version: 1
+status: active
+description: Weave packet lane — one small Linear packet per flight, submitted by the orchestrator only after the wave plan (with per-packet lean verdicts) passed the Stage-0 autoplan+lean gate and the operator's GO. Builder runs focused tests only; no verify-runtime — the wave-close weave-integrate flight owns the full suite. One cross-executor review lands the packet; no per-packet approval card (the operator approves once per wave). Builder and reviewer seats are per-flight parameters so the orchestrator pairs them across executor families (finding #57).
+intent_tags: [software-change, weave-packet]
+supersedes: null
+verdict_contract: shipfactory.verdict/v2
+parameters:
+  request: {type: string, required: true, default: null}
+  builder_seat: {type: string, required: true, default: null}
+  reviewer_seat: {type: string, required: true, default: null}
+  notify_target: {type: string, required: false, default: telegram:Abhinav}
+budgets:
+  max_activations: 8
+  step_activation_caps:
+    build: 3
+    review: 3
+steps:
+  - id: build
+    primitive: agent_task
+    title: Build the packet
+    needs: []
+    optional: false
+    inputs: []
+    outputs:
+      - {kind: change-set, schema: shipfactory.change-set/v1, path: .shipfactory-output/change-set.json}
+    params:
+      seat: "${builder_seat}"
+      instructions: |
+        Implement exactly the Linear packet in ${request}. The packet text is
+        the spec: honor its scope, files, frozen interfaces, and acceptance
+        criteria; touch nothing outside its declared scope. LEAN LAW: do not
+        rebuild capability that already exists in this repo or its vendored
+        foundations when the packet says tweak; do not add any store, daemon,
+        transport, queue, or second path the packet does not explicitly
+        ratify; if the packet's approach layers a fix over a prior fix of the
+        same defect, stop and report instead of patching the patch. Run ONLY
+        the focused tests the packet names plus tests that need no server or
+        listening socket; do not run the full suite — the wave-close
+        integration flight owns it. Do not treat sandbox network or port
+        denials as defects in your change. Do not stage or commit and do not
+        invent Git identities: after your successful exit, Factory creates the
+        canonical commit and shipfactory.change-set/v1 artifact from your
+        assigned worktree.
+      execution_profile: build
+      workspace: worktree
+      access_mode: workspace_write
+      environment: source
+  - id: review
+    primitive: review_gate
+    title: Review the packet change-set
+    needs: [build]
+    optional: false
+    inputs:
+      - {from: build, kind: change-set, required: true}
+    outputs: []
+    params:
+      seat: "${reviewer_seat}"
+      instructions: |
+        Review the Factory-opened exact change-set and binary diff against the
+        packet request in ${request}. Judge from the bytes, never builder
+        prose. A blocker exists ONLY when: the change-set violates the
+        packet's stated scope or acceptance criteria; it breaks a focused test
+        the packet names; it touches files outside the packet's declared
+        scope; it contains a concrete correctness or security defect in the
+        changed lines; or it violates the LEAN LAW — rebuilding capability
+        that already exists where the packet said tweak, adding a store,
+        daemon, transport, queue, or second path the packet did not ratify, or
+        layering a fix over a prior fix of the same defect instead of deleting
+        to the root cause. When no blocker exists you MUST approve, with
+        residual observations in the verdict summary — the wave-level
+        adversarial review owns deep cross-packet attack. Request changes only
+        against the upstream build step, with cited findings. Finish with the
+        exact structured SHIPFACTORY_VERDICT v2 JSON sentinel.
+      execution_profile: review
+      workspace: worktree
+      access_mode: readonly
+      environment: source
+  - id: notify
+    primitive: notify
+    title: Notify that the packet landed
+    needs: [review]
+    optional: true
+    inputs: []
+    outputs: []
+    params:
+      target: "${notify_target}"
+      message: "weave-fast packet landed: reviewed change-set sealed in its worktree, awaiting wave integration. No merge occurred."
