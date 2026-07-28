@@ -93,3 +93,16 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: separate visible node types for planning, building,
   reviewing, and decisions; routing hidden inside box-specific engine logic;
   manual artifact plumbing as part of the basic recipe structure.
+
+## D-005 · A box returns work plus one result (2026-07-28)
+
+- Every completed box returns exactly two conceptual values: **the work it
+  produced** and **one result label**.
+- The result label selects the outgoing arrow. A review might return
+  `approved` or `changes needed`; a box with no branch returns `done`.
+- Models decide the substance of the work and report the result. ShipFactory
+  stores both and follows the matching arrow; it does not reinterpret the
+  model's work to invent a different route.
+- Rejected alternatives: engine-specific verdict protocols for each kind of
+  work; deriving routes by parsing arbitrary prose; separate completion rules
+  for planners, builders, and reviewers.
