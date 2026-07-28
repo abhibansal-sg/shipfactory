@@ -58,3 +58,23 @@ closed unless explicitly reopened. Reference these before proposing structure.
   drift); forcing creative work through `dev-pipeline@14` forever (software
   artifact assumptions); making HyperFrames or generative video the default
   lane (contradicts the proven Nous NumPy/Pillow/OpenCV/FFmpeg workflow).
+
+## D-003 · Structure-first recipe simplification (2026-07-28)
+
+- Finalise the **recipe structure before changing the engine, converting real
+  workflows, or building the visual designer**. The structure is the contract
+  that tells every later layer what it must support.
+- Begin with the smallest visible grammar: one work box records **who does the
+  work**, **what they should do**, and **where each result goes next**; arrows
+  express ordinary continuation, parallel splits, joins, branches, and loops.
+- Use the operator's original planner → review → worker → parallel reviews →
+  synthesis → pass/rework graph as the first completeness test. Freeze the
+  structure only after that graph can be represented cleanly without hidden
+  execution meaning.
+- The engine will then be reduced to the smallest runner for the frozen
+  structure. Real workflows are converted after the runner exists; the visual
+  designer comes last and renders the same executable structure directly.
+- Rejected alternatives: engine-first redesign (repeats current assumptions);
+  workflow-by-workflow conversion before a common structure (creates special
+  cases); designer-first work (risks another projection that differs from
+  execution).
