@@ -78,3 +78,18 @@ closed unless explicitly reopened. Reference these before proposing structure.
   workflow-by-workflow conversion before a common structure (creates special
   cases); designer-first work (risks another projection that differs from
   execution).
+
+## D-004 · One box for work; arrows for flow (2026-07-28)
+
+- Every visible work box has only three required parts: **name**, **who does
+  it**, and **instructions**.
+- A box automatically receives the work passed from its preceding box or
+  boxes. Passing work forward is the default; recipe authors do not manually
+  wire ordinary intermediate artifacts into every box.
+- Arrows, not boxes, own routing. An arrow connects a reported result such as
+  `approved` or `changes needed` to the next box or boxes. A backward arrow is
+  rework; several outgoing arrows are a split.
+- Governing shorthand: **box = work; arrow = flow**.
+- Rejected alternatives: separate visible node types for planning, building,
+  reviewing, and decisions; routing hidden inside box-specific engine logic;
+  manual artifact plumbing as part of the basic recipe structure.
