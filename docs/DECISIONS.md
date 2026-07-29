@@ -173,3 +173,19 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: infinite automatic retry; immediate operator
   interruption on the first transient failure; treating a technical failure as
   a model-authored workflow result.
+
+## D-011 · Three rejected rework rounds pause and escalate (2026-07-28)
+
+- A normal backward arrow may send completed work back for correction without
+  human involvement.
+- If the same rework loop is rejected after **three completed correction
+  rounds**, ShipFactory pauses the affected path and reports the full work and
+  feedback history to the main orchestrator for the owning project.
+- The orchestrator may continue with better instructions, change the worker,
+  alter the workflow, or ask the operator. ShipFactory does not loop forever.
+- Technical failures under D-010 and completed-but-rejected work under D-011
+  are counted separately.
+- Governing shorthand: **three rejected fixes → pause → project orchestrator**.
+- Rejected alternatives: unlimited model-review loops; treating reviewer
+  rejection as a technical crash; interrupting the orchestrator on the first
+  ordinary correction round.
