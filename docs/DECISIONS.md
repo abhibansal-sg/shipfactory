@@ -120,3 +120,16 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: dedicated fan-out, collector, and synthesis
   primitives; fixed global dependencies that wait for paths a branch never
   started; requiring recipe authors to coordinate parallel completion by hand.
+
+## D-007 · Human boxes pause for the operator (2026-07-28)
+
+- A human box uses the same visible structure as any work box: name, who does
+  it, instructions, and result-labelled outgoing arrows.
+- When an active path reaches a human box, ShipFactory pauses that path and
+  presents the incoming work to the operator.
+- Only the human operator may choose the box's result and release its matching
+  arrow. A model, worker, dashboard automation, or engine recovery path cannot
+  decide or bypass it.
+- Governing shorthand: **model boxes run; human boxes wait**.
+- Rejected alternatives: a separate visible approval-gate grammar; allowing a
+  model verdict to stand in for the operator; automatic timeout approval.
