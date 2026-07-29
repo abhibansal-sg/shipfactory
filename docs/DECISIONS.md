@@ -231,3 +231,17 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Governing shorthand: **Project → Recipe → Run → Boxes and arrows**.
 - Rejected alternative: preserving several overlapping names for the same
   execution concepts merely because the old engine used them.
+
+## D-015 · Recipe Structure v1 frozen (2026-07-28)
+
+- `docs/recipe-structure-v1.md` is the operator-ratified canonical structure
+  for the simplified ShipFactory recipe model.
+- Its complete planner → plan review → builder → parallel reviews → synthesis
+  → human approval → End example proves sequence, branching, splitting,
+  active-path joining, backward rework, protected human decisions, explicit
+  completion, bounded technical failure, bounded rework, and frozen runs.
+- The structure requires no work-specific engine primitives. The next phase is
+  to audit the current engine against this contract and classify each mechanism
+  as **keep**, **simplify**, or **delete** before implementation begins.
+- Rejected alternative: continuing abstract structure design after the original
+  graph already fits and the structural checks pass.

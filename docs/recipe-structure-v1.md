@@ -1,7 +1,7 @@
-# Simple Recipe — Paper Prototype
+# ShipFactory Recipe Structure v1
 
-**Status:** design draft; not current engine syntax  
-**Purpose:** prove the ratified box-and-arrow structure against the operator's original graph before changing engine code.
+**Status:** operator-ratified structure; not yet current engine syntax
+**Purpose:** define the canonical box-and-arrow structure that the simplified engine must execute and display.
 
 ## The complete recipe
 
