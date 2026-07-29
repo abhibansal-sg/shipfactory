@@ -216,3 +216,18 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Governing shorthand: **project owns the work; recipe controls the flow**.
 - Rejected alternatives: one project per recipe; one universal recipe for all
   kinds of work; runs with no owning project or responsible orchestrator.
+
+## D-014 · Five user-facing nouns only (2026-07-28)
+
+- The operator-facing structure uses only five nouns:
+  - **Project** — owns the work and its main orchestrator.
+  - **Recipe** — a reusable graph attached to projects.
+  - **Run** — one frozen execution of a recipe for a project.
+  - **Box** — one piece of work.
+  - **Arrow** — where a reported result sends the work next.
+- Existing terms such as workflow, flight, journey, instance, primitive,
+  activation, and collector are removed from the operator's model. Temporary
+  internal migration names must not leak back into the product surface.
+- Governing shorthand: **Project → Recipe → Run → Boxes and arrows**.
+- Rejected alternative: preserving several overlapping names for the same
+  execution concepts merely because the old engine used them.
