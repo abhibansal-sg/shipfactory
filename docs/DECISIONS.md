@@ -145,3 +145,16 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: different recipe-start primitives for each external
   source; source-specific workflow structures; several implicit starting boxes
   whose activation cannot be read from the graph.
+
+## D-009 · Recipes end only at an explicit End box (2026-07-28)
+
+- A successful recipe finishes only when an active path reaches a box clearly
+  marked **End**. An End box has no outgoing arrows.
+- An ordinary box with no matching next arrow is a broken or incomplete graph.
+  ShipFactory pauses and reports the problem instead of silently declaring the
+  work finished.
+- Different branches may reach different explicitly labelled End boxes, such
+  as completed or cancelled.
+- Governing shorthand: **no arrow is not enough; the box must say End**.
+- Rejected alternative: inferring successful completion from any box that
+  happens to have no outgoing arrow.
