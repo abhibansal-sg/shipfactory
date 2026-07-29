@@ -1,7 +1,7 @@
 # ShipFactory Engine Deletion Map v1
 
-**Status:** source-grounded audit against operator-ratified Recipe Structure v1  
-**Scope:** current `main`; read-only analysis, no engine changes  
+**Status:** operator-ratified migration direction
+**Scope:** source-grounded audit of `main`; no engine changes
 **Safety line:** new Recipe Structure v1 runs use a new runner; existing runs remain pinned to the legacy runner until they finish or are explicitly cancelled.
 
 ## Verdict

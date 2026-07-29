@@ -245,3 +245,21 @@ closed unless explicitly reopened. Reference these before proposing structure.
   as **keep**, **simplify**, or **delete** before implementation begins.
 - Rejected alternative: continuing abstract structure design after the original
   graph already fits and the structural checks pass.
+
+## D-016 · Side-by-side GraphRunner replacement (2026-07-29)
+
+- `docs/engine-deletion-map-v1.md` is the operator-ratified migration direction
+  for replacing the current domain-specific recipe engine.
+- Keep the safety substrate: executor adapters, process supervision, frozen run
+  state, idempotent action intents, leases, protected human decisions, project
+  attachment, runtime configuration, logs, and telemetry.
+- Build a small GraphRunner beside the legacy runner. Only new Recipe Structure
+  v1 runs use it; existing runs remain pinned to the legacy engine until they
+  finish or are explicitly cancelled.
+- Replace the loader, advancer, run projection, completion protocol, dashboard,
+  and CLI with the generic Project → Recipe → Run → Boxes and arrows model.
+- After legacy runs drain, delete work-specific primitives, typed artifacts,
+  built-in verification/evidence semantics, collectors, legacy execution
+  policy, and domain-specific rework/recovery protocols.
+- Rejected alternative: trimming the 2,854-line legacy advancer in place, which
+  would preserve its domain assumptions and recreate the overbuilt structure.
