@@ -158,3 +158,18 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Governing shorthand: **no arrow is not enough; the box must say End**.
 - Rejected alternative: inferring successful completion from any box that
   happens to have no outgoing arrow.
+
+## D-010 · Three failed attempts pause and escalate (2026-07-28)
+
+- If a box crashes, times out, or otherwise fails before returning work and a
+  result, ShipFactory retries that same box.
+- After **three consecutive failed attempts**, ShipFactory pauses the affected
+  path and reports the failure to the main orchestrator for the owning project.
+- The report includes the recipe run, failed box, all three attempts, and their
+  errors so the orchestrator can diagnose, retry, redirect, or escalate. The
+  engine does not guess a normal result or follow a success/rework arrow.
+- A successful attempt resets the consecutive-failure count for that box.
+- Governing shorthand: **three failures → pause → project orchestrator**.
+- Rejected alternatives: infinite automatic retry; immediate operator
+  interruption on the first transient failure; treating a technical failure as
+  a model-authored workflow result.
