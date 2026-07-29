@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
@@ -20,6 +21,14 @@ _RESULT_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 class GraphRecipeError(ValueError):
     """A graph recipe does not conform to the V1 contract."""
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -48,38 +57,51 @@ _UniqueKeyLoader.add_constructor(
 
 
 @dataclass(frozen=True)
-class V1Box:
-    id: str
-    name: str
-    who: str
-    instructions: str
-    end: bool = False
-
-
-@dataclass(frozen=True)
-class V1Arrow:
-    from_id: str
-    result: str
-    to: tuple[str, ...]
-    backward: bool
-
-
-@dataclass(frozen=True)
-class V1Recipe:
+class GraphRecipe:
     name: str
     start: str
-    boxes: tuple[V1Box, ...]
-    arrows: tuple[V1Arrow, ...]
-    incoming_by_box: Mapping[str, tuple[int, ...]]
-    join_candidates: tuple[str, ...]
-    canonical_json: bytes
-    snapshot_hash: str
+    boxes: tuple[dict[str, object], ...]
+    arrows: tuple[dict[str, object], ...]
+    document: dict[str, object]
+    canonical_json: str
+    hash: str
 
-    def destinations(self, source_box_id: str, result: str) -> tuple[str, ...]:
+    def box(self, box_id: str) -> dict[str, object]:
+        for box in self.boxes:
+            if box["id"] == box_id:
+                return box
+        raise GraphRecipeError(f"unknown box {box_id!r}")
+
+    def destinations(self, box_id: str, result: str) -> tuple[str, ...]:
         for arrow in self.arrows:
-            if arrow.from_id == source_box_id and arrow.result == result:
-                return arrow.to
+            if arrow["from"] == box_id and arrow["result"] == result:
+                return tuple(arrow["to"])  # type: ignore[arg-type]
         return ()
+
+    def incoming(self, box_id: str) -> tuple[tuple[str, str], ...]:
+        self.box(box_id)
+        return tuple(
+            (str(arrow["from"]), str(arrow["result"]))
+            for arrow in self.arrows
+            if box_id in arrow["to"]  # type: ignore[operator]
+        )
+
+    def is_end(self, box_id: str) -> bool:
+        return self.box(box_id).get("end") is True
+
+    def is_rework_arrow(self, source_id: str, result: str) -> bool:
+        positions = {
+            str(box["id"]): index for index, box in enumerate(self.boxes)
+        }
+        if source_id not in positions:
+            raise GraphRecipeError(f"unknown box {source_id!r}")
+        for arrow in self.arrows:
+            if arrow["from"] == source_id and arrow["result"] == result:
+                return any(
+                    positions[str(destination)] <= positions[source_id]
+                    for destination in arrow["to"]  # type: ignore[union-attr]
+                )
+        return False
 
 
 def _require_exact_keys(
@@ -102,8 +124,9 @@ def _require_non_empty_string(value: Any, *, location: str) -> str:
     return value
 
 
-def validate_v1_recipe(document: Any) -> V1Recipe:
+def validate(document: object) -> GraphRecipe:
     _require_exact_keys(document, _TOP_LEVEL_KEYS, location="top-level document")
+    assert isinstance(document, dict)
     if not isinstance(document["boxes"], list):
         raise GraphRecipeError("boxes must be a list")
     if not isinstance(document["arrows"], list):
@@ -127,8 +150,8 @@ def validate_v1_recipe(document: Any) -> V1Recipe:
             _require_non_empty_string(
                 box[field], location=f"boxes[{index}].{field}"
             )
-        if "end" in box and type(box["end"]) is not bool:
-            raise GraphRecipeError(f"boxes[{index}].end must be boolean")
+        if "end" in box and box["end"] is not True:
+            raise GraphRecipeError(f"boxes[{index}].end, when present, must be true")
 
     route_keys: set[tuple[str, str]] = set()
     for index, arrow in enumerate(document["arrows"]):
@@ -227,67 +250,49 @@ def validate_v1_recipe(document: Any) -> V1Recipe:
             f"all boxes must be able to reach the end; unable: {missing!r}"
         )
 
+    snapshot_document = copy.deepcopy(document)
     canonical_json = json.dumps(
-        document,
+        snapshot_document,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
-    ).encode("utf-8")
-    box_positions = {
-        box["id"]: index for index, box in enumerate(document["boxes"])
-    }
-    incoming: dict[str, list[int]] = {
-        box["id"]: [] for box in document["boxes"]
-    }
-    for index, arrow in enumerate(document["arrows"]):
-        for destination in arrow["to"]:
-            incoming[destination].append(index)
-
-    return V1Recipe(
-        name=document["name"],
-        start=document["start"],
-        boxes=tuple(
-            V1Box(
-                id=box["id"],
-                name=box["name"],
-                who=box["who"],
-                instructions=box["instructions"],
-                end=box.get("end", False),
-            )
-            for box in document["boxes"]
-        ),
-        arrows=tuple(
-            V1Arrow(
-                from_id=arrow["from"],
-                result=arrow["result"],
-                to=tuple(arrow["to"]),
-                backward=any(
-                    box_positions[destination] <= box_positions[arrow["from"]]
-                    for destination in arrow["to"]
-                ),
-            )
-            for arrow in document["arrows"]
-        ),
-        incoming_by_box=MappingProxyType(
-            {
-                box["id"]: tuple(incoming[box["id"]])
-                for box in document["boxes"]
-            }
-        ),
-        join_candidates=tuple(
-            box["id"]
-            for box in document["boxes"]
-            if len(incoming[box["id"]]) > 1
-        ),
+    )
+    frozen_document = _freeze(snapshot_document)
+    return GraphRecipe(
+        name=str(frozen_document["name"]),
+        start=str(frozen_document["start"]),
+        boxes=tuple(frozen_document["boxes"]),
+        arrows=tuple(frozen_document["arrows"]),
+        document=frozen_document,
         canonical_json=canonical_json,
-        snapshot_hash=hashlib.sha256(canonical_json).hexdigest(),
+        hash=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
     )
 
 
-def load_v1_recipe(path: str | Path) -> V1Recipe:
+def load(path: Path) -> GraphRecipe:
     try:
-        with Path(path).open("r", encoding="utf-8") as stream:
+        with path.open("r", encoding="utf-8") as stream:
             document = yaml.load(stream, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as exc:
         raise GraphRecipeError(f"invalid YAML: {exc}") from exc
-    return validate_v1_recipe(document)
+    return validate(document)
+
+
+def load_library(path: Path) -> dict[str, GraphRecipe]:
+    recipes: dict[str, GraphRecipe] = {}
+    files = sorted({*path.glob("*.yaml"), *path.glob("*.yml")})
+    for recipe_path in files:
+        recipe = load(recipe_path)
+        if recipe.name in recipes:
+            raise GraphRecipeError(f"duplicate recipe name {recipe.name!r} in library")
+        recipes[recipe.name] = recipe
+    return recipes
+
+
+# Transitional aliases for callers written against the pre-review draft.
+V1Recipe = GraphRecipe
+validate_v1_recipe = validate
+
+
+def load_v1_recipe(path: str | Path) -> GraphRecipe:
+    return load(Path(path))

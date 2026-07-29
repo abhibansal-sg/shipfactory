@@ -69,6 +69,8 @@ def stage_config(monkeypatch) -> FactoryConfig:
             ("story-author", "engineer"), ("builder", "engineer"),
             ("spec-reviewer", "qa"), ("plan-reviewer", "qa"),
             ("correctness-reviewer", "qa"), ("adversarial-reviewer", "engineer"),
+            ("weave-integrator", "engineer"),
+            ("weave-adversary", "qa"),
         )
     }
     cfg = FactoryConfig(

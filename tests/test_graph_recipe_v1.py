@@ -11,9 +11,11 @@ import pytest
 import yaml
 
 from shipfactory.graph_recipe import (
+    GraphRecipe,
     GraphRecipeError,
-    load_v1_recipe,
-    validate_v1_recipe,
+    load,
+    load_library,
+    validate,
 )
 
 
@@ -37,14 +39,18 @@ def test_runtime_recipe_matches_ratified_document():
     )
 
     assert runtime_recipe == ratified_recipe
+    assert (ROOT / "recipes" / "v1" / "plan-build-review.yaml").read_text() == (
+        match.group(1) + "\n"
+    )
 
 
 def test_canonical_fixture_loads_as_an_immutable_ordered_snapshot():
-    recipe = load_v1_recipe(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
+    recipe = load(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
 
+    assert isinstance(recipe, GraphRecipe)
     assert recipe.name == "plan-build-review"
     assert recipe.start == "planner"
-    assert [box.id for box in recipe.boxes] == [
+    assert [box["id"] for box in recipe.boxes] == [
         "planner",
         "plan-review",
         "builder",
@@ -55,29 +61,35 @@ def test_canonical_fixture_loads_as_an_immutable_ordered_snapshot():
         "human-approval",
         "final-delivery",
     ]
-    assert recipe.boxes[-1].end is True
-    assert recipe.arrows[0].from_id == "planner"
-    assert recipe.arrows[0].result == "done"
-    assert recipe.arrows[0].to == ("plan-review",)
-    assert isinstance(recipe.canonical_json, bytes)
-    assert len(recipe.snapshot_hash) == 64
+    assert recipe.boxes[-1]["end"] is True
+    assert dict(recipe.arrows[0]) == {
+        "from": "planner", "result": "done", "to": ("plan-review",),
+    }
+    assert json.loads(recipe.canonical_json) == canonical_document()
+    assert isinstance(recipe.canonical_json, str)
+    assert len(recipe.hash) == 64
     with pytest.raises(FrozenInstanceError):
         setattr(recipe, "name", "changed")
-    with pytest.raises(FrozenInstanceError):
-        setattr(recipe.boxes[0], "name", "changed")
-    with pytest.raises(FrozenInstanceError):
-        setattr(recipe.arrows[0], "result", "changed")
-    assert [
-        (arrow.from_id, arrow.result, arrow.to)
-        for arrow in recipe.arrows
-    ] == [
-        (arrow["from"], arrow["result"], tuple(arrow["to"]))
-        for arrow in canonical_document()["arrows"]
-    ]
+    with pytest.raises(TypeError):
+        recipe.boxes[0]["name"] = "changed"
+    destinations = recipe.arrows[0]["to"]
+    assert isinstance(destinations, tuple)
+    with pytest.raises(TypeError):
+        recipe.arrows[0]["to"] = destinations + ("builder",)
+    with pytest.raises(TypeError):
+        recipe.document["start"] = "builder"
+    assert recipe.hash == hashlib.sha256(recipe.canonical_json.encode()).hexdigest()
+    assert [dict(box) for box in recipe.boxes] == canonical_document()["boxes"]
+    actual_arrows = []
+    for arrow in recipe.arrows:
+        destinations = arrow["to"]
+        assert isinstance(destinations, tuple)
+        actual_arrows.append({**dict(arrow), "to": list(destinations)})
+    assert actual_arrows == canonical_document()["arrows"]
 
 
 def test_canonical_routing_destinations_preserve_declaration_order():
-    recipe = load_v1_recipe(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
+    recipe = load(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
 
     assert recipe.destinations("builder", "done") == (
         "correctness-review",
@@ -88,13 +100,12 @@ def test_canonical_routing_destinations_preserve_declaration_order():
 
 
 def test_canonical_arrows_classify_backward_only_by_box_position():
-    recipe = load_v1_recipe(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
-    arrows = {(arrow.from_id, arrow.result): arrow for arrow in recipe.arrows}
+    recipe = load(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
 
-    assert arrows["plan-review", "revise"].backward is True
-    assert arrows["synthesize", "rework"].backward is True
-    assert arrows["human-approval", "rejected"].backward is True
-    assert arrows["builder", "done"].backward is False
+    assert recipe.is_rework_arrow("plan-review", "revise") is True
+    assert recipe.is_rework_arrow("synthesize", "rework") is True
+    assert recipe.is_rework_arrow("human-approval", "rejected") is True
+    assert recipe.is_rework_arrow("builder", "done") is False
 
 
 def test_self_loop_is_backward_by_declared_position():
@@ -105,49 +116,49 @@ def test_self_loop_is_backward_by_declared_position():
         "to": ["planner"],
     })
 
-    recipe = validate_v1_recipe(document)
+    recipe = validate(document)
 
-    assert recipe.arrows[-1].backward is True
+    assert recipe.is_rework_arrow("planner", "retry") is True
 
 
 def test_one_backward_destination_marks_the_whole_arrow_backward():
     document = canonical_document()
     document["arrows"][3]["to"].append("planner")
 
-    recipe = validate_v1_recipe(document)
+    recipe = validate(document)
 
-    assert recipe.arrows[3].backward is True
+    assert recipe.is_rework_arrow("builder", "done") is True
 
 
-def test_canonical_incoming_metadata_is_complete_ordered_and_read_only():
+def test_canonical_incoming_metadata_is_complete_and_ordered():
     document = canonical_document()
-    recipe = validate_v1_recipe(document)
+    recipe = validate(document)
     expected_incoming = {
         box["id"]: tuple(
-            index
-            for index, arrow in enumerate(document["arrows"])
+            (arrow["from"], arrow["result"])
+            for arrow in document["arrows"]
             if box["id"] in arrow["to"]
         )
         for box in document["boxes"]
     }
-    expected_join_candidates = tuple(
-        box["id"]
-        for box in document["boxes"]
-        if sum(
-            box["id"] in arrow["to"] for arrow in document["arrows"]
-        )
-        > 1
-    )
 
-    assert tuple(recipe.incoming_by_box) == tuple(
-        box["id"] for box in document["boxes"]
-    )
-    assert dict(recipe.incoming_by_box) == expected_incoming
-    assert expected_join_candidates == ("builder", "synthesize")
-    assert recipe.join_candidates == ("builder", "synthesize")
-    assert "synthesize" in recipe.join_candidates
-    with pytest.raises(TypeError):
-        recipe.incoming_by_box["synthesize"] = ()
+    assert {
+        box["id"]: recipe.incoming(box["id"])
+        for box in document["boxes"]
+    } == expected_incoming
+    assert recipe.box("planner")["name"] == "Plan the work"
+    assert recipe.is_end("final-delivery") is True
+    assert recipe.is_end("planner") is False
+
+
+def test_rework_identity_uses_position_not_result_label():
+    document = canonical_document()
+    document["arrows"][0]["result"] = "rework"
+    document["arrows"][2]["result"] = "done"
+    recipe = validate(document)
+
+    assert recipe.is_rework_arrow("planner", "rework") is False
+    assert recipe.is_rework_arrow("plan-review", "done") is True
 
 
 @pytest.mark.parametrize(
@@ -166,7 +177,7 @@ def test_keys_are_exact(case, mutate):
     mutate(document)
 
     with pytest.raises(GraphRecipeError, match="keys"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize(
@@ -175,7 +186,7 @@ def test_keys_are_exact(case, mutate):
 )
 def test_top_level_document_must_be_a_mapping(replacement):
     with pytest.raises(GraphRecipeError, match="mapping"):
-        validate_v1_recipe(replacement)
+        validate(replacement)
 
 
 @pytest.mark.parametrize("field,replacement", [("boxes", {}), ("arrows", {})])
@@ -184,7 +195,7 @@ def test_boxes_and_arrows_must_be_lists(field, replacement):
     document[field] = replacement
 
     with pytest.raises(GraphRecipeError, match=field):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_malformed_yaml_fails_closed(tmp_path):
@@ -192,7 +203,18 @@ def test_malformed_yaml_fails_closed(tmp_path):
     path.write_text("name: [unterminated")
 
     with pytest.raises(GraphRecipeError, match="YAML"):
-        load_v1_recipe(path)
+        load(path)
+
+
+def test_load_library_returns_recipes_by_name_and_rejects_duplicates(tmp_path):
+    library = load_library(ROOT / "recipes" / "v1")
+    assert library == {"plan-build-review": library["plan-build-review"]}
+
+    recipe_text = (ROOT / "recipes" / "v1" / "plan-build-review.yaml").read_text()
+    (tmp_path / "one.yaml").write_text(recipe_text)
+    (tmp_path / "two.yml").write_text(recipe_text)
+    with pytest.raises(GraphRecipeError, match="duplicate recipe name"):
+        load_library(tmp_path)
 
 
 def test_duplicate_yaml_mapping_keys_fail_closed(tmp_path):
@@ -202,7 +224,7 @@ def test_duplicate_yaml_mapping_keys_fail_closed(tmp_path):
     )
 
     with pytest.raises(GraphRecipeError, match="duplicate YAML key.*name"):
-        load_v1_recipe(path)
+        load(path)
 
 
 def test_composite_yaml_mapping_key_fails_as_graph_recipe_error(tmp_path):
@@ -210,7 +232,7 @@ def test_composite_yaml_mapping_key_fails_as_graph_recipe_error(tmp_path):
     path.write_text("? [one, two]\n: value\n")
 
     with pytest.raises(GraphRecipeError, match="invalid YAML key"):
-        load_v1_recipe(path)
+        load(path)
 
 
 def test_graph_recipe_has_no_legacy_recipe_imports():
@@ -240,7 +262,7 @@ def test_box_text_fields_are_non_empty_strings(field, invalid):
     document["boxes"][0][field] = invalid
 
     with pytest.raises(GraphRecipeError, match=field):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize("field", ["name", "start"])
@@ -250,7 +272,7 @@ def test_recipe_name_and_start_are_non_empty_strings(field, invalid):
     document[field] = invalid
 
     with pytest.raises(GraphRecipeError, match=field):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize("invalid", ["", "   ", None, 7])
@@ -259,7 +281,7 @@ def test_box_ids_are_non_empty_strings(invalid):
     document["boxes"][0]["id"] = invalid
 
     with pytest.raises(GraphRecipeError, match="id"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_box_ids_are_unique():
@@ -267,7 +289,7 @@ def test_box_ids_are_unique():
     document["boxes"][1]["id"] = document["boxes"][0]["id"]
 
     with pytest.raises(GraphRecipeError, match="unique"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize("invalid", ["true", 1, None])
@@ -276,7 +298,7 @@ def test_end_is_boolean_when_present(invalid):
     document["boxes"][0]["end"] = invalid
 
     with pytest.raises(GraphRecipeError, match="end"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize(
@@ -288,7 +310,7 @@ def test_result_labels_match_v1_result_word_regex(invalid):
     document["arrows"][0]["result"] = invalid
 
     with pytest.raises(GraphRecipeError, match="result"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_duplicate_source_result_routes_are_rejected():
@@ -298,7 +320,7 @@ def test_duplicate_source_result_routes_are_rejected():
     document["arrows"].append(duplicate)
 
     with pytest.raises(GraphRecipeError, match=r"from.*, result"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize(
@@ -310,21 +332,21 @@ def test_destination_lists_are_non_empty_and_unique(invalid):
     document["arrows"][0]["to"] = invalid
 
     with pytest.raises(GraphRecipeError, match="destination"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_snapshot_is_sha256_of_canonical_json():
     document = canonical_document()
-    recipe = validate_v1_recipe(document)
+    recipe = validate(document)
     expected = json.dumps(
         document,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
-    ).encode("utf-8")
+    )
 
     assert recipe.canonical_json == expected
-    assert recipe.snapshot_hash == hashlib.sha256(expected).hexdigest()
+    assert recipe.hash == hashlib.sha256(expected.encode("utf-8")).hexdigest()
 
 
 def test_start_must_reference_an_existing_box():
@@ -332,7 +354,7 @@ def test_start_must_reference_an_existing_box():
     document["start"] = "missing"
 
     with pytest.raises(GraphRecipeError, match="start"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize("field", ["from", "to"])
@@ -344,19 +366,27 @@ def test_arrow_references_must_exist(field):
         document["arrows"][0]["to"] = ["missing"]
 
     with pytest.raises(GraphRecipeError, match="reference"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 @pytest.mark.parametrize("end_count", [0, 2])
 def test_exactly_one_box_is_the_end(end_count):
     document = canonical_document()
-    document["boxes"][-1]["end"] = False
-    if end_count == 2:
+    if end_count == 0:
+        document["boxes"][-1].pop("end")
+    else:
         document["boxes"][0]["end"] = True
-        document["boxes"][1]["end"] = True
 
     with pytest.raises(GraphRecipeError, match="exactly one"):
-        validate_v1_recipe(document)
+        validate(document)
+
+
+def test_end_false_is_not_part_of_the_exact_grammar():
+    document = canonical_document()
+    document["boxes"][-1]["end"] = False
+
+    with pytest.raises(GraphRecipeError, match="when present, must be true"):
+        validate(document)
 
 
 def test_end_box_has_no_outgoing_arrows():
@@ -366,7 +396,7 @@ def test_end_box_has_no_outgoing_arrows():
     )
 
     with pytest.raises(GraphRecipeError, match="end.*outgoing"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_every_non_end_box_has_an_outgoing_route():
@@ -376,7 +406,7 @@ def test_every_non_end_box_has_an_outgoing_route():
     ]
 
     with pytest.raises(GraphRecipeError, match="outgoing"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_every_box_is_reachable_from_start():
@@ -384,7 +414,7 @@ def test_every_box_is_reachable_from_start():
     document["arrows"][0]["to"] = ["builder"]
 
     with pytest.raises(GraphRecipeError, match="reachable"):
-        validate_v1_recipe(document)
+        validate(document)
 
 
 def test_every_box_can_reach_end():
@@ -395,4 +425,4 @@ def test_every_box_can_reach_end():
     risk_route["to"] = ["risk-review"]
 
     with pytest.raises(GraphRecipeError, match="reach the end"):
-        validate_v1_recipe(document)
+        validate(document)

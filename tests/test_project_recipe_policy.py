@@ -35,9 +35,10 @@ def test_migration_16_is_idempotent_checksum_disciplined_and_has_exact_schema(tm
             "SELECT version,name,checksum,applied_at FROM schema_migrations WHERE version=16"
         ).fetchone()
         assert first is not None
-        expected = hashlib.sha256(store._MIGRATIONS[-1][2].encode("utf-8")).hexdigest()
+        migration_16 = next(item for item in store._MIGRATIONS if item[0] == 16)
+        expected = hashlib.sha256(migration_16[2].encode("utf-8")).hexdigest()
         assert first[0] == 16
-        assert first[1] == store._MIGRATIONS[-1][1]
+        assert first[1] == migration_16[1]
         assert first[2] == expected
         assert {row[1] for row in db.execute("PRAGMA table_info(project_recipe_policies)")} == {
             "project_id", "allowed_recipe_keys_json", "default_recipe_key", "created_at", "updated_at",

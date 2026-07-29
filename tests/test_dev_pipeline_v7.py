@@ -85,7 +85,7 @@ def test_startup_guard_loads_the_published_library_under_the_count_only_regime(m
             # dev-pipeline@13 step-granular seats.
             "spec-author", "plan-author", "story-author", "builder",
             "spec-reviewer", "plan-reviewer", "correctness-reviewer",
-            "adversarial-reviewer",
+            "adversarial-reviewer", "weave-integrator", "weave-adversary",
         )},
         {},
         {

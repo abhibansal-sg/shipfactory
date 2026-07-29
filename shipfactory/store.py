@@ -391,6 +391,172 @@ _PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS = (
 _PROJECT_RECIPE_POLICY_MIGRATION_TEXT = (
     ";\n".join(_PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS) + ";\n"
 )
+_GRAPH_RUNNER_V1_MIGRATION_STATEMENTS = (
+    """CREATE TABLE recipe_runs_v1 (
+  id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  board TEXT NOT NULL,
+  recipe_name TEXT NOT NULL,
+  recipe_hash TEXT NOT NULL CHECK(
+    typeof(recipe_hash)='text'
+    AND length(recipe_hash)=64
+    AND recipe_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  recipe_snapshot_json TEXT NOT NULL CHECK(json_valid(recipe_snapshot_json)),
+  request_text TEXT NOT NULL,
+  workspace_path TEXT,
+  launch_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('running','paused','completed','failed')),
+  blocked_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  CHECK(
+    (state IN ('completed','failed') AND completed_at IS NOT NULL)
+    OR (state IN ('running','paused') AND completed_at IS NULL)
+  )
+)""",
+    "CREATE INDEX idx_recipe_runs_v1_active ON recipe_runs_v1(state,updated_at DESC)",
+    """CREATE TABLE box_attempts_v1 (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES recipe_runs_v1(id),
+  box_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal>=1),
+  state TEXT NOT NULL CHECK(state IN ('pending','ready','running','waiting_human','completed','failed','cancelled')),
+  executor_run_id INTEGER REFERENCES runs(id),
+  input_work_json TEXT NOT NULL CHECK(json_valid(input_work_json)),
+  output_work TEXT,
+  result TEXT,
+  technical_failure TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(run_id,box_id,ordinal),
+  UNIQUE(id,run_id),
+  CHECK(
+    (state IN ('completed','failed','cancelled') AND finished_at IS NOT NULL)
+    OR (state IN ('pending','ready','running','waiting_human') AND finished_at IS NULL)
+  )
+)""",
+    "CREATE INDEX idx_box_attempts_v1_ready ON box_attempts_v1(state,run_id,created_at)",
+    """CREATE TABLE route_tokens_v1 (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES recipe_runs_v1(id),
+  source_attempt_id TEXT,
+  arrow_index INTEGER CHECK(arrow_index IS NULL OR (typeof(arrow_index)='integer' AND arrow_index>=0)),
+  destination_box_id TEXT NOT NULL,
+  lineage_json TEXT NOT NULL CHECK(
+    json_valid(lineage_json) AND json_type(lineage_json)='array'
+  ),
+  work_refs_json TEXT NOT NULL CHECK(json_valid(work_refs_json)),
+  state TEXT NOT NULL CHECK(state IN ('pending','consumed','cancelled')),
+  created_at TEXT NOT NULL,
+  consumed_at TEXT,
+  UNIQUE(run_id,source_attempt_id,arrow_index,destination_box_id),
+  FOREIGN KEY(source_attempt_id,run_id) REFERENCES box_attempts_v1(id,run_id),
+  CHECK(
+    (source_attempt_id IS NULL AND arrow_index IS NULL)
+    OR (source_attempt_id IS NOT NULL AND arrow_index IS NOT NULL)
+  ),
+  CHECK(
+    (state IN ('consumed','cancelled') AND consumed_at IS NOT NULL)
+    OR (state='pending' AND consumed_at IS NULL)
+  )
+)""",
+    """CREATE TRIGGER trg_route_tokens_v1_logical_unique_insert
+BEFORE INSERT ON route_tokens_v1
+WHEN EXISTS (
+  SELECT 1 FROM route_tokens_v1 existing
+  WHERE existing.run_id=NEW.run_id
+    AND existing.source_attempt_id IS NEW.source_attempt_id
+    AND existing.arrow_index IS NEW.arrow_index
+    AND existing.destination_box_id=NEW.destination_box_id
+)
+BEGIN
+  SELECT RAISE(ABORT,'duplicate route token logical identity');
+END""",
+    """CREATE TRIGGER trg_route_tokens_v1_logical_unique_update
+BEFORE UPDATE OF run_id,source_attempt_id,arrow_index,destination_box_id
+ON route_tokens_v1
+WHEN EXISTS (
+  SELECT 1 FROM route_tokens_v1 existing
+  WHERE existing.id<>OLD.id
+    AND existing.run_id=NEW.run_id
+    AND existing.source_attempt_id IS NEW.source_attempt_id
+    AND existing.arrow_index IS NEW.arrow_index
+    AND existing.destination_box_id=NEW.destination_box_id
+)
+BEGIN
+  SELECT RAISE(ABORT,'duplicate route token logical identity');
+END""",
+    "CREATE INDEX idx_route_tokens_v1_active ON route_tokens_v1(state,run_id,destination_box_id)",
+    """CREATE TABLE split_groups_v1 (
+  id TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES recipe_runs_v1(id),
+  parent_lineage_json TEXT NOT NULL CHECK(
+    json_valid(parent_lineage_json) AND json_type(parent_lineage_json)='array'
+  ),
+  branch_ids_json TEXT NOT NULL CHECK(
+    json_valid(branch_ids_json)
+    AND json_type(branch_ids_json)='array'
+    AND json_array_length(branch_ids_json)>1
+  ),
+  state TEXT NOT NULL CHECK(state IN ('open','closed','cancelled')),
+  created_at TEXT NOT NULL,
+  closed_at TEXT,
+  CHECK(
+    (state IN ('closed','cancelled') AND closed_at IS NOT NULL)
+    OR (state='open' AND closed_at IS NULL)
+  )
+)""",
+    """CREATE TABLE run_events_v1 (
+  key TEXT PRIMARY KEY NOT NULL,
+  run_id TEXT NOT NULL REFERENCES recipe_runs_v1(id),
+  source TEXT NOT NULL,
+  payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+  state TEXT NOT NULL CHECK(state IN ('pending','leased','applied','discarded','failed')),
+  lease_owner TEXT,
+  lease_until TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempt_count)='integer' AND attempt_count>=0),
+  outcome TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  applied_at TEXT,
+  UNIQUE(key,run_id),
+  CHECK(
+    (state='leased' AND lease_owner IS NOT NULL AND lease_until IS NOT NULL)
+    OR (state<>'leased' AND lease_owner IS NULL AND lease_until IS NULL)
+  ),
+  CHECK(
+    (state IN ('applied','discarded','failed') AND applied_at IS NOT NULL)
+    OR (state IN ('pending','leased') AND applied_at IS NULL)
+  )
+)""",
+    "CREATE INDEX idx_run_events_v1_pending ON run_events_v1(state,lease_until,created_at)",
+    """CREATE TABLE human_box_decisions_v1 (
+  id TEXT PRIMARY KEY NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES box_attempts_v1(id),
+  result TEXT NOT NULL,
+  actor_kind TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  nonce_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  event_key TEXT NOT NULL UNIQUE
+)""",
+    """CREATE TABLE project_recipes_v1 (
+  project_id TEXT NOT NULL,
+  recipe_name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+  is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(project_id,recipe_name)
+)""",
+)
+_GRAPH_RUNNER_V1_MIGRATION_TEXT = (
+    ";\n".join(_GRAPH_RUNNER_V1_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -408,6 +574,7 @@ _MIGRATIONS = (
     (14, "app_session_expected_candidate_identity", _APP_SESSION_IDENTITY_MIGRATION_TEXT),
     (15, "sf17_containment_overlay", _CONTAINMENT_OVERLAY_MIGRATION_TEXT),
     (16, "sf18_project_recipe_policy_and_flight_identity", _PROJECT_RECIPE_POLICY_MIGRATION_TEXT),
+    (17, "graphrunner_v1_durable_state", _GRAPH_RUNNER_V1_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -426,6 +593,7 @@ _MIGRATION_STATEMENTS = {
     14: _APP_SESSION_IDENTITY_MIGRATION_STATEMENTS,
     15: _CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS,
     16: _PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS,
+    17: _GRAPH_RUNNER_V1_MIGRATION_STATEMENTS,
 }
 
 
@@ -684,6 +852,35 @@ def init_db() -> None:
                             "uq_recipe_instances_launch_key",
                         }
                         & indexes
+                    )
+                elif version == 17:
+                    graph_tables = {
+                        "recipe_runs_v1", "box_attempts_v1", "route_tokens_v1",
+                        "split_groups_v1", "run_events_v1", "human_box_decisions_v1",
+                        "project_recipes_v1",
+                    }
+                    graph_indexes = {
+                        "idx_recipe_runs_v1_active", "idx_box_attempts_v1_ready",
+                        "idx_route_tokens_v1_active", "idx_run_events_v1_pending",
+                    }
+                    graph_triggers = {
+                        "trg_route_tokens_v1_logical_unique_insert",
+                        "trg_route_tokens_v1_logical_unique_update",
+                    }
+                    indexes = {
+                        row[0] for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='index'"
+                        )
+                    }
+                    triggers = {
+                        row[0] for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='trigger'"
+                        )
+                    }
+                    migration_artifacts = bool(
+                        graph_tables & existing_tables
+                        or graph_indexes & indexes
+                        or graph_triggers & triggers
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
@@ -1750,4 +1947,642 @@ def sync_upsert(gh_number, task_id, gh_updated, k_updated) -> None:
                      (gh_number, task_id, gh_updated, k_updated, _now()))
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "load_project_recipe_policy", "save_project_recipe_policy", "project_flight", "project_flight_by_idempotency_key", "project_flight_by_linear_issue_id", "project_rollup", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert"]
+class GraphStoreConflict(RuntimeError):
+    """A GraphRunner write conflicts with already-persisted durable state."""
+
+
+class GraphStoreIntegrityError(RuntimeError):
+    """A GraphRunner write violates the durable v1 schema or its bindings."""
+
+
+_GRAPH_UNSET = object()
+_BOX_TERMINAL_STATES = {"completed", "failed", "cancelled"}
+_EVENT_TERMINAL_STATES = {"applied", "discarded", "failed"}
+
+
+def _graph_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _validate_graph_recipe_identity(
+    *, recipe_name: str, recipe_hash: str, recipe_snapshot_json: str,
+):
+    from .graph_recipe import GraphRecipeError, validate
+
+    try:
+        document = json.loads(recipe_snapshot_json)
+        recipe = validate(document)
+    except (json.JSONDecodeError, GraphRecipeError) as exc:
+        raise GraphStoreIntegrityError("invalid frozen GraphRecipe snapshot") from exc
+    if recipe.canonical_json != recipe_snapshot_json:
+        raise GraphStoreIntegrityError("GraphRecipe snapshot is not canonical JSON")
+    if recipe.name != recipe_name or recipe.hash != recipe_hash:
+        raise GraphStoreIntegrityError("GraphRecipe name or hash does not match snapshot")
+    return recipe
+
+
+def _graph_recipe_for_run(conn: sqlite3.Connection, run_id: str):
+    row = conn.execute(
+        """SELECT recipe_name,recipe_hash,recipe_snapshot_json
+           FROM recipe_runs_v1 WHERE id=?""",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise GraphStoreIntegrityError(f"GraphRecipe run does not exist: {run_id}")
+    return _validate_graph_recipe_identity(
+        recipe_name=row["recipe_name"], recipe_hash=row["recipe_hash"],
+        recipe_snapshot_json=row["recipe_snapshot_json"],
+    )
+
+
+def _graph_row(conn: sqlite3.Connection, table: str, column: str, value: Any) -> dict[str, Any] | None:
+    if table not in {
+        "recipe_runs_v1", "box_attempts_v1", "route_tokens_v1",
+        "run_events_v1", "human_box_decisions_v1",
+    } or column not in {"id", "key", "launch_key"}:
+        raise ValueError("unsupported GraphRunner row lookup")
+    row = conn.execute(f"SELECT * FROM {table} WHERE {column}=?", (value,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_recipe_run_v1(
+    *, run_id: str, project_id: str, board: str, recipe_name: str,
+    recipe_hash: str, recipe_snapshot_json: str, request_text: str,
+    workspace_path: str | None, launch_key: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """Create a frozen GraphRunner run, idempotently keyed by ``launch_key``."""
+    _validate_graph_recipe_identity(
+        recipe_name=recipe_name, recipe_hash=recipe_hash,
+        recipe_snapshot_json=recipe_snapshot_json,
+    )
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return create_recipe_run_v1(
+                run_id=run_id, project_id=project_id, board=board,
+                recipe_name=recipe_name, recipe_hash=recipe_hash,
+                recipe_snapshot_json=recipe_snapshot_json, request_text=request_text,
+                workspace_path=workspace_path, launch_key=launch_key, conn=db,
+            )
+    existing = _graph_row(conn, "recipe_runs_v1", "launch_key", launch_key)
+    identity = {
+        "project_id": project_id, "board": board, "recipe_name": recipe_name,
+        "recipe_hash": recipe_hash, "recipe_snapshot_json": recipe_snapshot_json,
+        "request_text": request_text, "workspace_path": workspace_path,
+        "launch_key": launch_key,
+    }
+    if existing:
+        if all(existing[key] == value for key, value in identity.items()):
+            return existing
+        raise GraphStoreConflict(f"launch key {launch_key!r} already identifies another run")
+    now = _now()
+    try:
+        conn.execute(
+            """INSERT INTO recipe_runs_v1(
+                id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,
+                request_text,workspace_path,launch_key,state,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,'running',?,?)""",
+            (run_id, project_id, board, recipe_name, recipe_hash,
+             recipe_snapshot_json, request_text, workspace_path, launch_key, now, now),
+        )
+    except sqlite3.IntegrityError as exc:
+        row = conn.execute(
+            "SELECT * FROM recipe_runs_v1 WHERE id=? OR launch_key=?",
+            (run_id, launch_key),
+        ).fetchone()
+        if row:
+            existing = dict(row)
+            if all(existing[key] == value for key, value in identity.items()):
+                return existing
+            raise GraphStoreConflict(
+                f"run or launch key already exists with different content: {run_id}"
+            ) from exc
+        raise GraphStoreIntegrityError(f"invalid recipe run: {run_id}") from exc
+    return _graph_row(conn, "recipe_runs_v1", "id", run_id)  # type: ignore[return-value]
+
+
+def get_recipe_run_v1(
+    run_id: str, *, conn: sqlite3.Connection | None = None,
+) -> dict[str, Any] | None:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            return get_recipe_run_v1(run_id, conn=db)
+    return _graph_row(conn, "recipe_runs_v1", "id", run_id)
+
+
+def list_recipe_runs_v1(
+    *, project_id: str | None = None, state: str | None = None,
+    limit: int = 100, conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            return list_recipe_runs_v1(
+                project_id=project_id, state=state, limit=limit, conn=db,
+            )
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project_id is not None:
+        clauses.append("project_id=?")
+        params.append(project_id)
+    if state is not None:
+        clauses.append("state=?")
+        params.append(state)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(max(1, min(int(limit), 1000)))
+    return _rows(conn.execute(
+        f"SELECT * FROM recipe_runs_v1{where} ORDER BY created_at,id LIMIT ?", params,
+    ))
+
+
+def insert_box_attempt_v1(
+    *, attempt_id: str, run_id: str, box_id: str, ordinal: int,
+    state: str, input_work: Any, executor_run_id: int | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return insert_box_attempt_v1(
+                attempt_id=attempt_id, run_id=run_id, box_id=box_id,
+                ordinal=ordinal, state=state, input_work=input_work,
+                executor_run_id=executor_run_id, conn=db,
+            )
+    input_json = _graph_json(input_work)
+    recipe = _graph_recipe_for_run(conn, run_id)
+    try:
+        recipe.box(box_id)
+    except ValueError as exc:
+        raise GraphStoreIntegrityError(f"unknown box in attempt: {box_id}") from exc
+    expected = {
+        "run_id": run_id, "box_id": box_id, "ordinal": int(ordinal),
+        "input_work_json": input_json,
+    }
+    row = conn.execute(
+        "SELECT * FROM box_attempts_v1 WHERE run_id=? AND box_id=? AND ordinal=?",
+        (run_id, box_id, int(ordinal)),
+    ).fetchone()
+    if row:
+        existing = dict(row)
+        if all(existing[key] == value for key, value in expected.items()):
+            return existing
+        raise GraphStoreConflict("box attempt identity already exists with different content")
+    now = _now()
+    try:
+        conn.execute(
+            """INSERT INTO box_attempts_v1(
+                id,run_id,box_id,ordinal,state,executor_run_id,input_work_json,
+                created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (attempt_id, run_id, box_id, int(ordinal), state, executor_run_id,
+             input_json, now, now),
+        )
+    except sqlite3.IntegrityError as exc:
+        row = conn.execute(
+            """SELECT * FROM box_attempts_v1
+               WHERE id=? OR (run_id=? AND box_id=? AND ordinal=?)""",
+            (attempt_id, run_id, box_id, int(ordinal)),
+        ).fetchone()
+        if row:
+            existing = dict(row)
+            if all(existing[key] == value for key, value in expected.items()):
+                return existing
+            raise GraphStoreConflict(
+                "box attempt identity already exists with different content"
+            ) from exc
+        raise GraphStoreIntegrityError(f"invalid box attempt: {attempt_id}") from exc
+    return _graph_row(conn, "box_attempts_v1", "id", attempt_id)  # type: ignore[return-value]
+
+
+def update_box_attempt_v1(
+    attempt_id: str, *, expected_state: str, state: str,
+    executor_run_id: int | None | object = _GRAPH_UNSET,
+    output_work: str | None | object = _GRAPH_UNSET,
+    result: str | None | object = _GRAPH_UNSET,
+    technical_failure: str | None | object = _GRAPH_UNSET,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return update_box_attempt_v1(
+                attempt_id, expected_state=expected_state, state=state,
+                executor_run_id=executor_run_id, output_work=output_work,
+                result=result, technical_failure=technical_failure, conn=db,
+            )
+    current = _graph_row(conn, "box_attempts_v1", "id", attempt_id)
+    if current is None or current["state"] != expected_state:
+        actual = current["state"] if current else "missing"
+        raise GraphStoreConflict(
+            f"box attempt state mismatch: expected {expected_state}, found {actual}"
+        )
+    values = {
+        "executor_run_id": current["executor_run_id"] if executor_run_id is _GRAPH_UNSET else executor_run_id,
+        "output_work": current["output_work"] if output_work is _GRAPH_UNSET else output_work,
+        "result": current["result"] if result is _GRAPH_UNSET else result,
+        "technical_failure": (
+            current["technical_failure"]
+            if technical_failure is _GRAPH_UNSET else technical_failure
+        ),
+    }
+    if state == "completed":
+        completion_result = values["result"]
+        if not isinstance(completion_result, str) or not completion_result:
+            raise GraphStoreIntegrityError("completed box attempt requires a result")
+        recipe = _graph_recipe_for_run(conn, current["run_id"])
+        if (
+            not recipe.is_end(current["box_id"])
+            and not recipe.destinations(current["box_id"], completion_result)
+        ):
+            raise GraphStoreIntegrityError(
+                "box attempt result is not declared by frozen recipe"
+            )
+    now = _now()
+    finished_at = now if state in _BOX_TERMINAL_STATES else None
+    updated = conn.execute(
+        """UPDATE box_attempts_v1
+           SET state=?,executor_run_id=?,output_work=?,result=?,technical_failure=?,
+               updated_at=?,finished_at=?
+           WHERE id=? AND state=?""",
+        (state, values["executor_run_id"], values["output_work"], values["result"],
+         values["technical_failure"], now, finished_at, attempt_id, expected_state),
+    ).rowcount
+    if updated != 1:
+        raise GraphStoreConflict("box attempt state changed concurrently")
+    return _graph_row(conn, "box_attempts_v1", "id", attempt_id)  # type: ignore[return-value]
+
+
+def insert_route_token_v1(
+    *, token_id: str, run_id: str, source_attempt_id: str | None,
+    arrow_index: int | None, destination_box_id: str, lineage: Any,
+    work_refs: Any, conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return insert_route_token_v1(
+                token_id=token_id, run_id=run_id,
+                source_attempt_id=source_attempt_id, arrow_index=arrow_index,
+                destination_box_id=destination_box_id, lineage=lineage,
+                work_refs=work_refs, conn=db,
+            )
+    lineage_json = _graph_json(lineage)
+    work_refs_json = _graph_json(work_refs)
+    recipe = _graph_recipe_for_run(conn, run_id)
+    if (source_attempt_id is None) != (arrow_index is None):
+        raise GraphStoreIntegrityError(
+            "route token source_attempt_id and arrow_index must both be null or non-null"
+        )
+    if source_attempt_id is None:
+        if destination_box_id != recipe.start:
+            raise GraphStoreIntegrityError("root route token must target the recipe start box")
+    else:
+        source = conn.execute(
+            """SELECT box_id,result,state FROM box_attempts_v1
+               WHERE id=? AND run_id=?""",
+            (source_attempt_id, run_id),
+        ).fetchone()
+        if source is None:
+            raise GraphStoreIntegrityError("route token source attempt does not exist in run")
+        assert arrow_index is not None
+        if arrow_index < 0 or arrow_index >= len(recipe.arrows):
+            raise GraphStoreIntegrityError("route token arrow_index is outside recipe")
+        arrow = recipe.arrows[arrow_index]
+        destinations = arrow["to"]
+        assert isinstance(destinations, tuple)
+        if (
+            source["state"] != "completed"
+            or arrow["from"] != source["box_id"]
+            or arrow["result"] != source["result"]
+            or destination_box_id not in destinations
+        ):
+            raise GraphStoreIntegrityError(
+                "route token source, arrow, and destination do not match recipe"
+            )
+    existing = _graph_row(conn, "route_tokens_v1", "id", token_id)
+    if existing is None:
+        row = conn.execute(
+            """SELECT * FROM route_tokens_v1
+               WHERE run_id=? AND source_attempt_id IS ? AND arrow_index IS ?
+                 AND destination_box_id=?""",
+            (run_id, source_attempt_id, arrow_index, destination_box_id),
+        ).fetchone()
+        existing = dict(row) if row else None
+    expected = {
+        "run_id": run_id, "source_attempt_id": source_attempt_id,
+        "arrow_index": arrow_index, "destination_box_id": destination_box_id,
+        "lineage_json": lineage_json, "work_refs_json": work_refs_json,
+    }
+    if existing:
+        if all(existing[key] == value for key, value in expected.items()):
+            return existing
+        raise GraphStoreConflict("route token already exists with different content")
+    now = _now()
+    try:
+        conn.execute(
+            """INSERT INTO route_tokens_v1(
+                id,run_id,source_attempt_id,arrow_index,destination_box_id,
+                lineage_json,work_refs_json,state,created_at
+            ) VALUES(?,?,?,?,?,?,?,'pending',?)""",
+            (token_id, run_id, source_attempt_id, arrow_index, destination_box_id,
+             lineage_json, work_refs_json, now),
+        )
+    except sqlite3.IntegrityError as exc:
+        row = conn.execute(
+            """SELECT * FROM route_tokens_v1
+               WHERE id=? OR (
+                   run_id=? AND source_attempt_id IS ? AND arrow_index IS ?
+                   AND destination_box_id=?
+               )""",
+            (token_id, run_id, source_attempt_id, arrow_index, destination_box_id),
+        ).fetchone()
+        if row:
+            existing = dict(row)
+            if all(existing[key] == value for key, value in expected.items()):
+                return existing
+            raise GraphStoreConflict(
+                "route token already exists with different content"
+            ) from exc
+        raise GraphStoreIntegrityError(f"invalid route token: {token_id}") from exc
+    return _graph_row(conn, "route_tokens_v1", "id", token_id)  # type: ignore[return-value]
+
+
+def consume_route_tokens_v1(
+    *, run_id: str, destination_box_id: str, token_ids: list[str] | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return consume_route_tokens_v1(
+                run_id=run_id, destination_box_id=destination_box_id,
+                token_ids=token_ids, conn=db,
+            )
+    params: list[Any] = [run_id, destination_box_id]
+    token_filter = ""
+    if token_ids is not None:
+        if not token_ids:
+            return []
+        unique_ids = list(dict.fromkeys(token_ids))
+        if len(unique_ids) != len(token_ids):
+            raise GraphStoreConflict("route token request contains duplicate ids")
+        requested = _rows(conn.execute(
+            f"SELECT * FROM route_tokens_v1 WHERE id IN "
+            f"({','.join('?' for _ in unique_ids)})",
+            unique_ids,
+        ))
+        if len(requested) != len(unique_ids) or any(
+            row["run_id"] != run_id
+            or row["destination_box_id"] != destination_box_id
+            or row["state"] != "pending"
+            for row in requested
+        ):
+            raise GraphStoreConflict(
+                "requested route tokens are missing, consumed, or bound elsewhere"
+            )
+        token_filter = f" AND id IN ({','.join('?' for _ in unique_ids)})"
+        params.extend(unique_ids)
+    rows = _rows(conn.execute(
+        "SELECT * FROM route_tokens_v1 WHERE run_id=? AND destination_box_id=? "
+        f"AND state='pending'{token_filter} ORDER BY created_at,id",
+        params,
+    ))
+    if not rows:
+        return []
+    now = _now()
+    ids = [row["id"] for row in rows]
+    updated = conn.execute(
+        f"UPDATE route_tokens_v1 SET state='consumed',consumed_at=? "
+        f"WHERE state='pending' AND id IN ({','.join('?' for _ in ids)})",
+        [now, *ids],
+    ).rowcount
+    if updated != len(ids):
+        raise GraphStoreConflict("route tokens changed concurrently")
+    return _rows(conn.execute(
+        f"SELECT * FROM route_tokens_v1 WHERE id IN ({','.join('?' for _ in ids)}) "
+        "ORDER BY created_at,id",
+        ids,
+    ))
+
+
+def enqueue_run_event_v1(
+    *, key: str, run_id: str, source: str, payload: Any,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return enqueue_run_event_v1(
+                key=key, run_id=run_id, source=source, payload=payload, conn=db,
+            )
+    payload_json = _graph_json(payload)
+    existing = _graph_row(conn, "run_events_v1", "key", key)
+    if existing:
+        if (
+            existing["run_id"] == run_id
+            and existing["source"] == source
+            and existing["payload_json"] == payload_json
+        ):
+            return existing
+        raise GraphStoreConflict("run event key already exists with different content")
+    try:
+        conn.execute(
+            """INSERT INTO run_events_v1(
+                key,run_id,source,payload_json,state,created_at
+            ) VALUES(?,?,?,?,'pending',?)""",
+            (key, run_id, source, payload_json, _now()),
+        )
+    except sqlite3.IntegrityError as exc:
+        existing = _graph_row(conn, "run_events_v1", "key", key)
+        if existing:
+            if (
+                existing["run_id"] == run_id
+                and existing["source"] == source
+                and existing["payload_json"] == payload_json
+            ):
+                return existing
+            raise GraphStoreConflict(
+                "run event key already exists with different content"
+            ) from exc
+        raise GraphStoreIntegrityError(f"invalid run event: {key}") from exc
+    return _graph_row(conn, "run_events_v1", "key", key)  # type: ignore[return-value]
+
+
+def _graph_normalize_time(value: str) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _graph_lease_deadline(now: str, lease_seconds: int) -> str:
+    parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (
+        parsed.astimezone(timezone.utc)
+        + timedelta(seconds=max(1, int(lease_seconds)))
+    ).isoformat()
+
+
+def lease_run_events_v1(
+    *, owner: str, limit: int = 10, lease_seconds: int = 60,
+    now: str | None = None, run_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return lease_run_events_v1(
+                owner=owner, limit=limit, lease_seconds=lease_seconds,
+                now=now, run_id=run_id, conn=db,
+            )
+    now = _graph_normalize_time(now or _now())
+    lease_until = _graph_lease_deadline(now, lease_seconds)
+    conn.execute(
+        """UPDATE run_events_v1
+           SET state='pending',lease_owner=NULL,lease_until=NULL
+           WHERE state='leased' AND lease_until<=?""",
+        (now,),
+    )
+    where = "state='pending'"
+    params: list[Any] = []
+    if run_id is not None:
+        where += " AND run_id=?"
+        params.append(run_id)
+    params.append(max(1, min(int(limit), 1000)))
+    keys = [
+        row["key"] for row in conn.execute(
+            f"SELECT key FROM run_events_v1 WHERE {where} ORDER BY created_at,key LIMIT ?",
+            params,
+        )
+    ]
+    if not keys:
+        return []
+    updated = conn.execute(
+        f"""UPDATE run_events_v1
+            SET state='leased',lease_owner=?,lease_until=?,attempt_count=attempt_count+1
+            WHERE state='pending' AND key IN ({','.join('?' for _ in keys)})""",
+        [owner, lease_until, *keys],
+    ).rowcount
+    if updated != len(keys):
+        raise GraphStoreConflict("run event lease changed concurrently")
+    return _rows(conn.execute(
+        f"SELECT * FROM run_events_v1 WHERE key IN ({','.join('?' for _ in keys)}) "
+        "ORDER BY created_at,key",
+        keys,
+    ))
+
+
+def finish_run_event_v1(
+    key: str, *, owner: str, expected_attempt_count: int, state: str,
+    outcome: str | None = None, error: str | None = None, now: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if state not in _EVENT_TERMINAL_STATES:
+        raise ValueError(f"invalid terminal run event state: {state}")
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return finish_run_event_v1(
+                key, owner=owner, expected_attempt_count=expected_attempt_count,
+                state=state, outcome=outcome, error=error, now=now, conn=db,
+            )
+    applied_at = _graph_normalize_time(now or _now())
+    updated = conn.execute(
+        """UPDATE run_events_v1
+           SET state=?,lease_owner=NULL,lease_until=NULL,outcome=?,last_error=?,applied_at=?
+           WHERE key=? AND state='leased' AND lease_owner=?
+             AND attempt_count=? AND lease_until>?""",
+        (state, outcome, error, applied_at, key, owner,
+         int(expected_attempt_count), applied_at),
+    ).rowcount
+    if updated != 1:
+        raise GraphStoreConflict(f"run event lease is not owned by {owner!r}: {key}")
+    return _graph_row(conn, "run_events_v1", "key", key)  # type: ignore[return-value]
+
+
+def record_human_box_decision_v1(
+    *, decision_id: str, attempt_id: str, result: str, actor_kind: str,
+    actor_id: str, channel: str, nonce_hash: str, event_key: str,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return record_human_box_decision_v1(
+                decision_id=decision_id, attempt_id=attempt_id, result=result,
+                actor_kind=actor_kind, actor_id=actor_id, channel=channel,
+                nonce_hash=nonce_hash, event_key=event_key, conn=db,
+            )
+    binding = conn.execute(
+        """SELECT a.run_id AS attempt_run_id,a.box_id AS box_id,
+                  e.run_id AS event_run_id
+           FROM box_attempts_v1 a CROSS JOIN run_events_v1 e
+           WHERE a.id=? AND e.key=?""",
+        (attempt_id, event_key),
+    ).fetchone()
+    if binding is None:
+        raise GraphStoreIntegrityError("human decision attempt or event does not exist")
+    if binding["attempt_run_id"] != binding["event_run_id"]:
+        raise GraphStoreIntegrityError(
+            "human decision attempt and event are not in the same run"
+        )
+    recipe = _graph_recipe_for_run(conn, binding["attempt_run_id"])
+    box = recipe.box(binding["box_id"])
+    if box["who"] != "human":
+        raise GraphStoreIntegrityError("human decision attempt is not a human box")
+    if not recipe.destinations(binding["box_id"], result):
+        raise GraphStoreIntegrityError("human decision result is not declared by recipe")
+    rows = _rows(conn.execute(
+        """SELECT * FROM human_box_decisions_v1
+           WHERE attempt_id=? OR nonce_hash=? OR event_key=?""",
+        (attempt_id, nonce_hash, event_key),
+    ))
+    expected = {
+        "attempt_id": attempt_id, "result": result, "actor_kind": actor_kind,
+        "actor_id": actor_id, "channel": channel, "nonce_hash": nonce_hash,
+        "event_key": event_key,
+    }
+    if rows:
+        if len(rows) == 1 and all(rows[0][key] == value for key, value in expected.items()):
+            return rows[0]
+        raise GraphStoreConflict("human decision replay conflicts with durable decision")
+    try:
+        conn.execute(
+            """INSERT INTO human_box_decisions_v1(
+                id,attempt_id,result,actor_kind,actor_id,channel,nonce_hash,created_at,event_key
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (decision_id, attempt_id, result, actor_kind, actor_id, channel,
+             nonce_hash, _now(), event_key),
+        )
+    except sqlite3.IntegrityError as exc:
+        rows = _rows(conn.execute(
+            """SELECT * FROM human_box_decisions_v1
+               WHERE id=? OR attempt_id=? OR nonce_hash=? OR event_key=?""",
+            (decision_id, attempt_id, nonce_hash, event_key),
+        ))
+        if len(rows) == 1 and all(
+            rows[0][key] == value for key, value in expected.items()
+        ):
+            return rows[0]
+        if rows:
+            raise GraphStoreConflict(
+                "human decision replay conflicts with durable decision"
+            ) from exc
+        raise GraphStoreIntegrityError("invalid human decision") from exc
+    return _graph_row(conn, "human_box_decisions_v1", "id", decision_id)  # type: ignore[return-value]
+
+
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "load_project_recipe_policy", "save_project_recipe_policy", "project_flight", "project_flight_by_idempotency_key", "project_flight_by_linear_issue_id", "project_rollup", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert", "GraphStoreConflict", "GraphStoreIntegrityError", "create_recipe_run_v1", "get_recipe_run_v1", "list_recipe_runs_v1", "insert_box_attempt_v1", "update_box_attempt_v1", "insert_route_token_v1", "consume_route_tokens_v1", "enqueue_run_event_v1", "lease_run_events_v1", "finish_run_event_v1", "record_human_box_decision_v1"]
