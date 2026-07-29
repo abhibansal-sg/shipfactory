@@ -133,3 +133,15 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Governing shorthand: **model boxes run; human boxes wait**.
 - Rejected alternatives: a separate visible approval-gate grammar; allowing a
   model verdict to stand in for the operator; automatic timeout approval.
+
+## D-008 · One request enters one starting box (2026-07-28)
+
+- Every recipe names one starting box. Starting the recipe passes the submitted
+  work request into that box.
+- The recipe does not care whether the request came from an operator button, a
+  Linear issue, a schedule, a webhook, or another system. Those are submission
+  methods outside the recipe grammar.
+- Governing shorthand: **a recipe starts when it receives work**.
+- Rejected alternatives: different recipe-start primitives for each external
+  source; source-specific workflow structures; several implicit starting boxes
+  whose activation cannot be read from the graph.
