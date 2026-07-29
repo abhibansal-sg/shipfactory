@@ -204,3 +204,15 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: mutating active runs when a recipe changes; forcing
   all edits through a complex manual publication lifecycle; cloning whole
   recipes by hand merely to preserve running history.
+
+## D-013 · Projects own runs and choose attached recipes (2026-07-28)
+
+- Every project has one main orchestrator responsible for its work.
+- A project may have several attached recipes for different kinds of work.
+  Starting work means the project's orchestrator chooses one attached recipe
+  and submits the request to its starting box.
+- Every resulting run belongs to that project. Failures and exhausted rework
+  loops report to that same project's main orchestrator under D-010 and D-011.
+- Governing shorthand: **project owns the work; recipe controls the flow**.
+- Rejected alternatives: one project per recipe; one universal recipe for all
+  kinds of work; runs with no owning project or responsible orchestrator.
