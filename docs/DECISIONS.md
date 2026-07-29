@@ -106,3 +106,17 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: engine-specific verdict protocols for each kind of
   work; deriving routes by parsing arbitrary prose; separate completion rules
   for planners, builders, and reviewers.
+
+## D-006 · Split freely; join active paths (2026-07-28)
+
+- When one result points to several next boxes, ShipFactory starts all of them
+  together. Parallel work needs no separate recipe primitive.
+- When those paths meet at one box, that box waits until every path started by
+  the split has finished, then receives their combined work.
+- ShipFactory tracks only paths that were actually activated. A branch that
+  was not selected cannot hold a later join open.
+- Governing shorthand: **a split starts many; a join waits for every active
+  line**.
+- Rejected alternatives: dedicated fan-out, collector, and synthesis
+  primitives; fixed global dependencies that wait for paths a branch never
+  started; requiring recipe authors to coordinate parallel completion by hand.
