@@ -1,0 +1,94 @@
+name: plan-build-review
+start: planner
+
+boxes:
+  - id: planner
+    name: Plan the work
+    who: planner
+    instructions: Understand the request and produce a clear plan.
+
+  - id: plan-review
+    name: Review the plan
+    who: plan-reviewer
+    instructions: Check whether the plan is clear, complete, and suitable to execute.
+
+  - id: builder
+    name: Do the work
+    who: builder
+    instructions: Execute the approved plan and produce the requested work.
+
+  - id: correctness-review
+    name: Check correctness
+    who: correctness-reviewer
+    instructions: Review the completed work for correctness and report findings.
+
+  - id: risk-review
+    name: Check risk
+    who: risk-reviewer
+    instructions: Review the completed work for important risks and report findings.
+
+  - id: simplicity-review
+    name: Check simplicity
+    who: simplicity-reviewer
+    instructions: Review the completed work for unnecessary complexity and report findings.
+
+  - id: synthesize
+    name: Combine the reviews
+    who: lead-reviewer
+    instructions: Combine all active review findings and decide whether the work passes or needs correction.
+
+  - id: human-approval
+    name: Human approval
+    who: human
+    instructions: Review the completed work and combined review before approving or rejecting it.
+
+  - id: final-delivery
+    name: Deliver the work
+    who: main-orchestrator
+    instructions: Deliver the approved work and report completion to the project.
+    end: true
+
+arrows:
+  - from: planner
+    result: done
+    to: [plan-review]
+
+  - from: plan-review
+    result: approved
+    to: [builder]
+
+  - from: plan-review
+    result: revise
+    to: [planner]
+
+  - from: builder
+    result: done
+    to: [correctness-review, risk-review, simplicity-review]
+
+  - from: correctness-review
+    result: done
+    to: [synthesize]
+
+  - from: risk-review
+    result: done
+    to: [synthesize]
+
+  - from: simplicity-review
+    result: done
+    to: [synthesize]
+
+  - from: synthesize
+    result: pass
+    to: [human-approval]
+
+  - from: synthesize
+    result: rework
+    to: [builder]
+
+  - from: human-approval
+    result: approved
+    to: [final-delivery]
+
+  - from: human-approval
+    result: rejected
+    to: [builder]
