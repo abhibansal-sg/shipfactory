@@ -189,3 +189,18 @@ closed unless explicitly reopened. Reference these before proposing structure.
 - Rejected alternatives: unlimited model-review loops; treating reviewer
   rejection as a technical crash; interrupting the orchestrator on the first
   ordinary correction round.
+
+## D-012 · Editable recipes; frozen running copies (2026-07-28)
+
+- Recipes remain directly editable. Operators do not manage a separate maze of
+  draft, publish, attach, and migration states merely to change future work.
+- When a run starts, ShipFactory stores the exact recipe structure used by that
+  run. The running copy never changes underneath active work.
+- Editing the recipe affects only later runs. Existing runs continue on their
+  frozen copy, and their history remains readable against that exact structure.
+- Version identity may be generated automatically for audit and display; it is
+  not a second workflow the operator must manage.
+- Governing shorthand: **edit the recipe; freeze each run**.
+- Rejected alternatives: mutating active runs when a recipe changes; forcing
+  all edits through a complex manual publication lifecycle; cloning whole
+  recipes by hand merely to preserve running history.
