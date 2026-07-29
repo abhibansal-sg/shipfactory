@@ -187,6 +187,64 @@ def test_migration_17_checksum_drift_fails_closed(tmp_path, monkeypatch):
         store.init_db()
 
 
+def test_migration_18_preserves_runs_and_allows_only_nonterminal_escalated(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    migrations = store._MIGRATIONS
+    monkeypatch.setattr(
+        store,
+        "_MIGRATIONS",
+        tuple(item for item in migrations if item[0] <= 17),
+    )
+    store.init_db()
+    with store._connect() as db:
+        _insert_run(db, "preserved-run", "preserved-launch")
+        _insert_attempt(db, "preserved-attempt", "preserved-run")
+        before = dict(db.execute(
+            "SELECT * FROM recipe_runs_v1 WHERE id='preserved-run'",
+        ).fetchone())
+
+    monkeypatch.setattr(store, "_MIGRATIONS", migrations)
+    store.init_db()
+
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT MAX(version) FROM schema_migrations",
+        ).fetchone()[0] == 18
+        assert dict(db.execute(
+            "SELECT * FROM recipe_runs_v1 WHERE id='preserved-run'",
+        ).fetchone()) == before
+        assert db.execute(
+            "SELECT run_id FROM box_attempts_v1 WHERE id='preserved-attempt'",
+        ).fetchone()[0] == "preserved-run"
+        assert [
+            row["name"]
+            for row in db.execute("PRAGMA index_info(idx_recipe_runs_v1_active)")
+        ] == ["state", "updated_at"]
+
+        db.execute(
+            """INSERT INTO recipe_runs_v1(
+                id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,
+                request_text,launch_key,state,blocked_reason,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "escalated-run", "project", "board", "recipe", "b" * 64, "{}",
+                "request", "escalated-launch", "escalated", "{}", "now", "now",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                """UPDATE recipe_runs_v1
+                   SET completed_at='now' WHERE id='escalated-run'"""
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                """UPDATE recipe_runs_v1
+                   SET state='unknown' WHERE id='escalated-run'"""
+            )
+
+
 def _insert_run(db, run_id: str, launch_key: str) -> None:
     db.execute(
         """INSERT INTO recipe_runs_v1(

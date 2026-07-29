@@ -557,6 +557,48 @@ END""",
 _GRAPH_RUNNER_V1_MIGRATION_TEXT = (
     ";\n".join(_GRAPH_RUNNER_V1_MIGRATION_STATEMENTS) + ";\n"
 )
+_GRAPH_RUNNER_ESCALATED_MIGRATION_STATEMENTS = (
+    "PRAGMA defer_foreign_keys=ON",
+    """CREATE TABLE recipe_runs_v1_next (
+  id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  board TEXT NOT NULL,
+  recipe_name TEXT NOT NULL,
+  recipe_hash TEXT NOT NULL CHECK(
+    typeof(recipe_hash)='text'
+    AND length(recipe_hash)=64
+    AND recipe_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  recipe_snapshot_json TEXT NOT NULL CHECK(json_valid(recipe_snapshot_json)),
+  request_text TEXT NOT NULL,
+  workspace_path TEXT,
+  launch_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('running','paused','escalated','completed','failed')),
+  blocked_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  CHECK(
+    (state IN ('completed','failed') AND completed_at IS NOT NULL)
+    OR (state IN ('running','paused','escalated') AND completed_at IS NULL)
+  )
+)""",
+    """INSERT INTO recipe_runs_v1_next(
+  id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,request_text,
+  workspace_path,launch_key,state,blocked_reason,created_at,updated_at,completed_at
+)
+SELECT
+  id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,request_text,
+  workspace_path,launch_key,state,blocked_reason,created_at,updated_at,completed_at
+FROM recipe_runs_v1""",
+    "DROP TABLE recipe_runs_v1",
+    "ALTER TABLE recipe_runs_v1_next RENAME TO recipe_runs_v1",
+    "CREATE INDEX idx_recipe_runs_v1_active ON recipe_runs_v1(state,updated_at DESC)",
+    "PRAGMA defer_foreign_keys=OFF",
+)
+_GRAPH_RUNNER_ESCALATED_MIGRATION_TEXT = (
+    ";\n".join(_GRAPH_RUNNER_ESCALATED_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -575,6 +617,7 @@ _MIGRATIONS = (
     (15, "sf17_containment_overlay", _CONTAINMENT_OVERLAY_MIGRATION_TEXT),
     (16, "sf18_project_recipe_policy_and_flight_identity", _PROJECT_RECIPE_POLICY_MIGRATION_TEXT),
     (17, "graphrunner_v1_durable_state", _GRAPH_RUNNER_V1_MIGRATION_TEXT),
+    (18, "graphrunner_v1_escalated_runs", _GRAPH_RUNNER_ESCALATED_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -594,6 +637,7 @@ _MIGRATION_STATEMENTS = {
     15: _CONTAINMENT_OVERLAY_MIGRATION_STATEMENTS,
     16: _PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS,
     17: _GRAPH_RUNNER_V1_MIGRATION_STATEMENTS,
+    18: _GRAPH_RUNNER_ESCALATED_MIGRATION_STATEMENTS,
 }
 
 
@@ -881,6 +925,18 @@ def init_db() -> None:
                         graph_tables & existing_tables
                         or graph_indexes & indexes
                         or graph_triggers & triggers
+                    )
+                elif version == 18:
+                    run_schema = conn.execute(
+                        """SELECT sql FROM sqlite_master
+                           WHERE type='table' AND name='recipe_runs_v1'"""
+                    ).fetchone()
+                    migration_artifacts = bool(
+                        "recipe_runs_v1_next" in existing_tables
+                        or (
+                            run_schema is not None
+                            and "'escalated'" in str(run_schema["sql"])
+                        )
                     )
                 if migration_artifacts:
                     raise RuntimeError(f"schema migration {version} is partially applied")
