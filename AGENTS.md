@@ -911,6 +911,21 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   The launch boundary now opens the project's primary Git workspace, derives
   the exact base SHA there, and passes it explicitly into instantiation.
 
+- A shared adapter must consume the required fields of its target record
+  directly (finding #124). `_spawn_target` received a durable `seat_name` for
+  both legacy tasks and graph boxes but used
+  `target.get("seat_name", seat.name)`; Python eagerly evaluated the fallback
+  and crashed valid legacy seat doubles that deliberately expose no `name`.
+  Required adapter metadata is now indexed directly, preserving the legacy
+  launch contract while keeping graph and legacy targets on one core path.
+- Per-board daemon isolation must include event leasing, not only reconciliation
+  and spawn queries (finding #125). The first GraphRunner composition filtered
+  ready attempts and active Runs by board but called global `apply_events`, so a
+  tick for board A could consume a pending human/completion event for board B
+  and report its failure against the wrong board. `apply_events` now accepts a
+  Run filter, and the daemon aggregates only its current board's Runs within
+  the original bounded event budget.
+
 ## Conventions
 
 - Git author: `Abhinav Bansal <abhibansal-sg@users.noreply.github.com>`.

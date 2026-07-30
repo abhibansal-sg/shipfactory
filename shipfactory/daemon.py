@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import inspect
 import json
 import os
@@ -276,6 +277,51 @@ def _requeue_capacity_claim(conn: Any, task: Any) -> bool:
     return True
 
 
+def _tick_graph_v1(*, board: str | None, max_workers: int) -> dict[str, Any]:
+    """Apply, reconcile, and dispatch GraphRunner v1 work for one board."""
+    from shipfactory import graph_runner, graph_runtime, store
+
+    store.init_db()
+    owner_material = str(board or "all").encode("utf-8")
+    owner = f"graph-daemon-{hashlib.sha256(owner_material).hexdigest()[:32]}"
+    with store._connect() as db:
+        if board is None:
+            run_rows = db.execute(
+                "SELECT id FROM recipe_runs_v1 WHERE state='running' ORDER BY created_at,id"
+            ).fetchall()
+        else:
+            run_rows = db.execute(
+                """SELECT id FROM recipe_runs_v1
+                   WHERE state='running' AND board=? ORDER BY created_at,id""",
+                (board,),
+            ).fetchall()
+
+    events = {"leased": 0, "applied": 0, "discarded": 0, "failed": 0}
+    remaining_event_budget = 100
+    for row in run_rows:
+        if remaining_event_budget <= 0:
+            break
+        run_events = graph_runner.apply_events(
+            owner=owner,
+            limit=remaining_event_budget,
+            run_id=row["id"],
+        )
+        for key in events:
+            events[key] += run_events[key]
+        remaining_event_budget -= run_events["leased"]
+
+    reconciled: list[dict[str, Any]] = []
+    with store._connect() as db:
+        for row in run_rows:
+            run_id = str(row["id"])
+            reconciled.append({
+                "run_id": run_id,
+                "result": graph_runner.reconcile_run(db, run_id),
+            })
+    spawned = graph_runtime.spawn_ready(max_workers, board=board)
+    return {"events": events, "reconciled": reconciled, "spawned": spawned}
+
+
 def tick(conn, *, board: str | None = None, sync: bool = False,
          require_recipes: bool = False) -> dict[str, Any]:
     """Run one dispatch, reaping, watchdog, and optional GitHub-sync cycle."""
@@ -293,6 +339,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     result_recipes = None
     result_selector = None
     result_environments = None
+    result_graph = None
     cfg = validate_recipe_mode(required=require_recipes)
     max_workers = 2
     if cfg is not None:
@@ -305,6 +352,28 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
         restore = getattr(spawn_module, "restore_running", None)
         if restore is not None:
             restore(max_workers=max_workers)
+        # Finding #23 tick-order race: reap exited harnesses BEFORE dispatch_once,
+        # whose claim watchdog otherwise sees a dead pid with an unfinalized task
+        # and records a protocol violation — burning the failure fuse on workers
+        # that completed perfectly. Reaping first finalizes their kanban state.
+        # GraphRunner must observe executor exits before applying their durable
+        # completion events or creating successor attempts. Legacy dispatch
+        # remains after this entire v1 sequence.
+        reaped = reap_finished()
+        graph_board = board or cfg.company
+        try:
+            result_graph = _tick_graph_v1(
+                board=graph_board, max_workers=max_workers,
+            )
+        except Exception as exc:
+            logger.error(
+                "GraphRunner v1 tick failed for board %s: %s",
+                graph_board, exc, exc_info=True,
+            )
+            result_graph = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
         # Environment sessions (SF-8) are reaped every cycle like any other
         # supervised child — never run their bootstrap/app-up synchronously
         # here. Lane C modules are optional at plugin import time.
@@ -356,11 +425,8 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                 result_selector = run_stage(conn, board or cfg.company)
             else:
                 result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
-    # Finding #23 tick-order race: reap exited harnesses BEFORE dispatch_once,
-    # whose claim watchdog otherwise sees a dead pid with an unfinalized task
-    # and records a protocol violation — burning the failure fuse on workers
-    # that completed perfectly. Reaping first finalizes their kanban state.
-    reaped = reap_finished()
+    else:
+        reaped = reap_finished()
     if cfg is not None and hasattr(conn, "execute"):
         from shipfactory import store
         available = store.available_resource_units("worker_slot", max_workers)
@@ -458,6 +524,8 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     reaped += reap_finished()
     _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
+    if result_graph is not None:
+        result["graph"] = result_graph
     if result_recipes is not None:
         result["recipes"] = result_recipes
     if result_selector is not None:

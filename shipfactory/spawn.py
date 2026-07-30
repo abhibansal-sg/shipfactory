@@ -19,6 +19,11 @@ from shipfactory.executors import get_executor
 
 _RESULT_RE = re.compile(r"^SHIPFACTORY_RESULT:\s*(done|blocked)\s+(.+?)\s*$", re.I)
 _VERDICT_RE = re.compile(r"^SHIPFACTORY_VERDICT:\s*\{.*\}\s*$")
+_GRAPH_LABEL_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_GRAPH_SENTINEL_RE = re.compile(r"^SHIPFACTORY_RESULT: (.+)$")
+_PYTHON_LINE_TERMINATORS = (
+    "\r\n", "\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029",
+)
 _RUNNING: dict[int, dict[str, Any]] = {}
 _WORKER_LEASE_SECONDS = 300
 _START_TOKEN_OBSERVATION_SECONDS = 2.0
@@ -513,6 +518,176 @@ def _align_recipe_workspace_base(task_id: str, root: Path) -> None:
         )
 
 
+def _spawn_target(target: dict[str, Any], *, seat: Any, cfg: Any) -> int:
+    """Launch one durable legacy-task or graph-box executor target."""
+    store = _store_module()
+    target_kind = str(target["target_kind"])
+    target_id = target["target_id"]
+    board = target.get("board")
+    root = Path(target["workspace_path"])
+    executor = get_executor(seat.executor)
+    log_path = Path(target["log_path"])
+    prompt_path = Path(target["prompt_path"])
+    prompt = str(target["prompt"])
+    run_kwargs = {
+        "board": board,
+        "workspace_path": str(root),
+        "log_path": str(log_path),
+        "prompt_path": str(prompt_path),
+        "provider": seat.executor,
+        "resolved_model": seat.model or "",
+        "executor_version": str(getattr(executor, "version", "1")),
+        "task_attempt_id": target.get("task_attempt_id"),
+        "access_enforcement_level": target.get(
+            "access_enforcement_level", "not_applicable",
+        ),
+        "recipe_activation": target.get("recipe_activation"),
+    }
+    try:
+        run_id = store.record_run_start(
+            target_id, str(target["seat_name"]), seat.executor,
+            seat.model, None, **run_kwargs,
+        )
+    except TypeError:  # isolated legacy test doubles
+        run_id = store.record_run_start(
+            target_id, str(target["seat_name"]), seat.executor,
+            seat.model, None,
+        )
+    lease_key = f"worker_slot:run:{run_id}"
+    if hasattr(store, "acquire_resource_lease"):
+        acquired = store.acquire_resource_lease(
+            "worker_slot",
+            int(target.get("max_workers") or _runtime_max_workers(cfg)),
+            key=lease_key,
+            lease_seconds=_WORKER_LEASE_SECONDS,
+            metadata={
+                "run_id": run_id, "task_id": target_id, "board": board,
+                **({"target_kind": target_kind} if target_kind == "graph_box" else {}),
+            },
+        )
+        if acquired is None:
+            try:
+                store.record_run_end(
+                    run_id, -1, None, None, 0.0, "capacity_refused",
+                )
+            except Exception:
+                logger.exception(
+                    "Factory could not record capacity refusal for run %s", run_id,
+                )
+            raise WorkerCapacityExhausted("worker_slot capacity exhausted")
+
+    proc: Any
+    pid: int | None = None
+    bound = False
+    try:
+        bind_run = target.get("bind_run")
+        if callable(bind_run):
+            bind_run(int(run_id))
+            bound = True
+        if target_kind == "legacy_task" and seat.executor == "hermes":
+            from hermes_cli import kanban_db
+            pid = int(kanban_db._default_spawn(
+                target["task"], str(root), board=board,
+            ))
+            token = _capture_start_token(pid)
+            proc = _AdoptedProcess(pid, token)
+        else:
+            command = executor.build_cmd(seat, prompt, str(root))
+            override = os.environ.get(
+                f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()}",
+            )
+            if override:
+                command = shlex.split(override)
+                if not command:
+                    raise ValueError(
+                        f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()} is empty",
+                    )
+            env = _worker_environment(root, board=board, task_id=str(target_id))
+            log_file = log_path.open("wb")
+            prompt_file = prompt_path.open("rb")
+            try:
+                proc = subprocess.Popen(
+                    command, cwd=str(root), stdin=prompt_file, stdout=log_file,
+                    stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                )
+            finally:
+                prompt_file.close()
+                log_file.close()
+            pid = int(proc.pid)
+            token = _capture_start_token(pid, proc)
+        if hasattr(store, "record_run_spawned"):
+            store.record_run_spawned(run_id, pid, token)
+        record = {
+            "proc": proc, "run_id": run_id, "target_kind": target_kind,
+            "target_id": target_id, "executor": seat.executor, "board": board,
+            "log_path": log_path, "prompt_path": prompt_path,
+            "workspace_path": root, "process_start_token": token,
+            "lease_key": lease_key, "started": monotonic(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "adopted": target_kind == "legacy_task" and seat.executor == "hermes",
+        }
+        if target_kind == "legacy_task":
+            record.update({
+                "task_id": target_id,
+                "task_attempt_id": target.get("task_attempt_id"),
+            })
+        else:
+            record.update({
+                "attempt_id": target_id,
+                "graph_run_id": str(target["graph_run_id"]),
+            })
+        _RUNNING[pid] = record
+    except Exception as exc:
+        if pid is not None:
+            try:
+                os.killpg(pid, 15)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                terminate = getattr(locals().get("proc"), "terminate", None)
+                if terminate is not None:
+                    try:
+                        terminate()
+                    except Exception:
+                        logger.exception(
+                            "Factory could not terminate failed spawn pid %s", pid,
+                        )
+        terminal_event_durable = not bound
+        if bound and callable(target.get("on_bound_spawn_failure")):
+            try:
+                target["on_bound_spawn_failure"](int(run_id), exc)
+                terminal_event_durable = True
+            except Exception:
+                logger.exception(
+                    "Factory could not enqueue graph spawn failure for run %s",
+                    run_id,
+                )
+        if terminal_event_durable:
+            try:
+                if hasattr(store, "record_run_crashed"):
+                    store.record_run_crashed(run_id, "spawn failed")
+                else:
+                    store.record_run_end(
+                        run_id, -1, None, None, 0.0, "spawn_failed",
+                    )
+            except Exception:
+                logger.exception(
+                    "Factory could not record failed spawn run %s", run_id,
+                )
+        if hasattr(store, "release_resource_lease"):
+            try:
+                store.release_resource_lease(lease_key)
+            except Exception:
+                logger.exception(
+                    "Factory could not release failed spawn lease %s",
+                    lease_key,
+                )
+        if pid is not None:
+            _RUNNING.pop(pid, None)
+        raise
+    return pid
+
+
 def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
     """Spawn the configured harness for a claimed kanban task, or skip unknown seats.
 
@@ -587,110 +762,20 @@ def shipfactory_spawn(task, workspace: str, *, board=None) -> int | None:
         prompt = _worker_prompt(context)
         prompt_path.write_text(prompt, encoding="utf-8")
 
-    run_kwargs = {
+    return _spawn_target({
+        "target_kind": "legacy_task",
+        "target_id": task_id,
+        "seat_name": assignee,
+        "task": task,
         "board": board,
-        "workspace_path": str(root),
-        "log_path": str(log_path),
-        "prompt_path": str(prompt_path),
-        "provider": seat.executor,
-        "resolved_model": seat.model or "",
-        "executor_version": str(getattr(executor, "version", "1")),
+        "workspace_path": root,
+        "log_path": log_path,
+        "prompt_path": prompt_path,
+        "prompt": prompt,
         "task_attempt_id": _value(task, "current_run_id"),
         "access_enforcement_level": enforcement_level,
         "recipe_activation": _step_recipe_activation(str(task_id)),
-    }
-    try:
-        run_id = store.record_run_start(
-            task_id, assignee, seat.executor, seat.model, None, **run_kwargs,
-        )
-    except TypeError:  # isolated legacy test doubles
-        run_id = store.record_run_start(task_id, assignee, seat.executor, seat.model, None)
-    lease_key = f"worker_slot:run:{run_id}"
-    if hasattr(store, "acquire_resource_lease"):
-        acquired = store.acquire_resource_lease(
-            "worker_slot", _runtime_max_workers(cfg), key=lease_key,
-            lease_seconds=_WORKER_LEASE_SECONDS,
-            metadata={"run_id": run_id, "task_id": task_id, "board": board},
-        )
-        if acquired is None:
-            try:
-                store.record_run_end(run_id, -1, None, None, 0.0, "capacity_refused")
-            except Exception:
-                logger.exception("Factory could not record capacity refusal for run %s", run_id)
-            raise WorkerCapacityExhausted("worker_slot capacity exhausted")
-
-    proc: Any
-    pid: int | None = None
-    try:
-        if seat.executor == "hermes":
-            pid = int(kanban_db._default_spawn(task, workspace, board=board))
-            token = _capture_start_token(pid)
-            proc = _AdoptedProcess(pid, token)
-        else:
-            command = executor.build_cmd(seat, prompt, str(root))
-            # #16-V1: permit a real-path test/operator harness override without
-            # replacing Factory modules or faking subprocess execution.
-            override = os.environ.get(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()}")
-            if override:
-                command = shlex.split(override)
-                if not command:
-                    raise ValueError(f"FACTORY_EXECUTOR_CMD_{seat.executor.upper()} is empty")
-            env = _worker_environment(root, board=board, task_id=str(task_id))
-            log_file = log_path.open("wb")
-            prompt_file = prompt_path.open("rb")
-            try:
-                proc = subprocess.Popen(
-                    command, cwd=str(root), stdin=prompt_file, stdout=log_file,
-                    stderr=subprocess.STDOUT, env=env, start_new_session=True,
-                )
-            finally:
-                # The child owns duplicated descriptors after Popen; close ours.
-                prompt_file.close()
-                log_file.close()
-            pid = int(proc.pid)
-            token = _capture_start_token(pid, proc)
-        if hasattr(store, "record_run_spawned"):
-            store.record_run_spawned(run_id, pid, token)
-        _RUNNING[pid] = {
-            "proc": proc, "run_id": run_id, "task_id": task_id,
-            "executor": seat.executor, "board": board, "log_path": log_path,
-            "prompt_path": prompt_path, "workspace_path": root,
-            "process_start_token": token,
-            "task_attempt_id": _value(task, "current_run_id"),
-            "lease_key": lease_key,
-            "started": monotonic(), "started_at": datetime.now(timezone.utc).isoformat(),
-            "adopted": seat.executor == "hermes",
-        }
-    except Exception:
-        if pid is not None:
-            try:
-                os.killpg(pid, 15)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                terminate = getattr(locals().get("proc"), "terminate", None)
-                if terminate is not None:
-                    try:
-                        terminate()
-                    except Exception:
-                        logger.exception("Factory could not terminate failed spawn pid %s", pid)
-        try:
-            if hasattr(store, "record_run_crashed"):
-                store.record_run_crashed(run_id, "spawn failed")
-            else:
-                store.record_run_end(run_id, -1, None, None, 0.0, "spawn_failed")
-        except Exception:
-            logger.exception("Factory could not record failed spawn run %s", run_id)
-        finally:
-            if hasattr(store, "release_resource_lease"):
-                try:
-                    store.release_resource_lease(lease_key)
-                except Exception:
-                    logger.exception("Factory could not release failed spawn lease %s", lease_key)
-            if pid is not None:
-                _RUNNING.pop(pid, None)
-        raise
-    return pid
+    }, seat=seat, cfg=cfg)
 
 
 def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
@@ -714,6 +799,57 @@ def _parse_result(log_text: str, exit_code: int) -> tuple[str, str]:
     return "blocked", f"harness exited with code {exit_code}"
 
 
+def parse_graph_completion(text: str, exit_code: int) -> tuple[str, str]:
+    """Parse the GraphRunner v1 generic box completion envelope.
+
+    The final non-empty physical line must be exactly
+    ``SHIPFACTORY_RESULT: <label>`` — the colon followed by exactly one
+    ASCII space, never zero, multiple, a tab, or a unicode space — where
+    ``<label>`` matches the v1 result regex ``^[a-z][a-z0-9-]*$``.
+    ``exit_code`` must be zero. All text before that sentinel line is the
+    produced work, preserved byte-for-byte (original line endings, blank
+    lines, everything) except the sentinel's own physical line and the
+    single line terminator separating the work from it are removed. The
+    work must be non-empty. Any violation (malformed label, missing
+    sentinel, nonzero exit, empty work) raises ``ValueError`` describing
+    the technical failure.
+    """
+    raw_lines = text.splitlines(keepends=True)
+    non_empty_indices = [
+        i for i, line in enumerate(raw_lines) if line.strip()
+    ]
+    if not non_empty_indices:
+        raise ValueError("empty completion text: no sentinel line found")
+    last_idx = non_empty_indices[-1]
+    # Strip exactly the line's own terminator (if any) for the sentinel match;
+    # the terminator itself is handled separately when reassembling `work`.
+    stripped_sentinel = raw_lines[last_idx]
+    for terminator in _PYTHON_LINE_TERMINATORS:
+        if stripped_sentinel.endswith(terminator):
+            stripped_sentinel = stripped_sentinel[: -len(terminator)]
+            break
+    match = _GRAPH_SENTINEL_RE.fullmatch(stripped_sentinel)
+    if not match:
+        raise ValueError(
+            f"final non-empty line is not a SHIPFACTORY_RESULT sentinel: {stripped_sentinel!r}"
+        )
+    label = match.group(1)
+    if not _GRAPH_LABEL_RE.fullmatch(label):
+        raise ValueError(f"result label {label!r} does not match ^[a-z][a-z0-9-]*$")
+    if exit_code != 0:
+        raise ValueError(f"harness exited with nonzero code {exit_code}")
+    # `work` is everything before the sentinel's physical line, verbatim,
+    # minus the single line terminator that separated work from sentinel.
+    work = "".join(raw_lines[:last_idx])
+    for terminator in _PYTHON_LINE_TERMINATORS:
+        if work.endswith(terminator):
+            work = work[: -len(terminator)]
+            break
+    if not work.strip():
+        raise ValueError("produced work is empty")
+    return label, work
+
+
 def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
     """Reconstruct live workers from durable runs and crash dead identities."""
     store = _store_module()
@@ -725,6 +861,20 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
     lease_capacity = max(int(max_workers), len(rows), 1)
     for row in rows:
         run_id = int(row["id"])
+        graph_target: dict[str, Any] | None = None
+        if hasattr(store, "_connect"):
+            with store._connect() as db:
+                found = db.execute(
+                    """SELECT id,run_id,state,executor_run_id
+                       FROM box_attempts_v1
+                       WHERE executor_run_id=? OR id=?
+                       ORDER BY CASE WHEN executor_run_id=? THEN 0 ELSE 1 END
+                       LIMIT 1""",
+                    (run_id, str(row["task_id"]), run_id),
+                ).fetchone()
+            if found is not None:
+                graph_target = dict(found)
+        target_kind = "graph_box" if graph_target is not None else "legacy_task"
         pid = int(row["pid"]) if row.get("pid") is not None else 0
         token = row.get("process_start_token")
         lease_key = f"worker_slot:run:{run_id}"
@@ -735,7 +885,10 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
             restored.append(pid)
             continue
         identity_matches = bool(token) and _process_start_token(pid) == token
-        pid_only_matches = token is None and pid > 0 and _pid_alive(pid)
+        pid_only_matches = (
+            target_kind == "legacy_task"
+            and token is None and pid > 0 and _pid_alive(pid)
+        )
         if pid > 0 and (identity_matches or pid_only_matches):
             if hasattr(store, "acquire_resource_lease"):
                 store.acquire_resource_lease(
@@ -744,9 +897,10 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
                     metadata={"run_id": run_id, "task_id": row["task_id"],
                               "board": row.get("board")},
                 )
-            _RUNNING[pid] = {
+            restored_record = {
                 "proc": _AdoptedProcess(pid, token), "run_id": run_id,
-                "task_id": row["task_id"], "executor": row["executor"],
+                "target_kind": target_kind, "target_id": row["task_id"],
+                "executor": row["executor"],
                 "board": row.get("board"), "log_path": row.get("log_path"),
                 "prompt_path": row.get("prompt_path"),
                 "workspace_path": row.get("workspace_path"),
@@ -755,9 +909,33 @@ def restore_running(*, max_workers: int = 2) -> dict[str, list[int]]:
                 "lease_key": lease_key,
                 "started_at": row.get("started_at"), "adopted": True,
             }
+            if graph_target is None:
+                restored_record["task_id"] = row["task_id"]
+            else:
+                restored_record["attempt_id"] = graph_target["id"]
+                restored_record["graph_run_id"] = graph_target["run_id"]
+            _RUNNING[pid] = restored_record
             restored.append(pid)
             continue
         reason = "pid missing" if pid <= 0 else "pid dead or start token mismatched"
+        if graph_target is not None:
+            if (
+                graph_target.get("state") == "running"
+                and int(graph_target.get("executor_run_id") or -1) == run_id
+            ):
+                from shipfactory.graph_runtime import enqueue_terminal_event
+                enqueue_terminal_event(
+                    executor_run_id=run_id,
+                    graph_run_id=str(graph_target["run_id"]),
+                    attempt_id=str(graph_target["id"]),
+                    event_type="box_failed",
+                    failure=f"worker crashed: {reason}",
+                )
+            store.record_run_crashed(run_id, reason)
+            if hasattr(store, "release_resource_lease"):
+                store.release_resource_lease(lease_key)
+            crashed.append(run_id)
+            continue
         store.record_run_crashed(run_id, reason)
         if hasattr(store, "release_resource_lease"):
             store.release_resource_lease(lease_key)
@@ -817,6 +995,55 @@ def reap_finished() -> list[dict]:
             ) if record.get("log_path") else ""
         except (OSError, TypeError):
             log_text = ""
+        if record.get("target_kind") == "graph_box":
+            executor = get_executor(record["executor"])
+            text = executor.extract_text(log_text)
+            try:
+                result, work = parse_graph_completion(text, code)
+                event_type = "box_completed"
+                failure = None
+                run_result = "done"
+            except ValueError as exc:
+                result = None
+                work = None
+                event_type = "box_failed"
+                failure = str(exc)
+                run_result = "blocked"
+            from shipfactory.graph_runtime import enqueue_terminal_event
+            enqueue_terminal_event(
+                executor_run_id=int(record["run_id"]),
+                graph_run_id=str(record["graph_run_id"]),
+                attempt_id=str(record["attempt_id"]),
+                event_type=event_type,
+                result=result,
+                work=work,
+                failure=failure,
+            )
+            usage = executor.parse_usage(log_text)
+            duration = (
+                monotonic() - record["started"]
+                if record.get("started") is not None
+                else _duration_since(record.get("started_at"))
+            )
+            store.record_run_end(
+                record["run_id"], code, usage["tokens_in"], usage["tokens_out"],
+                duration, run_result,
+            )
+            if hasattr(store, "release_resource_lease"):
+                store.release_resource_lease(
+                    record.get(
+                        "lease_key", f"worker_slot:run:{record['run_id']}",
+                    )
+                )
+            finished.append({
+                "pid": pid,
+                "attempt_id": record["attempt_id"],
+                "result": result if event_type == "box_completed" else "failed",
+                "summary": work if event_type == "box_completed" else failure,
+                "exit_code": code,
+            })
+            del _RUNNING[pid]
+            continue
         board_result = _terminal_board_result(record)
         if board_result is not None:
             result, summary = board_result

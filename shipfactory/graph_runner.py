@@ -252,7 +252,9 @@ def enqueue_event(
     )
 
 
-def apply_events(*, owner: str, limit: int = 100) -> dict[str, Any]:
+def apply_events(
+    *, owner: str, limit: int = 100, run_id: str | None = None,
+) -> dict[str, Any]:
     """Lease and atomically apply direct box terminal events."""
     if (
         not isinstance(owner, str)
@@ -278,6 +280,7 @@ def apply_events(*, owner: str, limit: int = 100) -> dict[str, Any]:
             leased = store.lease_run_events_v1(
                 owner=owner,
                 limit=1,
+                run_id=run_id,
                 conn=conn,
             )
         if not leased:

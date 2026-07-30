@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import stat
 import time
 import uuid
@@ -414,7 +415,125 @@ def consume_phone_token(
     )
 
 
+def enqueue_human_box_decision(
+    *, attempt_id: str, result: str, actor_kind: str, actor_id: str,
+    channel: str, nonce: str,
+) -> dict[str, Any]:
+    """Atomically persist a human box decision and enqueue its completion event.
+
+    Only an authorized human actor may write a decision for an attempt that is
+    frozen ``who: human`` and currently ``waiting_human``. A replay of the
+    exact nonce/tuple returns the prior durable decision unchanged; reusing a
+    nonce for a different tuple, or targeting an attempt that already has a
+    durable decision with different content, fails closed. This function never
+    marks the attempt or Run complete -- GraphRunner applies the resulting
+    ``box_completed`` event on its next tick.
+    """
+    attempt_id = _required_text("attempt_id", attempt_id)
+    result = _required_text("result", result)
+    actor_kind = _required_text("actor_kind", actor_kind)
+    actor_id = _required_text("actor_id", actor_id)
+    channel = _required_text("channel", channel)
+    nonce_digest = _nonce_hash(nonce)
+    if actor_kind != "human":
+        raise DecisionConflict("human box decisions require actor_kind == 'human'")
+
+    store.init_db()
+    with store._connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        existing = store._rows(db.execute(
+            "SELECT * FROM human_box_decisions_v1 WHERE attempt_id=? OR nonce_hash=?",
+            (attempt_id, nonce_digest),
+        ))
+        submitted = {
+            "attempt_id": attempt_id, "result": result, "actor_kind": actor_kind,
+            "actor_id": actor_id, "channel": channel, "nonce_hash": nonce_digest,
+        }
+        if existing:
+            # A prior durable decision already passed authority/recipe
+            # validation when it was recorded. An identical replay of the
+            # exact tuple must return that decision unchanged even if
+            # GraphRunner has since consumed the event and the attempt is no
+            # longer waiting_human. A conflicting attempt/nonce still fails
+            # closed regardless of the attempt's current state.
+            if len(existing) == 1 and all(
+                existing[0][key] == value for key, value in submitted.items()
+            ):
+                return dict(existing[0]) | {"replayed": True}
+            raise DecisionConflict(
+                "human box decision nonce or attempt already has a conflicting durable decision"
+            )
+
+        attempt_row = db.execute(
+            "SELECT * FROM box_attempts_v1 WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt_row is None:
+            raise DecisionConflict(
+                f"human box attempt does not exist or is not waiting_human: {attempt_id}"
+            )
+        attempt = dict(attempt_row)
+        if attempt["state"] != "waiting_human":
+            raise DecisionConflict(
+                f"human box attempt is not waiting_human: {attempt_id}"
+            )
+
+        recipe = store._graph_recipe_for_run(db, attempt["run_id"])
+        box = recipe.box(attempt["box_id"])
+        if box["who"] != "human":
+            raise DecisionConflict(
+                f"frozen Run recipe does not declare box {attempt['box_id']!r} as who: human"
+            )
+        if not recipe.destinations(attempt["box_id"], result):
+            raise DecisionConflict(
+                f"result {result!r} has no declared outgoing arrow from {attempt['box_id']!r}"
+            )
+
+        decision_id = uuid.uuid4().hex
+        event_key = hashlib.sha256(
+            f"human-box-decision|{decision_id}".encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "type": "box_completed",
+            "run_id": attempt["run_id"],
+            "attempt_id": attempt_id,
+            "expected_state": "waiting_human",
+            "result": result,
+            "work": f"Human decision: {result}",
+        }
+        try:
+            store.enqueue_run_event_v1(
+                key=event_key, run_id=attempt["run_id"], source="human_decision",
+                payload=payload, conn=db,
+            )
+        except (
+            store.GraphStoreConflict,
+            store.GraphStoreIntegrityError,
+            sqlite3.IntegrityError,
+        ) as exc:
+            raise DecisionConflict(
+                f"human box decision event could not be enqueued: {exc}"
+            ) from exc
+        try:
+            row = store.record_human_box_decision_v1(
+                decision_id=decision_id, attempt_id=attempt_id, result=result,
+                actor_kind=actor_kind, actor_id=actor_id, channel=channel,
+                nonce_hash=nonce_digest, event_key=event_key, conn=db,
+            )
+        except (
+            store.GraphStoreConflict,
+            store.GraphStoreIntegrityError,
+            sqlite3.IntegrityError,
+        ) as exc:
+            raise DecisionConflict(
+                f"human box decision could not be recorded: {exc}"
+            ) from exc
+        return dict(row) | {"replayed": False}
+
+
 __all__ = [
     "DecisionConflict", "DecisionTokenError", "MAX_PHONE_TOKEN_SECONDS",
     "consume_phone_token", "current_binding", "issue_phone_token", "record_decision",
+    "enqueue_human_box_decision",
 ]
