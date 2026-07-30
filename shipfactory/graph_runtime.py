@@ -22,11 +22,36 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _allowed_result_labels(recipe: GraphRecipe, box_id: str) -> tuple[str, ...]:
+    labels = tuple(
+        str(arrow["result"])
+        for arrow in recipe.arrows
+        if arrow["from"] == box_id
+    )
+    if labels:
+        return labels
+    if recipe.box(box_id).get("end") is True:
+        return ("done",)
+    raise GraphRuntimeError(f"box {box_id!r} has no routable result labels")
+
+
 def _render_prompt(
     *, request: str, input_work: dict[str, Any], box: dict[str, object],
+    allowed_labels: tuple[str, ...],
 ) -> str:
     preceding = input_work["preceding_outputs"]
     work = "\n\n".join(str(item["work"]) for item in preceding) if preceding else "(none)"
+    if len(allowed_labels) == 1:
+        label_contract = (
+            f"The only allowed label for this box is `{allowed_labels[0]}`; "
+            "use it exactly and do not invent a synonym. "
+        )
+    else:
+        declared = ", ".join(f"`{label}`" for label in allowed_labels)
+        label_contract = (
+            f"The allowed labels for this box are {declared}; use exactly one "
+            "of them and do not invent a synonym. "
+        )
     return (
         "## REQUEST\n"
         f"{request}\n\n"
@@ -37,7 +62,9 @@ def _render_prompt(
         "## COMPLETION CONTRACT\n"
         "Your final non-empty output line must be exactly "
         "`SHIPFACTORY_RESULT: <label>`, where `<label>` is a lowercase "
-        "result label matching `^[a-z][a-z0-9-]*$`. Put all produced work "
+        "result label matching `^[a-z][a-z0-9-]*$`. "
+        f"{label_contract}"
+        "Put all produced work "
         "before that final line.\n"
     )
 
@@ -222,6 +249,7 @@ def spawn_ready(max_workers: int, *, board: str | None = None) -> list[int]:
             )
             prompt = _render_prompt(
                 request=row["request_text"], input_work=input_work, box=box,
+                allowed_labels=_allowed_result_labels(recipe, row["box_id"]),
             )
             if seat.executor == "hermes":
                 from hermes_cli import kanban_db

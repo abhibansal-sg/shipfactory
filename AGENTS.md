@@ -945,6 +945,12 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   while tests replaced `_backup_root` before exercising it. Every operator
   report must include one default-path regression against the real store path
   helper, plus a read-only live invocation before it is called ready.
+- A syntax-valid worker result label can still be unroutable (finding #128).
+  The first GraphRunner live planner returned conventional `success` while its
+  frozen outgoing route required `done`, because the prompt documented only
+  the label regex. Every graph worker prompt now enumerates the exact result
+  labels available from that box in the frozen recipe (with `done` for the end
+  box) and forbids invented synonyms.
 
 ## Conventions
 

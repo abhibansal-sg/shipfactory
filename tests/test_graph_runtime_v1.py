@@ -40,6 +40,7 @@ def test_render_graph_prompt_preserves_unicode_and_exact_sections():
             "activating_token_ids": ["token-1"],
         },
         box=recipe.box("write"),
+        allowed_labels=("done",),
     ) == (
         "## REQUEST\n"
         "Créer un résumé 🚀\n\n"
@@ -50,8 +51,55 @@ def test_render_graph_prompt_preserves_unicode_and_exact_sections():
         "## COMPLETION CONTRACT\n"
         "Your final non-empty output line must be exactly "
         "`SHIPFACTORY_RESULT: <label>`, where `<label>` is a lowercase "
-        "result label matching `^[a-z][a-z0-9-]*$`. Put all produced work "
+        "result label matching `^[a-z][a-z0-9-]*$`. The only allowed label "
+        "for this box is `done`; use it exactly and do not invent a synonym. "
+        "Put all produced work "
         "before that final line.\n"
+    )
+
+
+def test_allowed_result_labels_come_from_frozen_outgoing_routes():
+    recipe = validate({
+        "name": "labels",
+        "start": "review",
+        "boxes": [
+            {"id": "review", "name": "Review", "who": "worker",
+             "instructions": "Review."},
+            {"id": "finish", "name": "Finish", "who": "worker",
+             "instructions": "Finish.", "end": True},
+        ],
+        "arrows": [
+            {"from": "review", "result": "revise", "to": ["review"]},
+            {"from": "review", "result": "approved", "to": ["finish"]},
+        ],
+    })
+
+    assert graph_runtime._allowed_result_labels(recipe, "review") == (
+        "revise", "approved",
+    )
+    assert graph_runtime._allowed_result_labels(recipe, "finish") == ("done",)
+    assert graph_runtime._render_prompt(
+        request="Review this.",
+        input_work={
+            "request": "Review this.",
+            "preceding_outputs": [],
+            "activating_token_ids": ["token-1"],
+        },
+        box=recipe.box("review"),
+        allowed_labels=("revise", "approved"),
+    ) == (
+        "## REQUEST\n"
+        "Review this.\n\n"
+        "## PRECEDING WORK\n"
+        "(none)\n\n"
+        "## INSTRUCTIONS\n"
+        "Review.\n\n"
+        "## COMPLETION CONTRACT\n"
+        "Your final non-empty output line must be exactly "
+        "`SHIPFACTORY_RESULT: <label>`, where `<label>` is a lowercase "
+        "result label matching `^[a-z][a-z0-9-]*$`. The allowed labels for "
+        "this box are `revise`, `approved`; use exactly one of them and do "
+        "not invent a synonym. Put all produced work before that final line.\n"
     )
 
 
