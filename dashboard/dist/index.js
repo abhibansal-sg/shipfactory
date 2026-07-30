@@ -2176,8 +2176,16 @@
       if (!runId) return Promise.resolve(null);
       return request("/v1/runs/" + encodeURIComponent(runId) + "/graph").then(function (payload) { setGraph(payload); setError(""); return payload; }).catch(function (err) { setError(errorText(err)); });
     }, [runId]);
+    function loadExistingRun() {
+      return request("/v1/runs?project_id=" + encodeURIComponent(project.id)).then(function (payload) {
+        var runs = payload && Array.isArray(payload.runs) ? payload.runs : [];
+        var current = runs.find(function (run) { return run.state === "running"; }) || runs[0];
+        setRunId(current ? current.id : "");
+        return current || null;
+      });
+    }
 
-    useEffect(function () { setCatalog([]); setAttached([]); setSelectedName(""); setRunId(""); setGraph(null); setError(""); loadRecipes(); }, [project.id, loadRecipes]);
+    useEffect(function () { setCatalog([]); setAttached([]); setSelectedName(""); setRunId(""); setGraph(null); setError(""); Promise.all([loadRecipes(), loadExistingRun()]); }, [project.id, loadRecipes]);
     useEffect(function () {
       if (!runId) return undefined;
       loadGraph();
@@ -2217,12 +2225,95 @@
   }
 
 
+  function graphV1WorkText(value) {
+    if (value == null) return "";
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  }
+
+  function graphV1Input(value) {
+    if (value && typeof value === "object") return value;
+    if (typeof value !== "string") return {};
+    try { var parsed = JSON.parse(value); return parsed && typeof parsed === "object" ? parsed : {}; } catch (_) { return {}; }
+  }
+
+  function graphV1ApprovalContext(graph, attempts) {
+    var waiting = graph.run && Array.isArray(graph.run.waiting_human) ? graph.run.waiting_human : [];
+    var attempt = waiting[0] || attempts.find(function (item) { return item.state === "waiting_human"; }) || null;
+    if (!attempt) return null;
+    var input = graphV1Input(attempt.input_work);
+    var preceding = Array.isArray(input.preceding_outputs) ? input.preceding_outputs : [];
+    var proposedItem = preceding.length ? preceding[preceding.length - 1] : null;
+    var proposed = graphV1WorkText(proposedItem && proposedItem.output_work);
+    if (!proposed) {
+      var completed = attempts.filter(function (item) { return item.state === "completed" && item.output_work != null; });
+      proposed = graphV1WorkText(completed.length ? completed[completed.length - 1].output_work : "");
+    }
+    var synthesis = attempts.slice().reverse().find(function (item) { return item.state === "completed" && item.box_id === (proposedItem && proposedItem.box_id); });
+    var boxes = Array.isArray(graph.boxes) ? graph.boxes : [];
+    var latestReviews = {};
+    attempts.forEach(function (item) {
+      var box = boxes.find(function (candidate) { return candidate.id === item.box_id; });
+      var identity = ((box && box.who) || "") + " " + item.box_id;
+      if (item.state === "completed" && identity.toLowerCase().indexOf("review") >= 0 && (!latestReviews[item.box_id] || latestReviews[item.box_id].ordinal < item.ordinal)) latestReviews[item.box_id] = item;
+    });
+    return {
+      attempt: attempt,
+      request: graphV1WorkText(input.request),
+      proposed: proposed,
+      recommendation: (synthesis && synthesis.result) || "review",
+      reviews: Object.keys(latestReviews).map(function (boxId) {
+        return { box: boxes.find(function (candidate) { return candidate.id === boxId; }) || { id: boxId, name: boxId }, attempt: latestReviews[boxId] };
+      }),
+    };
+  }
+
+  function graphV1DecisionLabel(result) {
+    if (result === "approved") return "Approve";
+    if (result === "rejected") return "Reject";
+    return result.charAt(0).toUpperCase() + result.slice(1);
+  }
+
+  function GraphV1ApprovalCard(props) {
+    var context = props.context;
+    if (!context || !context.attempt) return null;
+    var attempt = context.attempt;
+    var declaredResults = props.graph.arrows.filter(function (arrow) { return arrow.from === attempt.box_id; }).map(function (arrow) { return arrow.result; });
+    return h("section", { className: "factory-v1-approval", "aria-label": "Human approval decision", "data-graph-v1-approval": attempt.id },
+      h("div", { className: "factory-v1-approval-head" },
+        h("div", null, h("span", { className: "factory-v1-eyebrow" }, "Decision required"), h("h3", { className: "text-base font-semibold text-foreground" }, "Review the proposed deliverable")),
+        h(StatePill, { value: attempt.state })
+      ),
+      context.request ? h("section", { className: "factory-v1-summary-block" }, h("strong", null, "Original request"), h("p", null, context.request)) : null,
+      h("div", { className: "factory-v1-recommendation" }, h("span", null, "Recommended outcome"), h(StatePill, { value: context.recommendation })),
+      h("section", { className: "factory-v1-summary-block" }, h("strong", null, "Proposed deliverable"), h("pre", { className: "factory-v1-deliverable" }, context.proposed || "No deliverable summary was provided.")),
+      context.reviews.length ? h("section", { className: "factory-v1-review-section" },
+        h("strong", null, "Review results"),
+        h("div", { className: "factory-v1-review-grid" }, context.reviews.map(function (review) {
+          return h("article", { key: review.attempt.id, className: "factory-v1-review-card" },
+            h("div", { className: "factory-v1-review-head" }, h("span", null, review.box.name), h(StatePill, { value: review.attempt.result || review.attempt.state })),
+            h("details", null, h("summary", null, "Full review"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(review.attempt.output_work) || "No review text."))
+          );
+        }))
+      ) : null,
+      h("details", { className: "factory-v1-raw-section" }, h("summary", null, "Run details"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(attempt.input_work))),
+      props.error ? h("p", { className: "text-xs text-destructive", role: "alert" }, props.error) : null,
+      h("div", { className: "factory-v1-actions", "aria-label": "Declared human results" },
+        h("p", null, "Choose once. ShipFactory records the decision with a fresh protected nonce."),
+        h("div", { className: "flex flex-wrap gap-2" }, declaredResults.map(function (result) {
+          return h(Button, { key: result, type: "button", size: "sm", disabled: !!props.busy, "data-graph-v1-decision": result, onClick: function () { props.onDecide(attempt, result); } }, props.busy === attempt.id + ":" + result ? h(Spinner, { label: "Recording" }) : graphV1DecisionLabel(result));
+        }))
+      )
+    );
+  }
+
   function GraphV1Run(props) {
     var graph = props.graph;
     var _a = useState(""), busy = _a[0], setBusy = _a[1];
     var _b = useState(""), error = _b[0], setError = _b[1];
     if (!graph || !graph.run) return null;
     var attempts = Array.isArray(graph.run.attempts) ? graph.run.attempts : [];
+    var approval = graphV1ApprovalContext(graph, attempts);
 
     function decideHuman(attempt, result) {
       var key = attempt.id + ":" + result;
@@ -2237,6 +2328,7 @@
 
     return h("section", { className: "grid gap-3 border border-border bg-background/20 p-4", "data-graph-v1-run": graph.run.id },
       h("div", { className: "flex flex-wrap items-center justify-between gap-2" }, h("div", null, h("strong", { className: "font-mono-ui text-sm text-foreground" }, graph.recipe.name), h("span", { className: "ml-2 font-mono-ui text-xs text-text-tertiary" }, graph.run.id)), h(StatePill, { value: graph.run.state })),
+      h(GraphV1ApprovalCard, { graph: graph, context: approval, busy: busy, error: error, onDecide: decideHuman }),
       h("div", { className: "grid gap-3", "aria-label": "Declared GraphRunner recipe" }, graph.boxes.map(function (box) {
         var boxAttempts = attempts.filter(function (attempt) { return attempt.box_id === box.id; });
         return h("article", { key: box.id, className: "border border-border bg-card p-3", "data-graph-v1-box": box.id },
@@ -2246,16 +2338,18 @@
             var declaredResults = graph.arrows.filter(function (arrow) { return arrow.from === attempt.box_id; }).map(function (arrow) { return arrow.result; });
             return h("div", { key: attempt.id, className: "border-t border-border/60 pt-2", "data-graph-v1-attempt": attempt.id },
               h("div", { className: "flex flex-wrap items-center gap-2 text-xs" }, h(MonoChip, null, "attempt " + attempt.ordinal), h(StatePill, { value: attempt.state }), attempt.result ? h(MonoChip, null, "result: " + attempt.result) : null),
-              attempt.input_work != null ? h("p", { className: "mt-2 whitespace-pre-wrap text-xs text-text-secondary" }, "Input: ", typeof attempt.input_work === "string" ? attempt.input_work : JSON.stringify(attempt.input_work)) : null,
-              attempt.output_work != null ? h("p", { className: "mt-1 whitespace-pre-wrap text-xs text-text-secondary" }, "Work: ", typeof attempt.output_work === "string" ? attempt.output_work : JSON.stringify(attempt.output_work)) : null,
               attempt.technical_failure ? h("p", { className: "mt-1 whitespace-pre-wrap text-xs text-destructive" }, attempt.technical_failure) : null,
-              attempt.state === "waiting_human" ? h("div", { className: "mt-2 flex flex-wrap gap-2", "aria-label": "Declared human results" }, declaredResults.map(function (result) { return h(Button, { key: result, type: "button", size: "xs", disabled: !!busy, "data-graph-v1-decision": result, onClick: function () { decideHuman(attempt, result); } }, busy === attempt.id + ":" + result ? h(Spinner, { label: "Recording" }) : result); })) : null
+              attempt.input_work != null || attempt.output_work != null ? h("details", { className: "factory-v1-attempt-details" },
+                h("summary", null, "Attempt details"),
+                attempt.input_work != null ? h("div", null, h("strong", null, "Input"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(attempt.input_work))) : null,
+                attempt.output_work != null ? h("div", null, h("strong", null, "Produced work"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(attempt.output_work))) : null
+              ) : null
             );
           })) : h("p", { className: "mt-2 text-xs text-text-tertiary" }, "No attempts yet.")
         );
       })),
-      h("section", { className: "grid gap-1", "aria-label": "Declared result routes" }, h("strong", { className: "text-xs text-foreground" }, "Declared result routes"), graph.arrows.map(function (arrow, index) { return h("p", { key: arrow.from + ":" + arrow.result + ":" + index, className: "font-mono-ui text-xs text-text-secondary" }, arrow.from, " — ", arrow.result, " → ", arrow.to.join(", ")); })),
-      error ? h("p", { className: "text-xs text-destructive", role: "alert" }, error) : null
+      h("details", { className: "factory-v1-routes" }, h("summary", null, "Declared result routes"), graph.arrows.map(function (arrow, index) { return h("p", { key: arrow.from + ":" + arrow.result + ":" + index, className: "font-mono-ui text-xs text-text-secondary" }, arrow.from, " — ", arrow.result, " → ", arrow.to.join(", ")); })),
+      !approval && error ? h("p", { className: "text-xs text-destructive", role: "alert" }, error) : null
     );
   }
 

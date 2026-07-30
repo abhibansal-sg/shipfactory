@@ -186,11 +186,15 @@ const graphV1RecipeFixture = deepFreeze({
   hash: "fixture-v1-hash",
   boxes: [
     { id: "planner", name: "Plan", who: "planner", instructions: "Produce a focused plan.", end: false },
+    { id: "review", name: "Review", who: "reviewer", instructions: "Review the work.", end: false },
+    { id: "synthesize", name: "Synthesize", who: "lead-reviewer", instructions: "Combine review findings.", end: false },
     { id: "approve", name: "Approve", who: "human", instructions: "Approve only after reviewing the work.", end: false },
     { id: "deliver", name: "Deliver", who: "builder", instructions: "Deliver the accepted result.", end: true },
   ],
   arrows: [
-    { from: "planner", result: "done", to: ["approve"] },
+    { from: "planner", result: "done", to: ["review"] },
+    { from: "review", result: "done", to: ["synthesize"] },
+    { from: "synthesize", result: "pass", to: ["approve"] },
     { from: "approve", result: "approved", to: ["deliver"] },
   ],
 });
@@ -200,8 +204,12 @@ let graphV1RunFixture = {
   arrows: graphV1RecipeFixture.arrows,
   run: {
     id: "fixture-v1-run", state: "running",
-    attempts: [{ id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it" }, output_work: null, result: null, technical_failure: null }],
-    waiting_human: [{ id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it" }, output_work: null, result: null, technical_failure: null }],
+    attempts: [
+      { id: "fixture-review-attempt", box_id: "review", ordinal: 1, state: "completed", input_work: {}, output_work: "No concrete blockers found.", result: "done", technical_failure: null },
+      { id: "fixture-synthesis-attempt", box_id: "synthesize", ordinal: 1, state: "completed", input_work: {}, output_work: "Ship the focused GraphRunner change.", result: "pass", technical_failure: null },
+      { id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it", preceding_outputs: [{ attempt_id: "fixture-synthesis-attempt", box_id: "synthesize", output_work: "Ship the focused GraphRunner change." }] }, output_work: null, result: null, technical_failure: null },
+    ],
+    waiting_human: [{ id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it", preceding_outputs: [{ attempt_id: "fixture-synthesis-attempt", box_id: "synthesize", output_work: "Ship the focused GraphRunner change." }] }, output_work: null, result: null, technical_failure: null }],
   },
 };
 
@@ -255,6 +263,9 @@ function browserMockFetch(url, options = {}) {
   }
   if (method === "POST" && path === "/api/plugins/shipfactory/v1/projects/p_bound/runs") {
     return Promise.resolve(browserJsonResponse({ run: { id: graphV1RunFixture.run.id, state: graphV1RunFixture.run.state } }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/v1/runs") {
+    return Promise.resolve(browserJsonResponse({ runs: [{ id: graphV1RunFixture.run.id, project_id: "p_bound", state: graphV1RunFixture.run.state }] }));
   }
   if (method === "GET" && path === "/api/plugins/shipfactory/v1/runs/fixture-v1-run/graph") {
     return Promise.resolve(browserJsonResponse(JSON.parse(JSON.stringify(graphV1RunFixture))));

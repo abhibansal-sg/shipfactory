@@ -150,8 +150,129 @@
 .factory-project-recipe > div:first-child > div:first-child { min-width: 0; }
 .factory-project-recipe ol { margin: 0; padding: 0; list-style: none; }
 
+/* GraphRunner operator decision packet. Raw model payloads remain exact but
+   never dominate the approval surface. */
+.factory-v1-approval {
+  display: grid;
+  gap: 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 55%, var(--color-border));
+  border-left: 0.25rem solid var(--color-primary);
+  padding: 1rem;
+  background: color-mix(in srgb, var(--color-primary) 7%, var(--color-card));
+}
+.factory-v1-approval-head,
+.factory-v1-review-head,
+.factory-v1-recommendation,
+.factory-v1-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.factory-v1-eyebrow {
+  display: block;
+  margin-bottom: 0.15rem;
+  color: var(--color-primary);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.factory-v1-summary-block,
+.factory-v1-review-section {
+  display: grid;
+  gap: 0.4rem;
+}
+.factory-v1-summary-block > strong,
+.factory-v1-review-section > strong {
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+}
+.factory-v1-summary-block > p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.factory-v1-recommendation {
+  border-block: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  padding-block: 0.55rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.factory-v1-deliverable,
+.factory-v1-raw {
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+  line-height: 1.55;
+}
+.factory-v1-deliverable {
+  max-height: 22rem;
+  border: 1px solid var(--color-border);
+  padding: 0.75rem;
+  background: var(--color-card);
+  font-size: 0.82rem;
+}
+.factory-v1-review-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.5rem;
+}
+.factory-v1-review-card {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  padding: 0.55rem 0.65rem;
+  background: var(--color-card);
+  font-size: 0.75rem;
+}
+.factory-v1-review-card details,
+.factory-v1-attempt-details,
+.factory-v1-raw-section,
+.factory-v1-routes {
+  margin-top: 0.45rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.75rem;
+}
+.factory-v1-review-card summary,
+.factory-v1-attempt-details summary,
+.factory-v1-raw-section summary,
+.factory-v1-routes summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--color-foreground);
+  font-weight: 600;
+}
+.factory-v1-raw {
+  max-height: 18rem;
+  margin-top: 0.4rem;
+  border: 1px solid var(--color-border);
+  padding: 0.6rem;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  font-size: 0.72rem;
+}
+.factory-v1-attempt-details > div { margin-top: 0.55rem; }
+.factory-v1-attempt-details strong { color: var(--color-foreground); }
+.factory-v1-actions {
+  align-items: flex-end;
+  border-top: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  padding-top: 0.75rem;
+}
+.factory-v1-actions > p {
+  max-width: 34rem;
+  margin: 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
 @media (max-width: 860px) {
   .factory-projects-layout { grid-template-columns: 1fr; }
+  .factory-v1-approval-head,
+  .factory-v1-actions { align-items: stretch; flex-direction: column; }
 }
 
 /* Journey view: folded logical cards (Amendment 1 items A/B). Novel layout

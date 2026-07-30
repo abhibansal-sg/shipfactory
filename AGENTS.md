@@ -958,6 +958,19 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   the executor bridge instead required invented `result` and `work` keys and
   silently skipped the invalid input. The consumer now validates and renders
   the producer's exact shape, with a regression that rejects the old mismatch.
+- A collection API is not an operator recovery surface until the UI consumes it
+  (finding #130). GraphRunner's Project panel remembered only the Run id returned
+  by a launch in that browser session, so a dashboard refresh or restart showed
+  zero visible Runs while the durable Run waited for human approval. Project
+  selection now queries `GET /v1/runs?project_id=...`, prefers the newest running
+  Run, and resumes graph polling without relaunching or mutating the Run.
+- A human gate is not usable merely because its decision buttons exist (finding
+  #131). GraphRunner rendered every predecessor input and model output inline
+  before the controls, turning the first live approval packet into an
+  unstructured multi-screen JSON dump. The operator surface now leads with the
+  original request, the final synthesis and its result, compact reviewer
+  verdicts, and the protected decisions; exact raw payloads and attempt history
+  remain available but are collapsed and height-bounded by default.
 
 ## Conventions
 
