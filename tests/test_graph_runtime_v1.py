@@ -34,8 +34,8 @@ def test_render_graph_prompt_preserves_unicode_and_exact_sections():
         input_work={
             "request": "Créer un résumé 🚀",
             "preceding_outputs": [
-                {"attempt_id": "a-1", "box_id": "prior", "result": "done",
-                 "work": "Déjà fait ✓"},
+                {"attempt_id": "a-1", "box_id": "prior",
+                 "output_work": "Déjà fait ✓"},
             ],
             "activating_token_ids": ["token-1"],
         },
@@ -101,6 +101,33 @@ def test_allowed_result_labels_come_from_frozen_outgoing_routes():
         "this box are `revise`, `approved`; use exactly one of them and do "
         "not invent a synonym. Put all produced work before that final line.\n"
     )
+
+
+def test_load_input_accepts_only_graph_runner_durable_preceding_output_shape():
+    durable = {
+        "request": "Review this.",
+        "preceding_outputs": [{
+            "attempt_id": "attempt-1",
+            "box_id": "planner",
+            "output_work": "A durable plan.",
+        }],
+        "activating_token_ids": ["token-1"],
+    }
+    assert graph_runtime._load_input(
+        json.dumps(durable), "Review this.",
+    ) == durable
+
+    invented = {
+        **durable,
+        "preceding_outputs": [{
+            "attempt_id": "attempt-1",
+            "box_id": "planner",
+            "result": "done",
+            "work": "A durable plan.",
+        }],
+    }
+    with pytest.raises(graph_runtime.GraphRuntimeError, match="invalid preceding work"):
+        graph_runtime._load_input(json.dumps(invented), "Review this.")
 
 
 RUNTIME_RECIPE = validate({

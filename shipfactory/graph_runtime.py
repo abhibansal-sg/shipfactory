@@ -40,7 +40,10 @@ def _render_prompt(
     allowed_labels: tuple[str, ...],
 ) -> str:
     preceding = input_work["preceding_outputs"]
-    work = "\n\n".join(str(item["work"]) for item in preceding) if preceding else "(none)"
+    work = (
+        "\n\n".join(str(item["output_work"]) for item in preceding)
+        if preceding else "(none)"
+    )
     if len(allowed_labels) == 1:
         label_contract = (
             f"The only allowed label for this box is `{allowed_labels[0]}`; "
@@ -89,7 +92,7 @@ def _load_input(raw: str, request: str) -> dict[str, Any]:
     for reference in value["preceding_outputs"]:
         if (
             not isinstance(reference, dict)
-            or frozenset(reference) != {"attempt_id", "box_id", "result", "work"}
+            or frozenset(reference) != {"attempt_id", "box_id", "output_work"}
             or any(not isinstance(reference[key], str) for key in reference)
         ):
             raise GraphRuntimeError("input_work_json has invalid preceding work")

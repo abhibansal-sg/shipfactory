@@ -951,6 +951,13 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   the label regex. Every graph worker prompt now enumerates the exact result
   labels available from that box in the frozen recipe (with `done` for the end
   box) and forbids invented synonyms.
+- A runtime bridge must consume the durable work-reference contract emitted by
+  the graph reconciler, not a plausible parallel shape (finding #129). Route
+  tokens carry exact preceding outputs as `attempt_id`, `box_id`, and
+  `output_work`; the first live downstream box stayed `ready` forever because
+  the executor bridge instead required invented `result` and `work` keys and
+  silently skipped the invalid input. The consumer now validates and renders
+  the producer's exact shape, with a regression that rejects the old mismatch.
 
 ## Conventions
 
