@@ -910,7 +910,13 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   therefore failed before persistence with `base_sha requires a Git workspace`.
   The launch boundary now opens the project's primary Git workspace, derives
   the exact base SHA there, and passes it explicitly into instantiation.
-
+- Read-only dashboard polling must not invoke database bootstrap connectors
+  (finding #123). `GET /projects` called both ShipFactory `init_db()` and Hermes
+  `projects_db.connect_closing()`, so an ordinary refresh could run schema DDL,
+  migrations, and WAL initialization. Projects listing now opens both existing
+  databases with SQLite `mode=ro` plus `query_only`; startup/daemon seams own
+  initialization, and a missing or stale database fails visibly without being
+  created or changed by the GET.
 - A shared adapter must consume the required fields of its target record
   directly (finding #124). `_spawn_target` received a durable `seat_name` for
   both legacy tasks and graph boxes but used
@@ -925,6 +931,20 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   and report its failure against the wrong board. `apply_events` now accepts a
   Run filter, and the daemon aggregates only its current board's Runs within
   the original bounded event budget.
+- A detail endpoint does not prove its collection surface exists (finding
+  #126). Task 15 implemented `GET /v1/runs/{id}` and the dashboard journey used
+  direct Run ids, while the separately required `GET /v1/runs` route was absent;
+  focused launch/detail/UI tests and two independent reviews all passed without
+  noticing the 404. Public API milestones now need an exact route-set assertion
+  plus one behavioral test for every collection and detail route. The v1 Run
+  list is read-only, deterministically ordered, filterable by Project/state, and
+  bounded to 1–1000 rows.
+- A report test that monkeypatches every filesystem seam can certify a helper
+  that does not exist (finding #127). The first live `legacy-drain-report`
+  crashed because `_backup_root()` called nonexistent `store._shipfactory_home`,
+  while tests replaced `_backup_root` before exercising it. Every operator
+  report must include one default-path regression against the real store path
+  helper, plus a read-only live invocation before it is called ready.
 
 ## Conventions
 

@@ -10,7 +10,7 @@ import types
 from shipfactory import cli
 
 
-VERBS = {"init", "seats", "seat-create", "seat-update", "seat-list", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "pause", "resume", "recipe"}
+VERBS = {"init", "seats", "seat-create", "seat-update", "seat-list", "daemon", "verdict", "policy", "monitor", "watchdog", "costs", "sync", "dashboard", "runs", "run", "legacy-drain-report", "pause", "resume", "recipe"}
 
 
 def parser() -> argparse.ArgumentParser:

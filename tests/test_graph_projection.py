@@ -4,7 +4,8 @@ import copy
 from pathlib import Path
 
 from shipfactory.config import PROJECTS_VISUAL_RECIPES_DEFAULTS, projects_visual_recipes_config
-from shipfactory.recipe_graph import project_graph
+from shipfactory.graph_recipe import load as load_graph_recipe
+from shipfactory.recipe_graph import project_direct_graph_v1, project_graph
 from shipfactory.recipes.loader import load_library, validate
 from shipfactory.recipes.primitives import review_verdict_targets
 
@@ -88,6 +89,71 @@ def _synthetic_recipe(*, root_review: bool = False) -> dict:
     }
     validate(recipe)
     return recipe
+
+
+def test_direct_graph_v1_projects_only_declared_boxes_arrows_and_run_state():
+    recipe = load_graph_recipe(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
+    run = {
+        "id": "run-1", "state": "running", "recipe_hash": recipe.hash,
+        "project_id": "project-1", "board": "board-one",
+    }
+    attempts = [
+        {
+            "id": "attempt-1", "box_id": recipe.start, "ordinal": 1,
+            "state": "waiting_human", "input_work": {"request": "Build it"},
+            "output_work": None, "result": None, "technical_failure": None,
+        },
+    ]
+
+    graph = project_direct_graph_v1(recipe, run=run, attempts=attempts)
+
+    assert graph == {
+        "recipe": {"name": recipe.name, "start": recipe.start, "hash": recipe.hash},
+        "boxes": [
+            {
+                "id": box["id"], "name": box["name"], "who": box["who"],
+                "instructions": box["instructions"],
+                "end": bool(box.get("end", False)),
+            }
+            for box in recipe.boxes
+        ],
+        "arrows": [
+            {
+                "from": arrow["from"], "result": arrow["result"],
+                "to": list(arrow["to"]),
+            }
+            for arrow in recipe.arrows
+        ],
+        "run": {
+            "id": "run-1", "state": "running", "attempts": attempts,
+            "waiting_human": attempts,
+        },
+    }
+    forbidden = {
+        "nodes", "edges", "shape", "primitive", "projection_only", "needs",
+        "inputs", "outputs", "params", "budgets", "layout", "schema_version",
+    }
+    def keys(value):
+        if isinstance(value, dict):
+            return set(value).union(*(keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(keys(item) for item in value))
+        return set()
+
+    assert forbidden.isdisjoint(keys(graph))
+
+
+def test_direct_graph_v1_uses_frozen_recipe_hash_not_mutable_run_metadata():
+    recipe = load_graph_recipe(ROOT / "recipes" / "v1" / "plan-build-review.yaml")
+    graph = project_direct_graph_v1(
+        recipe,
+        run={"id": "run-2", "state": "completed", "recipe_hash": "tampered"},
+        attempts=[],
+    )
+    assert graph["recipe"]["hash"] == recipe.hash
+    assert graph["run"] == {
+        "id": "run-2", "state": "completed", "attempts": [], "waiting_human": [],
+    }
 
 
 def _edge(graph: dict, source: str, target: str) -> dict:

@@ -2149,6 +2149,117 @@
     );
   }
 
+  function GraphV1ProjectPanel(props) {
+    var project = props.project;
+    var runtime = props.runtime;
+    var _a = useState([]), catalog = _a[0], setCatalog = _a[1];
+    var _b = useState([]), attached = _b[0], setAttached = _b[1];
+    var _c = useState(""), selectedName = _c[0], setSelectedName = _c[1];
+    var _d = useState(""), requestText = _d[0], setRequestText = _d[1];
+    var _e = useState(newNonce()), launchKey = _e[0], setLaunchKey = _e[1];
+    var _f = useState(""), runId = _f[0], setRunId = _f[1];
+    var _g = useState(null), graph = _g[0], setGraph = _g[1];
+    var _h = useState(""), error = _h[0], setError = _h[1];
+    var _i = useState(""), busy = _i[0], setBusy = _i[1];
+
+    var loadRecipes = useCallback(function () {
+      return Promise.all([request("/v1/recipes"), request("/v1/projects/" + encodeURIComponent(project.id) + "/recipes")]).then(function (values) {
+        var recipes = values[0] && Array.isArray(values[0].recipes) ? values[0].recipes : [];
+        var projectRecipes = values[1] && Array.isArray(values[1].recipes) ? values[1].recipes : [];
+        setCatalog(recipes); setAttached(projectRecipes);
+        var current = projectRecipes.find(function (item) { return item.enabled && item.is_default; }) || projectRecipes.find(function (item) { return item.enabled; });
+        setSelectedName(function (value) { return value || (current && current.name) || (recipes[0] && recipes[0].name) || ""; });
+        setError("");
+      }).catch(function (err) { setError(errorText(err)); });
+    }, [project.id]);
+    var loadGraph = useCallback(function () {
+      if (!runId) return Promise.resolve(null);
+      return request("/v1/runs/" + encodeURIComponent(runId) + "/graph").then(function (payload) { setGraph(payload); setError(""); return payload; }).catch(function (err) { setError(errorText(err)); });
+    }, [runId]);
+
+    useEffect(function () { setCatalog([]); setAttached([]); setSelectedName(""); setRunId(""); setGraph(null); setError(""); loadRecipes(); }, [project.id, loadRecipes]);
+    useEffect(function () {
+      if (!runId) return undefined;
+      loadGraph();
+      var timer = window.setInterval(loadGraph, runtime.ui_refresh_interval_seconds * 1000);
+      return function () { window.clearInterval(timer); };
+    }, [runId, loadGraph, runtime.ui_refresh_interval_seconds]);
+
+    function configureRecipe(name, enabled, isDefault) {
+      setBusy("recipe:" + name); setError("");
+      request("/v1/projects/" + encodeURIComponent(project.id) + "/recipes/" + encodeURIComponent(name), { method: "PUT", body: JSON.stringify({ enabled: enabled, is_default: isDefault }) })
+        .then(loadRecipes).catch(function (err) { setError(errorText(err)); }).finally(function () { setBusy(""); });
+    }
+    function startRun(event) {
+      event.preventDefault();
+      if (!selectedName || !requestText.trim() || busy) return;
+      setBusy("launch"); setError("");
+      request("/v1/projects/" + encodeURIComponent(project.id) + "/runs", { method: "POST", body: JSON.stringify({ recipe: selectedName, request: requestText.trim(), launch_key: launchKey }) })
+        .then(function (payload) { setRunId(payload.run.id); setLaunchKey(newNonce()); })
+        .catch(function (err) { setError(errorText(err)); }).finally(function () { setBusy(""); });
+    }
+
+    return h("section", { className: "grid gap-4 border border-primary/30 bg-primary/5 p-4", "data-graph-v1-project": project.id },
+      h(SectionHeading, { title: "GraphRunner v1", description: "Direct declared boxes, routes, attempts, and human decisions." }),
+      h("div", { className: "grid gap-2" }, catalog.map(function (recipe) {
+        var attachment = attached.find(function (item) { return item.name === recipe.name; });
+        var enabled = !!(attachment && attachment.enabled);
+        return h("div", { key: recipe.name, className: "flex flex-wrap items-center justify-between gap-2 border border-border bg-card p-3", "data-graph-v1-recipe": recipe.name },
+          h("button", { type: "button", className: "min-w-0 text-left", onClick: function () { setSelectedName(recipe.name); }, "aria-pressed": selectedName === recipe.name }, h("strong", { className: "block font-mono-ui text-sm text-foreground" }, recipe.name), h("span", { className: "block font-mono-ui text-xs text-text-tertiary" }, recipe.hash)),
+          h("div", { className: "flex gap-2" }, enabled ? h(Button, { type: "button", size: "xs", disabled: !!busy, onClick: function () { configureRecipe(recipe.name, false, false); } }, "Disable") : h(Button, { type: "button", size: "xs", disabled: !!busy, onClick: function () { configureRecipe(recipe.name, true, !attached.some(function (item) { return item.is_default; })); } }, "Enable"), enabled ? h(Button, { type: "button", size: "xs", disabled: !!busy || attachment.is_default, onClick: function () { configureRecipe(recipe.name, true, true); } }, attachment.is_default ? "Default" : "Set default") : null)
+        );
+      })),
+      h("form", { className: "grid gap-2", onSubmit: startRun }, h(FieldLabel, { htmlFor: "graph-v1-request", control: h("textarea", { id: "graph-v1-request", className: FIELD_CLASS, rows: 3, value: requestText, onChange: function (event) { setRequestText(event.target.value); }, placeholder: "What should this Run accomplish?" }) }, "Run request"), h("div", { className: "flex justify-end" }, h(Button, { type: "submit", size: "sm", disabled: !selectedName || !requestText.trim() || !!busy }, busy === "launch" ? h(Spinner, { label: "Starting" }) : "Start v1 Run"))),
+      error ? h("p", { className: "text-xs text-destructive", role: "alert" }, error) : null,
+      runId && !graph ? h(LoadingState, { label: "Loading v1 Run…" }) : null,
+      graph ? h(GraphV1Run, { graph: graph, onRefresh: loadGraph }) : null
+    );
+  }
+
+
+  function GraphV1Run(props) {
+    var graph = props.graph;
+    var _a = useState(""), busy = _a[0], setBusy = _a[1];
+    var _b = useState(""), error = _b[0], setError = _b[1];
+    if (!graph || !graph.run) return null;
+    var attempts = Array.isArray(graph.run.attempts) ? graph.run.attempts : [];
+
+    function decideHuman(attempt, result) {
+      var key = attempt.id + ":" + result;
+      setBusy(key); setError("");
+      request("/v1/human-boxes/" + encodeURIComponent(attempt.id) + "/decision", {
+        method: "POST",
+        body: JSON.stringify({ result: result, nonce: newNonce(), actor_kind: "human", actor_id: "local-operator", channel: "dashboard" }),
+      }).then(function () { return props.onRefresh(); })
+        .catch(function (err) { setError(errorText(err)); })
+        .finally(function () { setBusy(""); });
+    }
+
+    return h("section", { className: "grid gap-3 border border-border bg-background/20 p-4", "data-graph-v1-run": graph.run.id },
+      h("div", { className: "flex flex-wrap items-center justify-between gap-2" }, h("div", null, h("strong", { className: "font-mono-ui text-sm text-foreground" }, graph.recipe.name), h("span", { className: "ml-2 font-mono-ui text-xs text-text-tertiary" }, graph.run.id)), h(StatePill, { value: graph.run.state })),
+      h("div", { className: "grid gap-3", "aria-label": "Declared GraphRunner recipe" }, graph.boxes.map(function (box) {
+        var boxAttempts = attempts.filter(function (attempt) { return attempt.box_id === box.id; });
+        return h("article", { key: box.id, className: "border border-border bg-card p-3", "data-graph-v1-box": box.id },
+          h("div", { className: "flex flex-wrap items-center justify-between gap-2" }, h("strong", { className: "text-sm text-foreground" }, box.name), h("div", { className: "flex gap-2" }, h(MonoChip, null, box.id), h(MonoChip, null, box.who), box.end ? h(Badge, { className: "factory-pill text-xs", tone: "secondary" }, "End") : null)),
+          h("p", { className: "mt-2 whitespace-pre-wrap text-xs text-text-secondary" }, box.instructions),
+          boxAttempts.length ? h("div", { className: "mt-3 grid gap-2" }, boxAttempts.map(function (attempt) {
+            var declaredResults = graph.arrows.filter(function (arrow) { return arrow.from === attempt.box_id; }).map(function (arrow) { return arrow.result; });
+            return h("div", { key: attempt.id, className: "border-t border-border/60 pt-2", "data-graph-v1-attempt": attempt.id },
+              h("div", { className: "flex flex-wrap items-center gap-2 text-xs" }, h(MonoChip, null, "attempt " + attempt.ordinal), h(StatePill, { value: attempt.state }), attempt.result ? h(MonoChip, null, "result: " + attempt.result) : null),
+              attempt.input_work != null ? h("p", { className: "mt-2 whitespace-pre-wrap text-xs text-text-secondary" }, "Input: ", typeof attempt.input_work === "string" ? attempt.input_work : JSON.stringify(attempt.input_work)) : null,
+              attempt.output_work != null ? h("p", { className: "mt-1 whitespace-pre-wrap text-xs text-text-secondary" }, "Work: ", typeof attempt.output_work === "string" ? attempt.output_work : JSON.stringify(attempt.output_work)) : null,
+              attempt.technical_failure ? h("p", { className: "mt-1 whitespace-pre-wrap text-xs text-destructive" }, attempt.technical_failure) : null,
+              attempt.state === "waiting_human" ? h("div", { className: "mt-2 flex flex-wrap gap-2", "aria-label": "Declared human results" }, declaredResults.map(function (result) { return h(Button, { key: result, type: "button", size: "xs", disabled: !!busy, "data-graph-v1-decision": result, onClick: function () { decideHuman(attempt, result); } }, busy === attempt.id + ":" + result ? h(Spinner, { label: "Recording" }) : result); })) : null
+            );
+          })) : h("p", { className: "mt-2 text-xs text-text-tertiary" }, "No attempts yet.")
+        );
+      })),
+      h("section", { className: "grid gap-1", "aria-label": "Declared result routes" }, h("strong", { className: "text-xs text-foreground" }, "Declared result routes"), graph.arrows.map(function (arrow, index) { return h("p", { key: arrow.from + ":" + arrow.result + ":" + index, className: "font-mono-ui text-xs text-text-secondary" }, arrow.from, " — ", arrow.result, " → ", arrow.to.join(", ")); })),
+      error ? h("p", { className: "text-xs text-destructive", role: "alert" }, error) : null
+    );
+  }
+
+
   function ProjectDetails(props) {
     var project = props.project;
     var runtime = props.runtime;
@@ -2310,6 +2421,7 @@
     }
     return h("section", { className: "factory-project-detail grid gap-4" },
       h(ViewHeading, { title: project.name || project.id, description: "Choose an attached recipe, configure its immutable inputs, and start one flight." }),
+      h(GraphV1ProjectPanel, { project: project, runtime: runtime }),
       policyError ? h("div", { className: "border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive", role: "alert" }, policyError) : null,
       !runtime.policy_editing_enabled ? h("p", { className: "border border-border bg-background/20 p-3 text-xs text-text-tertiary" }, "Recipe policy editing is disabled by runtime configuration.") : null,
       recipeResource.loading && recipeResource.data === null ? h(LoadingState, { label: "Loading project recipes…" }) :

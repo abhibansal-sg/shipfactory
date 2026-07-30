@@ -11,12 +11,57 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 from shipfactory.config import projects_visual_recipes_config
+from shipfactory.graph_recipe import GraphRecipe
 from shipfactory.recipes.primitives import review_verdict_targets
 
 
 GRAPH_SCHEMA = "shipfactory.graph/v1"
 _WORK_PRIMITIVES = {"agent_task", "review_gate", "verification", "notify"}
 _DIAMOND_PRIMITIVES = {"approval_gate", "wait_for_event"}
+
+
+def project_direct_graph_v1(
+    recipe: GraphRecipe,
+    *,
+    run: Mapping[str, Any],
+    attempts: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Project a frozen GraphRunner recipe and Run without legacy semantics."""
+    projected_attempts = [deepcopy(dict(attempt)) for attempt in attempts]
+    return {
+        "recipe": {
+            "name": recipe.name,
+            "start": recipe.start,
+            "hash": recipe.hash,
+        },
+        "boxes": [
+            {
+                "id": box["id"],
+                "name": box["name"],
+                "who": box["who"],
+                "instructions": box["instructions"],
+                "end": bool(box.get("end", False)),
+            }
+            for box in recipe.boxes
+        ],
+        "arrows": [
+            {
+                "from": arrow["from"],
+                "result": arrow["result"],
+                "to": list(arrow["to"]),
+            }
+            for arrow in recipe.arrows
+        ],
+        "run": {
+            "id": run["id"],
+            "state": run["state"],
+            "attempts": projected_attempts,
+            "waiting_human": [
+                attempt for attempt in projected_attempts
+                if attempt["state"] == "waiting_human"
+            ],
+        },
+    }
 
 
 def _shape(primitive: str) -> str:

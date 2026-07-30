@@ -180,6 +180,31 @@ window.__SHIPFACTORY_CONFORMANCE_FIXTURES__ = CONFORMANCE_FIXTURES;
 window.__SHIPFACTORY_CONFORMANCE_API_RECIPES__ = apiRecipeFixtures;
 window.__SHIPFACTORY_CONFORMANCE_REQUESTS__ = [];
 
+const graphV1RecipeFixture = deepFreeze({
+  name: "plan-build-review",
+  start: "planner",
+  hash: "fixture-v1-hash",
+  boxes: [
+    { id: "planner", name: "Plan", who: "planner", instructions: "Produce a focused plan.", end: false },
+    { id: "approve", name: "Approve", who: "human", instructions: "Approve only after reviewing the work.", end: false },
+    { id: "deliver", name: "Deliver", who: "builder", instructions: "Deliver the accepted result.", end: true },
+  ],
+  arrows: [
+    { from: "planner", result: "done", to: ["approve"] },
+    { from: "approve", result: "approved", to: ["deliver"] },
+  ],
+});
+let graphV1RunFixture = {
+  recipe: { name: graphV1RecipeFixture.name, start: graphV1RecipeFixture.start, hash: graphV1RecipeFixture.hash },
+  boxes: graphV1RecipeFixture.boxes,
+  arrows: graphV1RecipeFixture.arrows,
+  run: {
+    id: "fixture-v1-run", state: "running",
+    attempts: [{ id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it" }, output_work: null, result: null, technical_failure: null }],
+    waiting_human: [{ id: "fixture-human-attempt", box_id: "approve", ordinal: 1, state: "waiting_human", input_work: { request: "Ship it" }, output_work: null, result: null, technical_failure: null }],
+  },
+};
+
 let browserPolicy = JSON.parse(JSON.stringify(policyFixtures.attached));
 
 function browserJsonResponse(payload, status = 200) {
@@ -217,6 +242,31 @@ function browserMockFetch(url, options = {}) {
       default: browserPolicy.default_recipe_key,
     };
     return Promise.resolve(browserJsonResponse(payload));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/v1/recipes") {
+    return Promise.resolve(browserJsonResponse({ recipes: [graphV1RecipeFixture] }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/v1/projects/p_bound/recipes") {
+    return Promise.resolve(browserJsonResponse({ project_id: "p_bound", recipes: [{ name: graphV1RecipeFixture.name, enabled: true, is_default: true }] }));
+  }
+  if (method === "PUT" && path === "/api/plugins/shipfactory/v1/projects/p_bound/recipes/plan-build-review") {
+    const attachment = JSON.parse(options.body || "{}");
+    return Promise.resolve(browserJsonResponse({ project_id: "p_bound", recipe: { name: graphV1RecipeFixture.name, ...attachment } }));
+  }
+  if (method === "POST" && path === "/api/plugins/shipfactory/v1/projects/p_bound/runs") {
+    return Promise.resolve(browserJsonResponse({ run: { id: graphV1RunFixture.run.id, state: graphV1RunFixture.run.state } }));
+  }
+  if (method === "GET" && path === "/api/plugins/shipfactory/v1/runs/fixture-v1-run/graph") {
+    return Promise.resolve(browserJsonResponse(JSON.parse(JSON.stringify(graphV1RunFixture))));
+  }
+  if (method === "POST" && path === "/api/plugins/shipfactory/v1/human-boxes/fixture-human-attempt/decision") {
+    const decision = JSON.parse(options.body || "{}");
+    graphV1RunFixture = JSON.parse(JSON.stringify(graphV1RunFixture));
+    graphV1RunFixture.run.attempts[0].state = "completed";
+    graphV1RunFixture.run.attempts[0].result = decision.result;
+    graphV1RunFixture.run.attempts[0].output_work = "Human decision: " + decision.result;
+    graphV1RunFixture.run.waiting_human = [];
+    return Promise.resolve(browserJsonResponse({ decision: { id: "fixture-v1-decision", result: decision.result, replayed: false } }));
   }
   if (method === "GET" && path === "/api/plugins/shipfactory/projects/p_bound/recipes") {
     return Promise.resolve(browserJsonResponse({

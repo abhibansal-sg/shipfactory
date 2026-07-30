@@ -26,6 +26,7 @@ if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
 from shipfactory import store
+from shipfactory.legacy_drain import build_report as build_legacy_drain_report
 from shipfactory.recipe_graph import project_graph
 from shipfactory.recipes import advancer
 from shipfactory.recipes.loader import Recipe, RecipeError, validate
@@ -105,6 +106,31 @@ class ProjectFlightRequest(BaseModel):
     skip_steps: list[str] = Field(default_factory=list)
     linear_issue_id: str | None = None
     idempotency_key: str = Field(min_length=1)
+
+
+class GraphProjectRecipeWrite(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    is_default: bool = False
+
+
+class GraphRunLaunch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recipe: str = Field(min_length=1)
+    request: str = Field(min_length=1)
+    launch_key: str = Field(min_length=1)
+
+
+class GraphHumanDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    result: str = Field(min_length=1)
+    nonce: str = Field(min_length=1)
+    actor_kind: str = Field(pattern="^human$")
+    actor_id: str = Field(min_length=1)
+    channel: str = Field(min_length=1)
 
 
 class SeatWrite(BaseModel):
@@ -871,7 +897,10 @@ def _project_registry(project_id: str | None = None) -> tuple[Any, list[Any]]:
     """Read Hermes projects and their explicit ``board_slug`` live."""
     from hermes_cli import projects_db
 
-    with projects_db.connect_closing() as conn:
+    # Hermes' normal connector is also its schema/WAL initialization seam.
+    # Dashboard reads consume the already-initialized registry in SQLite's
+    # read-only/query-only mode instead of running that seam per request.
+    with store._connect_readonly(projects_db.projects_db_path()) as conn:
         projects = list(projects_db.list_projects(conn))
         if project_id is None:
             return None, projects
@@ -898,6 +927,81 @@ def resolve_hermes_project(project_id: str) -> dict[str, Any]:
         "binding": _project_binding(project, projects),
         "board_slug": _project_value(project, "board_slug"),
     }
+
+
+def _v1_library() -> dict[str, Any]:
+    """Load the current editable v1 library from the configured recipe root."""
+    from shipfactory.config import load_seats
+    from shipfactory.graph_recipe import GraphRecipeError, load_library
+
+    try:
+        config = load_seats()
+        recipes = config.recipes or {}
+        root = recipes.get("library_path")
+        if not isinstance(root, str) or not root.strip():
+            _project_error(
+                400, "invalid_recipe_library",
+                "recipes.library_path is not configured",
+            )
+        return load_library(Path(root).expanduser() / "v1")
+    except _ProjectAPIError:
+        raise
+    except (FileNotFoundError, OSError, TypeError, UnicodeError, GraphRecipeError) as exc:
+        _project_error(400, "invalid_recipe_library", str(exc))
+
+
+def _v1_recipe_projection(recipe: Any) -> dict[str, Any]:
+    return {
+        "name": recipe.name,
+        "start": recipe.start,
+        "hash": recipe.hash,
+        "boxes": [dict(box) for box in recipe.boxes],
+        "arrows": [dict(arrow) for arrow in recipe.arrows],
+    }
+
+
+def _v1_project(project_id: str) -> tuple[str, Path]:
+    projection = resolve_hermes_project(project_id)
+    if projection["binding"] != "bound":
+        _project_error(
+            409, "project_binding_unavailable",
+            "project has no unique active board binding",
+        )
+    board = projection["board_slug"]
+    workspace = _project_value(projection["project"], "primary_path")
+    if not isinstance(board, str) or not board.strip():
+        _project_error(409, "project_binding_unavailable", "project has no board binding")
+    if not isinstance(workspace, str) or not workspace.strip():
+        _project_error(
+            409, "project_workspace_unavailable",
+            "project has no primary Git workspace",
+        )
+    return board, Path(workspace).expanduser().resolve()
+
+
+def _v1_run_projection(db: Any, run: dict[str, Any]) -> dict[str, Any]:
+    from shipfactory.graph_recipe import validate as validate_graph_recipe
+    from shipfactory.recipe_graph import project_direct_graph_v1
+
+    snapshot = json.loads(run["recipe_snapshot_json"])
+    attempts = [
+        dict(row) for row in db.execute(
+            "SELECT * FROM box_attempts_v1 WHERE run_id=? ORDER BY created_at,id",
+            (run["id"],),
+        ).fetchall()
+    ]
+    for attempt in attempts:
+        for source, target in (
+            ("input_work_json", "input_work"),
+            ("output_work_json", "output_work"),
+        ):
+            raw = attempt.get(source)
+            if raw is not None:
+                attempt[target] = json.loads(raw)
+    recipe = validate_graph_recipe(snapshot)
+    if recipe.hash != run["recipe_hash"]:
+        raise ValueError("frozen v1 recipe hash does not match Run binding")
+    return project_direct_graph_v1(recipe, run=run, attempts=attempts)
 
 
 def _project_summary(project: Any, binding: str, policy: dict[str, Any] | None,
@@ -1327,8 +1431,7 @@ def list_projects() -> dict[str, Any] | JSONResponse:
         _require_project_flag(runtime, "enabled")
         project, projects = _project_registry()
         del project
-        store.init_db()
-        with store._connect() as db:
+        with store._connect_readonly() as db:
             rollups, unclassified_rollup = _project_rollups(
                 db, projects, int(runtime["recent_flight_limit"]),
             )
@@ -1351,7 +1454,7 @@ def list_projects() -> dict[str, Any] | JSONResponse:
         }
     except _ProjectAPIError as exc:
         return _project_error_response(exc)
-    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+    except (FileNotFoundError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         return _project_error_response(_ProjectAPIError(400, "projects_unavailable", str(exc)))
 
 
@@ -1427,6 +1530,260 @@ def create_project_flight(
         return _project_error_response(exc)
     except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
         return _project_error_response(_ProjectAPIError(400, "launch_failed", str(exc)))
+
+
+@router.get("/v1/recipes", response_model=None)
+def list_graph_recipes_v1() -> dict[str, Any] | JSONResponse:
+    try:
+        library = _v1_library()
+        return {
+            "recipes": [
+                _v1_recipe_projection(library[name]) for name in sorted(library)
+            ],
+        }
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+
+
+@router.get("/v1/legacy-drain-report")
+def get_legacy_drain_report_v1():
+    return build_legacy_drain_report()
+
+
+@router.get("/v1/recipes/{name}", response_model=None)
+def show_graph_recipe_v1(name: str) -> dict[str, Any] | JSONResponse:
+    try:
+        recipe = _v1_library().get(name)
+        if recipe is None:
+            _project_error(404, "recipe_not_found", "unknown v1 recipe")
+        return {"recipe": _v1_recipe_projection(recipe)}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+
+
+@router.get("/v1/projects/{project_id}/recipes", response_model=None)
+def list_project_graph_recipes_v1(project_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        _v1_project(project_id)
+        with store._connect_readonly() as db:
+            rows = [
+                dict(row) for row in db.execute(
+                    """SELECT recipe_name AS name,enabled,is_default
+                       FROM project_recipes_v1 WHERE project_id=?
+                       ORDER BY recipe_name""",
+                    (project_id,),
+                ).fetchall()
+            ]
+        for row in rows:
+            row["enabled"] = bool(row["enabled"])
+            row["is_default"] = bool(row["is_default"])
+        return {"project_id": project_id, "recipes": rows}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error) as exc:
+        return _project_error_response(
+            _ProjectAPIError(400, "projects_unavailable", str(exc))
+        )
+
+
+@router.put("/v1/projects/{project_id}/recipes/{name}", response_model=None)
+def update_project_graph_recipe_v1(
+    project_id: str, name: str, request: GraphProjectRecipeWrite,
+) -> dict[str, Any] | JSONResponse:
+    try:
+        _v1_project(project_id)
+        if name not in _v1_library():
+            _project_error(404, "recipe_not_found", "unknown v1 recipe")
+        if request.is_default and not request.enabled:
+            _project_error(
+                422, "invalid_project_recipe",
+                "a disabled recipe cannot be the project default",
+                "is_default",
+            )
+        store.init_db()
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if request.is_default:
+                db.execute(
+                    "UPDATE project_recipes_v1 SET is_default=0,updated_at=? "
+                    "WHERE project_id=?",
+                    (store._now(), project_id),
+                )
+            now = store._now()
+            db.execute(
+                """INSERT INTO project_recipes_v1(
+                       project_id,recipe_name,enabled,is_default,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(project_id,recipe_name) DO UPDATE SET
+                       enabled=excluded.enabled,is_default=excluded.is_default,
+                       updated_at=excluded.updated_at""",
+                (
+                    project_id, name, int(request.enabled), int(request.is_default),
+                    now, now,
+                ),
+            )
+            row = db.execute(
+                """SELECT recipe_name AS name,enabled,is_default
+                   FROM project_recipes_v1 WHERE project_id=? AND recipe_name=?""",
+                (project_id, name),
+            ).fetchone()
+        result = dict(row)
+        result["enabled"] = bool(result["enabled"])
+        result["is_default"] = bool(result["is_default"])
+        return {"project_id": project_id, "recipe": result}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except sqlite3.Error as exc:
+        return _project_error_response(
+            _ProjectAPIError(409, "project_recipe_conflict", str(exc))
+        )
+
+
+@router.post("/v1/projects/{project_id}/runs", response_model=None)
+def create_graph_run_v1(
+    project_id: str, request: GraphRunLaunch,
+) -> dict[str, Any] | JSONResponse:
+    from shipfactory import graph_runner
+    from shipfactory.recipes.instantiate import current_base_sha
+
+    try:
+        library = _v1_library()
+        recipe = library.get(request.recipe)
+        if recipe is None:
+            _project_error(404, "recipe_not_found", "unknown v1 recipe")
+        board, workspace = _v1_project(project_id)
+        try:
+            current_base_sha(workspace)
+        except (OSError, ValueError) as exc:
+            _project_error(409, "project_workspace_unavailable", str(exc))
+        store.init_db()
+        with store._connect() as db:
+            attachment = db.execute(
+                """SELECT enabled FROM project_recipes_v1
+                   WHERE project_id=? AND recipe_name=?""",
+                (project_id, request.recipe),
+            ).fetchone()
+        if attachment is None or not bool(attachment["enabled"]):
+            _project_error(
+                409, "recipe_not_enabled",
+                "recipe is not enabled for this project",
+            )
+        run = graph_runner.start_run(
+            project_id=project_id,
+            board=board,
+            recipe=recipe,
+            request_text=request.request,
+            launch_key=request.launch_key,
+            workspace_path=str(workspace),
+        )
+        return {"run": run}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except store.GraphStoreConflict as exc:
+        return _project_error_response(
+            _ProjectAPIError(409, "launch_key_conflict", str(exc), "launch_key")
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "launch_failed", str(exc)))
+
+
+@router.get("/v1/runs", response_model=None)
+def list_graph_runs_v1(
+    project_id: str | None = None,
+    state: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any] | JSONResponse:
+    try:
+        valid_states = {
+            "running", "paused", "completed", "escalated", "cancelled", "failed",
+        }
+        if state is not None and state not in valid_states:
+            _project_error(422, "invalid_run_state", "unknown v1 Run state", "state")
+        if limit < 1 or limit > 1000:
+            _project_error(422, "invalid_limit", "limit must be between 1 and 1000", "limit")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id=?")
+            parameters.append(project_id)
+        if state is not None:
+            clauses.append("state=?")
+            parameters.append(state)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        parameters.append(limit)
+        with store._connect_readonly() as db:
+            rows = [
+                dict(row) for row in db.execute(
+                    "SELECT * FROM recipe_runs_v1" + where
+                    + " ORDER BY created_at DESC,id LIMIT ?",
+                    tuple(parameters),
+                )
+            ]
+        return {"runs": rows}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error) as exc:
+        return _project_error_response(_ProjectAPIError(400, "runs_unavailable", str(exc)))
+
+
+@router.get("/v1/runs/{run_id}", response_model=None)
+def show_graph_run_v1(run_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        with store._connect_readonly() as db:
+            row = db.execute(
+                "SELECT * FROM recipe_runs_v1 WHERE id=?", (run_id,),
+            ).fetchone()
+        if row is None:
+            _project_error(404, "run_not_found", "unknown v1 Run")
+        return {"run": dict(row)}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error) as exc:
+        return _project_error_response(_ProjectAPIError(400, "runs_unavailable", str(exc)))
+
+
+@router.get("/v1/runs/{run_id}/graph", response_model=None)
+def graph_run_v1(run_id: str) -> dict[str, Any] | JSONResponse:
+    try:
+        with store._connect_readonly() as db:
+            row = db.execute(
+                "SELECT * FROM recipe_runs_v1 WHERE id=?", (run_id,),
+            ).fetchone()
+            if row is None:
+                _project_error(404, "run_not_found", "unknown v1 Run")
+            return _v1_run_projection(db, dict(row))
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "runs_unavailable", str(exc)))
+
+
+@router.post("/v1/human-boxes/{attempt_id}/decision", response_model=None)
+def decide_human_box_v1(
+    attempt_id: str, request: GraphHumanDecision,
+) -> dict[str, Any] | JSONResponse:
+    from shipfactory.decisions import DecisionConflict, enqueue_human_box_decision
+
+    try:
+        decision = enqueue_human_box_decision(
+            attempt_id=attempt_id,
+            result=request.result,
+            actor_kind=request.actor_kind,
+            actor_id=request.actor_id,
+            channel=request.channel,
+            nonce=request.nonce,
+        )
+        return {"decision": decision}
+    except DecisionConflict as exc:
+        message = str(exc)
+        status = 422 if "has no declared outgoing arrow" in message else 409
+        return _project_error_response(
+            _ProjectAPIError(status, "invalid_human_decision", message, "result")
+        )
+    except (TypeError, ValueError) as exc:
+        return _project_error_response(
+            _ProjectAPIError(422, "invalid_human_decision", str(exc))
+        )
 
 
 @router.get("/recipes")

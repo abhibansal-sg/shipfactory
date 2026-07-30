@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import importlib.util
 import importlib
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -85,23 +85,23 @@ def _configure(tmp_path: Path, monkeypatch, *, projects_visual_recipes=None, cal
 def _projects(monkeypatch, projects: list[SimpleNamespace]) -> None:
     from hermes_cli import projects_db
 
-    @contextmanager
-    def connect_closing():
-        yield object()
-
-    monkeypatch.setattr(projects_db, "connect_closing", connect_closing)
-    monkeypatch.setattr(
-        projects_db,
-        "list_projects",
-        lambda _conn, include_archived=False: list(projects),
-    )
-    monkeypatch.setattr(
-        projects_db,
-        "get_project",
-        lambda _conn, value: next(
-            (p for p in projects if p.id == value or p.slug == value), None
-        ),
-    )
+    with projects_db.connect_closing() as conn:
+        for index, project in enumerate(projects, start=1):
+            conn.execute(
+                "INSERT INTO projects(id,slug,name,board_slug,primary_path,created_at,archived) "
+                "VALUES(?,?,?,?,?,?,0)",
+                (
+                    project.id,
+                    project.slug,
+                    project.name,
+                    project.board_slug,
+                    project.primary_path,
+                    index,
+                ),
+            )
+        conn.commit()
+    # Test startup seam: request handlers consume preinitialized databases.
+    store.init_db()
 
 
 def _project(
@@ -157,6 +157,46 @@ def test_projects_exposes_fresh_runtime_config_and_unclassified_rollup(
     assert body["unclassified"]["rollup"]["active"] == 1
     assert "board" not in body and "board_slug" not in body
     assert "board" not in body["projects"][0]
+
+
+def test_projects_listing_uses_only_preinitialized_readonly_databases(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import projects_db
+
+    _configure(tmp_path, monkeypatch)
+    projects_path = projects_db.projects_db_path()
+    with projects_db.connect_closing(db_path=projects_path) as conn:
+        projects_db.create_project(
+            conn,
+            name="Factory",
+            slug="factory",
+            board_slug="board-a",
+            primary_path=str(PLUGIN_API.parents[1]),
+        )
+    store.init_db()
+
+    for path in (None, projects_path):
+        with store._connect_readonly(path) as conn:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                conn.execute("CREATE TABLE forbidden_write(id INTEGER)")
+    missing = tmp_path / "missing" / "database.db"
+    with pytest.raises(sqlite3.OperationalError):
+        store._connect_readonly(missing)
+    assert not missing.exists()
+
+    def write_mode_forbidden(*_args, **_kwargs):
+        raise AssertionError("read-only project listing opened a write-mode database")
+
+    monkeypatch.setattr(store, "init_db", write_mode_forbidden)
+    monkeypatch.setattr(store, "_connect", write_mode_forbidden)
+    monkeypatch.setattr(projects_db, "connect", write_mode_forbidden)
+    monkeypatch.setattr(projects_db, "connect_closing", write_mode_forbidden)
+
+    response = _client().get("/api/plugins/shipfactory/projects")
+
+    assert response.status_code == 200
+    assert response.json()["projects"][0]["slug"] == "factory"
 
 
 def test_policy_write_filters_recipes_and_survives_reopen(tmp_path, monkeypatch):

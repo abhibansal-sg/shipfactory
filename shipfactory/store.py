@@ -682,6 +682,22 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _connect_readonly(path: Path | None = None) -> sqlite3.Connection:
+    """Open an existing SQLite database without creating or migrating it."""
+    target = (_db_path() if path is None else Path(path)).expanduser().resolve()
+    conn = sqlite3.connect(
+        f"{target.as_uri()}?mode=ro",
+        uri=True,
+        timeout=5.0,
+        factory=_ClosingConnection,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def _rows(cursor: sqlite3.Cursor) -> list[dict]:
     return [dict(row) for row in cursor.fetchall()]
 

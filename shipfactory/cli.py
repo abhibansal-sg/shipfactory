@@ -220,6 +220,108 @@ def _runs(args: argparse.Namespace) -> Any:
     return _emit(accessor(args.id) if args.id and accessor else accessor() if accessor else [])
 
 
+def _graph_recipe_library() -> dict[str, Any]:
+    from shipfactory.config import load_seats
+    from shipfactory.graph_recipe import load_library
+
+    recipes = load_seats().recipes or {}
+    root = recipes.get("library_path")
+    if not isinstance(root, str) or not root.strip():
+        raise ValueError("recipes.library_path is not configured")
+    return load_library(Path(root).expanduser() / "v1")
+
+
+def _graph_recipe(args: argparse.Namespace) -> Any:
+    library = _graph_recipe_library()
+    if args.recipe_command == "list":
+        answer = [
+            {
+                "name": recipe.name, "start": recipe.start, "hash": recipe.hash,
+                "boxes": [dict(box) for box in recipe.boxes],
+                "arrows": [dict(arrow) for arrow in recipe.arrows],
+            }
+            for recipe in (library[name] for name in sorted(library))
+        ]
+    else:
+        recipe = library.get(args.instance)
+        if recipe is None:
+            raise ValueError("unknown v1 recipe")
+        answer = {
+            "name": recipe.name, "start": recipe.start, "hash": recipe.hash,
+            "boxes": [dict(box) for box in recipe.boxes],
+            "arrows": [dict(arrow) for arrow in recipe.arrows],
+        }
+    return _emit(answer)
+
+
+def _graph_project(project_id: str) -> tuple[str, Path]:
+    from hermes_cli import projects_db
+    from shipfactory import store
+
+    with store._connect_readonly(projects_db.projects_db_path()) as db:
+        project = projects_db.get_project(db, project_id)
+        projects = list(projects_db.list_projects(db))
+    if project is None:
+        raise ValueError("unknown Hermes project")
+    board = project.board_slug
+    matches = [item for item in projects if item.board_slug == board]
+    if not board or len(matches) != 1 or matches[0].id != project.id:
+        raise ValueError("project has no unique active board binding")
+    if not project.primary_path:
+        raise ValueError("project has no primary Git workspace")
+    return str(board), Path(project.primary_path).expanduser().resolve()
+
+
+def _run(args: argparse.Namespace) -> Any:
+    from shipfactory import graph_runner, store
+
+    if args.run_command == "list":
+        return _emit(store.list_recipe_runs_v1(
+            project_id=args.project, state=args.state, limit=args.limit,
+        ))
+    if args.run_command == "show":
+        row = store.get_recipe_run_v1(args.id)
+        if row is None:
+            raise ValueError("unknown v1 Run")
+        return _emit(row)
+    if args.run_command == "decide":
+        from shipfactory.decisions import enqueue_human_box_decision
+        return _emit(enqueue_human_box_decision(
+            attempt_id=args.attempt, result=args.result,
+            actor_kind="human", actor_id=args.actor_id,
+            channel=args.channel, nonce=args.nonce,
+        ))
+
+    recipe = _graph_recipe_library().get(args.recipe)
+    if recipe is None:
+        raise ValueError("unknown v1 recipe")
+    board, workspace = _graph_project(args.project)
+    from shipfactory.recipes.instantiate import current_base_sha
+    current_base_sha(workspace)
+    store.init_db()
+    with store._connect() as db:
+        attached = db.execute(
+            """SELECT enabled FROM project_recipes_v1
+               WHERE project_id=? AND recipe_name=?""",
+            (args.project, args.recipe),
+        ).fetchone()
+    if attached is None or not bool(attached["enabled"]):
+        raise ValueError("recipe is not enabled for this project")
+    return _emit(graph_runner.start_run(
+        project_id=args.project,
+        board=board,
+        recipe=recipe,
+        request_text=args.request,
+        launch_key=args.launch_key,
+        workspace_path=str(workspace),
+    ))
+
+
+def _legacy_drain_report(_args: argparse.Namespace) -> Any:
+    from shipfactory.legacy_drain import build_report
+    return _emit(build_report())
+
+
 def _pause(args: argparse.Namespace) -> Any:
     from shipfactory import store
     paused = args.shipfactory_verb == "pause"
@@ -229,6 +331,8 @@ def _pause(args: argparse.Namespace) -> Any:
 
 def _recipe(args: argparse.Namespace) -> Any:
     """Thin CLI facade: commands enqueue/reconcile through the recipe service."""
+    if getattr(args, "v1", False):
+        return _graph_recipe(args)
     from shipfactory import store
     from shipfactory.recipes import advancer
     from hermes_cli import kanban_db
@@ -385,9 +489,19 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p = _handler(verbs, "sync", "synchronize GitHub Issues", _sync); p.add_argument("--board"); p.add_argument("--repo", required=True)
     p = _handler(verbs, "dashboard", "serve the local operator dashboard", _dashboard); p.add_argument("--port", type=int, default=18820)
     p = _handler(verbs, "runs", "list or inspect harness runs", _runs); p.add_argument("id", nargs="?", type=int)
+    _handler(
+        verbs, "legacy-drain-report",
+        "report read-only legacy deletion-gate readiness",
+        _legacy_drain_report,
+    )
+    p = _handler(verbs, "run", "operate GraphRunner v1 Runs", _run); subs = p.add_subparsers(dest="run_command", required=True)
+    q = subs.add_parser("start"); q.add_argument("--project", required=True); q.add_argument("--recipe", required=True); q.add_argument("--request", required=True); q.add_argument("--launch-key", required=True)
+    q = subs.add_parser("show"); q.add_argument("id")
+    q = subs.add_parser("list"); q.add_argument("--project"); q.add_argument("--state", choices=("running", "paused", "completed", "escalated", "cancelled", "failed")); q.add_argument("--limit", type=int, default=100)
+    q = subs.add_parser("decide"); q.add_argument("attempt"); q.add_argument("--result", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli")
     p = _handler(verbs, "recipe", "operate recipe instances", _recipe); subs = p.add_subparsers(dest="recipe_command", required=True)
-    q = subs.add_parser("show"); q.add_argument("instance")
-    subs.add_parser("waiting"); subs.add_parser("list")
+    q = subs.add_parser("show"); q.add_argument("instance"); q.add_argument("--v1", action="store_true")
+    subs.add_parser("waiting"); q = subs.add_parser("list"); q.add_argument("--v1", action="store_true")
     for name in ("approve", "reject"):
         q = subs.add_parser(name); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", default=""); q.add_argument("--activation", type=int, required=True); q.add_argument("--revision-hash", required=True); q.add_argument("--evidence-bundle-hash", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-kind", default="operator"); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli"); q.add_argument("--board")
     q = subs.add_parser("release"); q.add_argument("instance"); q.add_argument("step"); q.add_argument("--reason", required=True); q.add_argument("--board")
