@@ -13,6 +13,7 @@ import yaml
 
 
 _TOP_LEVEL_KEYS = frozenset({"name", "start", "boxes", "arrows"})
+_TOP_LEVEL_KEYS_WITH_APPROVAL_ARTIFACT = _TOP_LEVEL_KEYS | {"approval_artifact"}
 _BOX_KEYS = frozenset({"id", "name", "who", "instructions"})
 _BOX_KEYS_WITH_END = _BOX_KEYS | {"end"}
 _ARROW_KEYS = frozenset({"from", "result", "to"})
@@ -65,6 +66,7 @@ class GraphRecipe:
     document: dict[str, object]
     canonical_json: str
     hash: str
+    approval_artifact: str | None = None
 
     def box(self, box_id: str) -> dict[str, object]:
         for box in self.boxes:
@@ -125,7 +127,13 @@ def _require_non_empty_string(value: Any, *, location: str) -> str:
 
 
 def validate(document: object) -> GraphRecipe:
-    _require_exact_keys(document, _TOP_LEVEL_KEYS, location="top-level document")
+    if isinstance(document, dict) and "approval_artifact" in document:
+        _require_exact_keys(
+            document, _TOP_LEVEL_KEYS_WITH_APPROVAL_ARTIFACT,
+            location="top-level document",
+        )
+    else:
+        _require_exact_keys(document, _TOP_LEVEL_KEYS, location="top-level document")
     assert isinstance(document, dict)
     if not isinstance(document["boxes"], list):
         raise GraphRecipeError("boxes must be a list")
@@ -191,6 +199,16 @@ def validate(document: object) -> GraphRecipe:
 
     if document["start"] not in box_ids:
         raise GraphRecipeError("start must reference an existing box")
+
+    approval_artifact = document.get("approval_artifact")
+    if approval_artifact is not None:
+        approval_artifact = _require_non_empty_string(
+            approval_artifact, location="approval_artifact",
+        )
+        if approval_artifact not in box_ids:
+            raise GraphRecipeError(
+                "approval_artifact must reference an existing box"
+            )
 
     outgoing: dict[str, list[str]] = {box_id: [] for box_id in box_ids}
     for index, arrow in enumerate(document["arrows"]):
@@ -266,6 +284,7 @@ def validate(document: object) -> GraphRecipe:
         document=frozen_document,
         canonical_json=canonical_json,
         hash=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+        approval_artifact=approval_artifact,
     )
 
 

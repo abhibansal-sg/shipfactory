@@ -195,6 +195,7 @@ def test_nonce_conflict_fails_closed(tmp_path, monkeypatch):
         decisions.enqueue_human_box_decision(
             attempt_id="human-b", result="rejected", actor_kind="human",
             actor_id="operator", channel="dashboard", nonce="shared-nonce",
+            reason="conflicting nonce probe",
         )
 
 
@@ -213,6 +214,7 @@ def test_attempt_conflict_fails_closed(tmp_path, monkeypatch):
         decisions.enqueue_human_box_decision(
             attempt_id="human", result="rejected", actor_kind="human",
             actor_id="operator", channel="dashboard", nonce="nonce-2",
+            reason="conflicting attempt probe",
         )
 
 
@@ -329,6 +331,7 @@ def test_conflicting_replay_still_fails_closed_after_event_consumed(tmp_path, mo
         decisions.enqueue_human_box_decision(
             attempt_id="human", result="rejected", actor_kind="human",
             actor_id="operator", channel="dashboard", nonce="nonce-2",
+            reason="conflicting attempt probe",
         )
 
 

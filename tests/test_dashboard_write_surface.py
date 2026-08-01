@@ -60,7 +60,7 @@ steps:
 """
 
 
-def _configure_library(tmp_path: Path, monkeypatch) -> Path:
+def _configure_library(tmp_path: Path, monkeypatch, *, runner_mode: str = "mixed") -> Path:
     library = tmp_path / "recipes"
     library.mkdir()
     (library / "route-a@1.yaml").write_text(
@@ -71,6 +71,7 @@ def _configure_library(tmp_path: Path, monkeypatch) -> Path:
     )
     recipes = {
         "enabled": True,
+        "runner_mode": runner_mode,
         "library_path": str(library),
         "bare_task_recipe": "route-a@1",
         "notify_target": "test:dashboard",
@@ -327,6 +328,7 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
         "tick_interval_seconds": 5.0,
         "config": {
             "recipes_enabled": True,
+            "runner_mode": "mixed",
             "library_path": str(tmp_path / "recipes"),
             "bare_task_recipe": "route-a@1",
         },
@@ -349,6 +351,15 @@ def test_status_endpoint_reports_stopped_and_live_daemon(tmp_path, monkeypatch):
     stale = client.get("/api/plugins/shipfactory/status")
     assert stale.json()["running"] is False
     assert stale.json()["pid"] is None
+
+
+def test_status_endpoint_reports_graph_runner_mode(tmp_path, monkeypatch):
+    _configure_library(tmp_path, monkeypatch, runner_mode="graph")
+
+    response = _client().get("/api/plugins/shipfactory/status")
+
+    assert response.status_code == 200
+    assert response.json()["config"]["runner_mode"] == "graph"
 
 
 def test_status_uses_daemon_boards_and_marks_ticks_over_three_intervals_stale(

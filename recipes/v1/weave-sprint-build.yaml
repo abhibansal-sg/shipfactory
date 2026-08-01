@@ -1,0 +1,149 @@
+# DRAFT — NOT PUBLISHED. Lives in recipes/drafts/ which the v1 library does NOT
+# scan (only recipes/v1/ is loaded — dashboard/plugin_api.py:946). Move to
+# recipes/v1/ only after operator approval. Uses existing weave-* seats.
+# Designed 2026-08-01 with Abhi. Standard lane; fast lane deferred until
+# rework-rate data exists from real sprints.
+
+name: weave-sprint-build
+start: builder
+
+boxes:
+  - id: builder
+    name: Build the sprint
+    who: weave-builder
+    instructions: |
+      The request is one approved sprint brief: goal, exact file scope,
+      acceptance criteria, and focused test commands. Execute it exactly.
+
+      Hard rules:
+      - Touch only files inside the named scope. Needing a file outside it
+        means the brief is wrong: stop and report, do not improvise.
+      - No new queues, databases, daemons, config surfaces, or fallback
+        branches. When you find a broken mechanism, delete and replace it;
+        never add a compatibility path beside it.
+      - When a test fails, find the root cause before changing code. Read the
+        real traceback, form one hypothesis, verify it, then fix. Never stack
+        speculative fixes, and never weaken or delete a test to make it pass —
+        if a test seems to contradict the brief, report it instead.
+      - Run the sprint's named test commands yourself and report their real
+        output. Do not claim anything a command did not show you.
+      - Commit your work with a clear message before finishing. Never use
+        git add -A; stage only your scoped files.
+
+      Report: what changed per file, test output summary, anything incomplete
+      or uncertain — stated plainly, never rounded up to done. Your last
+      output line must be exactly one declared result label.
+
+  - id: correctness-review
+    name: Check correctness against the brief
+    who: weave-reviewer-fast
+    instructions: |
+      Review the builder's diff against the sprint brief in the input work.
+      Diff the workspace against its base commit yourself; read the changed
+      code, not the builder's description of it.
+
+      For every acceptance criterion in the brief, verdict it: MET, NOT MET,
+      or UNVERIFIABLE, each with file:line evidence. Run the sprint's test
+      commands yourself; report their real output. Check the diff stayed
+      inside the sprint's file scope, and check critical patterns: unsafe SQL
+      or shell interpolation, race conditions on shared state, unvalidated
+      external input crossing a trust boundary, new enum or status values not
+      handled at existing call sites (grep sibling values outside the diff).
+
+      Phase scope check: the request carries a "Phase context" block stating
+      the ratified phase intent this sprint serves. Compare what the diff
+      actually does against that intent and output exactly one line:
+      "Scope check: CLEAN" or "Scope check: DRIFT — <evidence>". Drift means
+      the work serves a different goal than the phase intent, or quietly
+      expands beyond it, even when every brief criterion is met. This line is
+      informational for the synthesizer and operator; it does not by itself
+      make a finding blocking.
+
+      Rate each finding with a confidence score 1-10 and include it. "Looks
+      fine" is not a finding — either cite evidence it is fine or mark it
+      unverified. Do not modify any file. Report findings only.
+
+      Result labels: done. Your last output line must be exactly: done
+
+  - id: simplicity-review
+    name: DRY and KISS audit
+    who: weave-reviewer
+    instructions: |
+      Audit the builder's diff for unnecessary complexity. Diff the workspace
+      against its base commit yourself.
+
+      Hunt for: logic duplicating code that already exists in the repo (name
+      the existing code); new abstractions, layers, or indirection not
+      required by the brief; scope creep — changes the brief never asked for;
+      dead code, unused parameters, speculative "just in case" branches;
+      compatibility fallbacks sitting beside a mechanism that should have
+      been deleted; empty or swallowed error handling.
+
+      A blocking finding needs a concrete counterexample (file:line plus the
+      simpler alternative). Style preferences without a counterexample are
+      advisory only. Rate each finding with a confidence score 1-10. Do not
+      modify any file.
+
+      Result labels: done. Your last output line must be exactly: done
+
+  - id: synthesize
+    name: Combine the reviews
+    who: weave-synthesize
+    instructions: |
+      Combine both review reports. Decide pass or rework.
+
+      Rework requires at least one blocking finding with concrete evidence:
+      an acceptance criterion NOT MET, a critical-pattern finding at
+      confidence 7 or above, or a simplicity finding with a counterexample.
+      Advisory and low-confidence findings alone do not block; list them for
+      the operator instead. Always carry the correctness reviewer's
+      "Scope check" line into your report verbatim — the operator reads it at
+      the approval gate. When sending rework, state exactly which findings
+      the builder must address, quoting their evidence.
+
+      Result labels: pass or rework. Your last output line must be exactly
+      one label.
+
+  - id: human-approval
+    name: Operator approves the sprint
+    who: human
+    instructions: Review the builder's work and the synthesized review before approving or rejecting.
+
+  - id: deliver
+    name: Deliver the sprint
+    who: weave-deliver
+    instructions: |
+      Report completion: sprint goal, what shipped (files and commit), test
+      evidence, and any advisory findings the operator accepted. Note that
+      integration to main happens outside this run after operator sign-off.
+      Do not add new analysis.
+    end: true
+
+arrows:
+  - from: builder
+    result: done
+    to: [correctness-review, simplicity-review]
+
+  - from: correctness-review
+    result: done
+    to: [synthesize]
+
+  - from: simplicity-review
+    result: done
+    to: [synthesize]
+
+  - from: synthesize
+    result: pass
+    to: [human-approval]
+
+  - from: synthesize
+    result: rework
+    to: [builder]
+
+  - from: human-approval
+    result: approved
+    to: [deliver]
+
+  - from: human-approval
+    result: rejected
+    to: [builder]

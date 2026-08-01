@@ -289,7 +289,13 @@ def _run(args: argparse.Namespace) -> Any:
         return _emit(enqueue_human_box_decision(
             attempt_id=args.attempt, result=args.result,
             actor_kind="human", actor_id=args.actor_id,
-            channel=args.channel, nonce=args.nonce,
+            channel=args.channel, nonce=args.nonce, reason=args.reason,
+        ))
+    if args.run_command == "cancel":
+        # Delegates to the same store function the dashboard cancel API calls
+        # (finding #67 -- the operator wrapper does not duplicate policy).
+        return _emit(store.cancel_recipe_run_v1(
+            args.id, actor_id="local-operator", reason=args.reason,
         ))
 
     recipe = _graph_recipe_library().get(args.recipe)
@@ -498,7 +504,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     q = subs.add_parser("start"); q.add_argument("--project", required=True); q.add_argument("--recipe", required=True); q.add_argument("--request", required=True); q.add_argument("--launch-key", required=True)
     q = subs.add_parser("show"); q.add_argument("id")
     q = subs.add_parser("list"); q.add_argument("--project"); q.add_argument("--state", choices=("running", "paused", "completed", "escalated", "cancelled", "failed")); q.add_argument("--limit", type=int, default=100)
-    q = subs.add_parser("decide"); q.add_argument("attempt"); q.add_argument("--result", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli")
+    q = subs.add_parser("decide"); q.add_argument("attempt"); q.add_argument("--result", required=True); q.add_argument("--nonce", required=True); q.add_argument("--actor-id", required=True); q.add_argument("--channel", default="cli"); q.add_argument("--reason")
+    q = subs.add_parser("cancel"); q.add_argument("id"); q.add_argument("--reason")
     p = _handler(verbs, "recipe", "operate recipe instances", _recipe); subs = p.add_subparsers(dest="recipe_command", required=True)
     q = subs.add_parser("show"); q.add_argument("instance"); q.add_argument("--v1", action="store_true")
     subs.add_parser("waiting"); q = subs.add_parser("list"); q.add_argument("--v1", action="store_true")

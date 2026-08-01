@@ -131,6 +131,13 @@ class GraphHumanDecision(BaseModel):
     actor_kind: str = Field(pattern="^human$")
     actor_id: str = Field(min_length=1)
     channel: str = Field(min_length=1)
+    reason: str | None = Field(default=None, max_length=8000)
+
+
+class GraphRunCancel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
 
 
 class SeatWrite(BaseModel):
@@ -1772,6 +1779,7 @@ def decide_human_box_v1(
             actor_id=request.actor_id,
             channel=request.channel,
             nonce=request.nonce,
+            reason=request.reason,
         )
         return {"decision": decision}
     except DecisionConflict as exc:
@@ -1780,10 +1788,45 @@ def decide_human_box_v1(
         return _project_error_response(
             _ProjectAPIError(status, "invalid_human_decision", message, "result")
         )
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
+        message = str(exc)
+        if message == "a rejection requires operator feedback":
+            return _project_error_response(
+                _ProjectAPIError(422, "invalid_human_decision", message, "reason")
+            )
+        return _project_error_response(
+            _ProjectAPIError(422, "invalid_human_decision", message)
+        )
+    except TypeError as exc:
         return _project_error_response(
             _ProjectAPIError(422, "invalid_human_decision", str(exc))
         )
+
+
+@router.post("/v1/runs/{run_id}/cancel", response_model=None)
+def cancel_graph_run_v1(
+    run_id: str, request: GraphRunCancel,
+) -> dict[str, Any] | JSONResponse:
+    try:
+        store.init_db()
+        with store._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = store.cancel_recipe_run_v1(
+                run_id, actor_id="local-operator", reason=request.reason, conn=db,
+            )
+        return {"run": run}
+    except store.GraphStoreIntegrityError:
+        return _project_error_response(
+            _ProjectAPIError(404, "run_not_found", "unknown v1 Run")
+        )
+    except store.GraphStoreConflict as exc:
+        return _project_error_response(
+            _ProjectAPIError(409, "run_not_cancellable", str(exc))
+        )
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return _project_error_response(_ProjectAPIError(400, "runs_unavailable", str(exc)))
 
 
 @router.get("/recipes")
@@ -2008,6 +2051,7 @@ def shipfactory_status() -> dict[str, Any]:
         "tick_interval_seconds": interval,
         "config": {
             "recipes_enabled": bool(recipes.get("enabled")),
+            "runner_mode": str(recipes.get("runner_mode", "mixed")),
             "library_path": recipes.get("library_path"),
             "bare_task_recipe": recipes.get("bare_task_recipe"),
         },

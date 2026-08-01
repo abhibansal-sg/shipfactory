@@ -208,7 +208,12 @@ def test_malformed_yaml_fails_closed(tmp_path):
 
 def test_load_library_returns_recipes_by_name_and_rejects_duplicates(tmp_path):
     library = load_library(ROOT / "recipes" / "v1")
-    assert library == {"plan-build-review": library["plan-build-review"]}
+    # The published library grows as recipes are added; assert the stock recipe
+    # is present and every entry is keyed by its own name rather than pinning an
+    # exact one-recipe inventory that any new publication would break.
+    assert "plan-build-review" in library
+    for name, recipe in library.items():
+        assert recipe.name == name
 
     recipe_text = (ROOT / "recipes" / "v1" / "plan-build-review.yaml").read_text()
     (tmp_path / "one.yaml").write_text(recipe_text)

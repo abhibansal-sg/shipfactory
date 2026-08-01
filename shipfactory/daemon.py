@@ -342,6 +342,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     result_graph = None
     cfg = validate_recipe_mode(required=require_recipes)
     max_workers = 2
+    runner_mode = "mixed"
     if cfg is not None:
         try:
             from shipfactory.config import recipe_runtime_config
@@ -349,6 +350,7 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
         except ImportError:  # isolated compatibility stubs
             runtime_cfg = {"max_workers": 2}
         max_workers = int(runtime_cfg["max_workers"])
+        runner_mode = str(runtime_cfg.get("runner_mode", "mixed"))
         restore = getattr(spawn_module, "restore_running", None)
         if restore is not None:
             restore(max_workers=max_workers)
@@ -374,60 +376,60 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
                 "error": str(exc),
                 "error_type": type(exc).__name__,
             }
-        # Environment sessions (SF-8) are reaped every cycle like any other
-        # supervised child — never run their bootstrap/app-up synchronously
-        # here. Lane C modules are optional at plugin import time.
-        try:
-            from shipfactory import environments
-            from shipfactory.config import environment_runtime_config
-            env_cfg = environment_runtime_config(cfg.recipes)
-            environments.restore_materializations()
-            materializations = environments.reap_materializations(env_cfg)
-            apps = environments.tick(env_cfg)
-            result_environments = {"materializations": materializations, "apps": apps["events"]}
-        except ImportError:
-            result_environments = None
-        recipes_cfg = cfg.recipes or {}
-        if recipes_cfg.get("enabled"):
+        if runner_mode == "mixed":
+            # Environment sessions (SF-8) are part of LegacyRunner. Graph-only
+            # service instances deliberately leave their durable rows untouched.
             try:
-                from shipfactory.verification import restore_runs as restore_verification_runs
-                restore_verification_runs()
+                from shipfactory import environments
+                from shipfactory.config import environment_runtime_config
+                env_cfg = environment_runtime_config(cfg.recipes)
+                environments.restore_materializations()
+                materializations = environments.reap_materializations(env_cfg)
+                apps = environments.tick(env_cfg)
+                result_environments = {"materializations": materializations, "apps": apps["events"]}
             except ImportError:
-                pass
-            from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
-            dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
-            recipe_board = board or cfg.company
-            event_kwargs = {
-                "profiles": recipes_cfg["execution_profiles"],
-                "board": recipe_board,
-            }
-            try:
-                apply_parameters = inspect.signature(apply_events).parameters
-                from shipfactory.config import (
-                    environment_runtime_config, verification_profiles_config,
-                )
-                if "verification_profiles" in apply_parameters:
-                    event_kwargs["verification_profiles"] = verification_profiles_config(
-                        recipes_cfg
+                result_environments = None
+            recipes_cfg = cfg.recipes or {}
+            if recipes_cfg.get("enabled"):
+                try:
+                    from shipfactory.verification import restore_runs as restore_verification_runs
+                    restore_verification_runs()
+                except ImportError:
+                    pass
+                from shipfactory.recipes.advancer import apply_events, deliver_outbox, reconcile_root_collectors
+                dispatch_kwargs["max_in_progress"] = int(recipes_cfg["dispatcher_max_in_progress"])
+                recipe_board = board or cfg.company
+                event_kwargs = {
+                    "profiles": recipes_cfg["execution_profiles"],
+                    "board": recipe_board,
+                }
+                try:
+                    apply_parameters = inspect.signature(apply_events).parameters
+                    from shipfactory.config import (
+                        environment_runtime_config, verification_profiles_config,
                     )
-                if "environment_config" in apply_parameters:
-                    event_kwargs["environment_config"] = environment_runtime_config(recipes_cfg)
-            except (ImportError, TypeError, ValueError):
-                pass
-            result_recipes = {
-                "events": apply_events(conn, **event_kwargs),
-                "outbox": deliver_outbox(conn, board=recipe_board),
-                "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
-            }
-            from shipfactory.config import selector_config
-            if selector_config(recipes_cfg)["enabled"]:
-                from shipfactory.recipes.selector_stage import run_stage
-                result_selector = run_stage(conn, board or cfg.company)
-            else:
-                result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
+                    if "verification_profiles" in apply_parameters:
+                        event_kwargs["verification_profiles"] = verification_profiles_config(
+                            recipes_cfg
+                        )
+                    if "environment_config" in apply_parameters:
+                        event_kwargs["environment_config"] = environment_runtime_config(recipes_cfg)
+                except (ImportError, TypeError, ValueError):
+                    pass
+                result_recipes = {
+                    "events": apply_events(conn, **event_kwargs),
+                    "outbox": deliver_outbox(conn, board=recipe_board),
+                    "root_collectors": reconcile_root_collectors(conn, board=recipe_board),
+                }
+                from shipfactory.config import selector_config
+                if selector_config(recipes_cfg)["enabled"]:
+                    from shipfactory.recipes.selector_stage import run_stage
+                    result_selector = run_stage(conn, board or cfg.company)
+                else:
+                    result_selector = {"leased": 0, "instantiated": 0, "parked": 0, "skipped": 0}
     else:
         reaped = reap_finished()
-    if cfg is not None and hasattr(conn, "execute"):
+    if runner_mode == "mixed" and cfg is not None and hasattr(conn, "execute"):
         from shipfactory import store
         available = store.available_resource_units("worker_slot", max_workers)
         running = int(conn.execute(
@@ -500,27 +502,23 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
             except Exception:
                 logger.exception("Factory could not rescue nonspawnable task %s", task_id)
 
-    dispatched = dispatch_once(
-        conn, spawn_fn=queue_safe_spawn, board=board, **dispatch_kwargs,
-    )
-    # Decoupling (seat name != Hermes profile): Hermes' dispatcher buckets a
-    # ready task as `nonspawnable` when its assignee is not a profile directory.
-    # Our step-granular seats (spec-author, *-reviewer, ...) are ShipFactory
-    # seats, not profiles, so they land here. Hermes appends to this bucket
-    # BEFORE it would claim the task, so we are the sole claimant — no race.
-    # We claim + resolve workspace + spawn through our own spawn_fn, exactly
-    # as dispatch_once does for profile-backed tasks. Hermes-executor seats are
-    # carved out (their `hermes -p <assignee>` argv genuinely needs the profile).
-    if cfg is not None and hasattr(conn, "execute") and getattr(dispatched, "skipped_nonspawnable", None):
-        _rescue_nonspawnable_seats(conn, cfg, dispatched, queue_safe_spawn, board)
-    if capacity_deferred:
-        dispatched.spawned = [
-            item for item in dispatched.spawned if item[0] not in capacity_deferred
-        ]
-        dispatched.respawn_guarded.extend(
-            (task_id, "worker_slot_capacity")
-            for task_id in sorted(capacity_deferred)
+    dispatched = None
+    if runner_mode == "mixed":
+        dispatched = dispatch_once(
+            conn, spawn_fn=queue_safe_spawn, board=board, **dispatch_kwargs,
         )
+        # Decoupling (seat name != Hermes profile): Hermes' dispatcher buckets a
+        # ready task as `nonspawnable` when its assignee is not a profile directory.
+        if cfg is not None and hasattr(conn, "execute") and getattr(dispatched, "skipped_nonspawnable", None):
+            _rescue_nonspawnable_seats(conn, cfg, dispatched, queue_safe_spawn, board)
+        if capacity_deferred:
+            dispatched.spawned = [
+                item for item in dispatched.spawned if item[0] not in capacity_deferred
+            ]
+            dispatched.respawn_guarded.extend(
+                (task_id, "worker_slot_capacity")
+                for task_id in sorted(capacity_deferred)
+            )
     reaped += reap_finished()
     _board_db_health_pass(conn, board)
     result: dict[str, Any] = {"dispatch": dispatched, "reaped": reaped}
@@ -533,25 +531,28 @@ def tick(conn, *, board: str | None = None, sync: bool = False,
     if result_environments is not None:
         result["environments"] = result_environments
     # Lane C modules are deliberately optional at plugin import time.
-    try:
-        from shipfactory import watchdog
-
-        result["watchdog"] = watchdog.tick(conn, board=board)
-    except ImportError:
+    if runner_mode == "graph":
         result["watchdog"] = None
-    if sync:
+    else:
         try:
-            from shipfactory import github_sync
+            from shipfactory import watchdog
 
-            result["sync"] = github_sync.tick(board=board)
+            result["watchdog"] = watchdog.tick(conn, board=board)
         except ImportError:
-            result["sync"] = None
-        except Exception as exc:  # sync is best-effort: a misconfigured or
-            # failing GitHub sync must never kill the dispatch/reap/watchdog
-            # cycle (integration fix 07-12: real github_sync raises ValueError
-            # when no repo is configured; Lane B's stub never did).
-            result["sync"] = None
-            result["sync_error"] = str(exc)
+            result["watchdog"] = None
+        if sync:
+            try:
+                from shipfactory import github_sync
+
+                result["sync"] = github_sync.tick(board=board)
+            except ImportError:
+                result["sync"] = None
+            except Exception as exc:  # sync is best-effort: a misconfigured or
+                # failing GitHub sync must never kill the dispatch/reap/watchdog
+                # cycle (integration fix 07-12: real github_sync raises ValueError
+                # when no repo is configured; Lane B's stub never did).
+                result["sync"] = None
+                result["sync_error"] = str(exc)
     return result
 
 

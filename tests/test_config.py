@@ -10,6 +10,7 @@ from shipfactory.config import (
     PROJECTS_VISUAL_RECIPES_DEFAULTS,
     load_seats,
     projects_visual_recipes_config,
+    recipe_runtime_config,
 )
 
 
@@ -48,6 +49,28 @@ hierarchy_gates:
         cfg = load_seats()
     assert cfg.company == "demo" and not hasattr(cfg.seats["dev"], "reports_to")
     assert cfg.seats["lead"].max_concurrent == 1
+
+
+def test_runner_mode_is_runtime_configurable():
+    assert recipe_runtime_config({})["runner_mode"] == "mixed"
+    assert recipe_runtime_config({"runner_mode": "graph"})["runner_mode"] == "graph"
+
+
+def test_unknown_runner_mode_is_rejected(tmp_path, monkeypatch):
+    _profiles(monkeypatch)
+    path = tmp_path / "seats.yaml"
+    path.write_text("""company: demo
+seats:
+  lead:
+    profile: lead
+    executor: hermes
+    role: ceo
+recipes:
+  runner_mode: legacy
+""")
+
+    with pytest.raises(FactoryConfigError, match="runner_mode must be mixed or graph"):
+        load_seats(path)
 
 
 def test_unknown_hierarchy_gate_seat_rejected(tmp_path, monkeypatch):

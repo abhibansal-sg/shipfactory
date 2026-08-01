@@ -56,7 +56,7 @@ GRAPH_TABLE_COLUMNS = {
     ],
     "human_box_decisions_v1": [
         "id", "attempt_id", "result", "actor_kind", "actor_id", "channel",
-        "nonce_hash", "created_at", "event_key",
+        "nonce_hash", "created_at", "event_key", "reason",
     ],
     "project_recipes_v1": [
         "project_id", "recipe_name", "enabled", "is_default", "created_at", "updated_at",
@@ -211,7 +211,7 @@ def test_migration_18_preserves_runs_and_allows_only_nonterminal_escalated(
     with store._connect() as db:
         assert db.execute(
             "SELECT MAX(version) FROM schema_migrations",
-        ).fetchone()[0] == 18
+        ).fetchone()[0] == 19
         assert dict(db.execute(
             "SELECT * FROM recipe_runs_v1 WHERE id='preserved-run'",
         ).fetchone()) == before

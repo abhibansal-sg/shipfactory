@@ -123,6 +123,7 @@ def test_v1_api_route_set_is_complete(api):
         ("GET", "/api/plugins/shipfactory/v1/runs"),
         ("GET", "/api/plugins/shipfactory/v1/runs/{run_id}"),
         ("GET", "/api/plugins/shipfactory/v1/runs/{run_id}/graph"),
+        ("POST", "/api/plugins/shipfactory/v1/runs/{run_id}/cancel"),
         ("POST", "/api/plugins/shipfactory/v1/human-boxes/{attempt_id}/decision"),
         ("GET", "/api/plugins/shipfactory/v1/legacy-drain-report"),
     }

@@ -33,7 +33,9 @@ def test_dashboard_v1_decisions_are_declared_human_actions_with_fresh_nonces():
     source = BUNDLE.read_text(encoding="utf-8")
     assert "function GraphV1ProjectPanel" in source
     assert "function GraphV1Run" in source
-    assert "function decideHuman(attempt, result)" in source
+    # `reason` joined the signature so a rejection can carry operator feedback
+    # to the rework box (finding #136); the protected shape below is unchanged.
+    assert "function decideHuman(attempt, result, reason)" in source
     assert 'graph.arrows.filter(function (arrow) { return arrow.from === attempt.box_id; })' in source
     assert "nonce: newNonce()" in source
     assert 'actor_kind: "human"' in source
@@ -49,8 +51,12 @@ def test_dashboard_v1_approval_card_precedes_graph_history_and_summarizes_decisi
     assert "function graphV1ApprovalContext" in source
     assert '"Decision required"' in source
     assert '"Recommended outcome"' in source
+    # The plan slot is now labelled by the box that produced it, because
+    # labelling the critic's attack "Proposed deliverable" was the defect
+    # (finding #133). The fallback label retains the original wording.
+    assert '"Final plan — "' in source
     assert '"Proposed deliverable"' in source
-    assert '"Review results"' in source
+    assert '"Critic verdicts"' in source
     assert '"Approve"' in source
     assert '"Reject"' in source
     assert source.index("h(GraphV1ApprovalCard") < source.index('"aria-label": "Declared GraphRunner recipe"')
@@ -63,7 +69,10 @@ def test_dashboard_v1_raw_attempt_payloads_are_collapsed_by_default():
     assert 'h("details", { className: "factory-v1-attempt-details"' in source
     assert 'h("summary", null, "Attempt details")' in source
     assert 'h("pre", { className: "factory-v1-raw"' in source
-    assert 'h("summary", null, "Full review")' in source
+    # Critic verdicts stay collapsed; each <details> is now the review card
+    # itself, with the box name in its summary instead of a generic label.
+    assert 'h("details", { key: review.attempt.id, className: "factory-v1-review-card" }' in source
+    assert 'h("summary", null, "Raw payload")' in source
     assert 'h("p", { className: "mt-2 whitespace-pre-wrap text-xs text-text-secondary" }, "Input: "' not in source
     assert 'h("p", { className: "mt-1 whitespace-pre-wrap text-xs text-text-secondary" }, "Work: "' not in source
 

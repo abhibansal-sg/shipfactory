@@ -108,7 +108,10 @@ def test_direct_graph_v1_projects_only_declared_boxes_arrows_and_run_state():
     graph = project_direct_graph_v1(recipe, run=run, attempts=attempts)
 
     assert graph == {
-        "recipe": {"name": recipe.name, "start": recipe.start, "hash": recipe.hash},
+        "recipe": {
+            "name": recipe.name, "start": recipe.start, "hash": recipe.hash,
+            "approval_artifact": recipe.approval_artifact,
+        },
         "boxes": [
             {
                 "id": box["id"], "name": box["name"], "who": box["who"],

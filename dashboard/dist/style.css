@@ -538,3 +538,89 @@
   .factory-graph-node,
   .factory-graph-edge { transition: none; }
 }
+
+/* Markdown rendered as real elements (finding #134) — the approval card used
+   to flatten headings/tables/lists into one grey <pre> wall. */
+.factory-md { display: grid; gap: 0.5rem; }
+.factory-md-h {
+  margin: 0.35rem 0 0;
+  color: var(--color-foreground);
+  font-weight: 600;
+  line-height: 1.3;
+}
+.factory-md-h1 { font-size: 0.95rem; }
+.factory-md-h2 { font-size: 0.88rem; }
+.factory-md-h3, .factory-md-h4 { font-size: 0.82rem; }
+.factory-md-p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+.factory-md-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+.factory-md-list li { margin: 0.15rem 0; }
+.factory-md-code {
+  padding: 0.05rem 0.3rem;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.95em;
+}
+.factory-md-pre {
+  margin: 0;
+  overflow: auto;
+  max-height: 20rem;
+  padding: 0.6rem;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+.factory-md-quote {
+  margin: 0;
+  padding-left: 0.7rem;
+  border-left: 2px solid var(--color-border);
+  color: var(--color-muted-foreground);
+  font-size: 0.82rem;
+}
+.factory-md-hr { margin: 0.3rem 0; border: 0; border-top: 1px solid var(--color-border); }
+.factory-md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+.factory-md-table th,
+.factory-md-table td {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+}
+.factory-md-table th { background: color-mix(in srgb, currentColor 6%, transparent); font-weight: 600; }
+
+/* The plan is the thing being approved — give it room, and keep the critics
+   compact and collapsed beneath it. */
+.factory-v1-deliverable {
+  max-height: 34rem;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  padding: 0.8rem;
+  background: var(--color-card);
+}
+.factory-v1-review-stack { display: grid; gap: 0.4rem; }
+.factory-v1-review-stack .factory-v1-review-card > summary { cursor: pointer; }
+.factory-v1-review-stack .factory-md { max-height: 22rem; overflow: auto; margin-top: 0.5rem; }
+.factory-v1-feedback { display: grid; gap: 0.5rem; margin-top: 0.6rem; }
+.factory-v1-cancel {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--color-destructive, currentColor) 35%, transparent);
+  background: color-mix(in srgb, var(--color-destructive, currentColor) 5%, transparent);
+}

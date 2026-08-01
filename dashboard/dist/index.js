@@ -2225,6 +2225,173 @@
   }
 
 
+  // ---------------------------------------------------------------------
+  // Markdown -> React children (finding #134).
+  //
+  // Worker output is markdown. Rendering it into a <pre> flattened headings,
+  // tables and lists into an unreadable grey wall, so the operator could not
+  // actually READ what he was approving. This renders a bounded markdown
+  // subset as real elements.
+  //
+  // Finding #51 is law here: model-authored text reaches the operator's trust
+  // surface as React TEXT CHILDREN only. Raw-HTML injection props are
+  // deliberately absent from this file — a worker that emits
+  // "<img onerror=...>" must render as those literal characters.
+  // ---------------------------------------------------------------------
+
+  // Inline spans: **bold**, `code`. Everything else stays literal text.
+  function mdInline(text, keyPrefix) {
+    var out = [];
+    var rest = String(text == null ? "" : text);
+    var counter = 0;
+    var pattern = /(\*\*([^*]+)\*\*|`([^`]+)`)/;
+    var match = rest.match(pattern);
+    while (match) {
+      if (match.index > 0) out.push(rest.slice(0, match.index));
+      if (match[2] != null) {
+        out.push(h("strong", { key: keyPrefix + "-b" + counter }, match[2]));
+      } else {
+        out.push(h("code", { key: keyPrefix + "-c" + counter, className: "factory-md-code" }, match[3]));
+      }
+      counter += 1;
+      rest = rest.slice(match.index + match[1].length);
+      match = rest.match(pattern);
+    }
+    if (rest) out.push(rest);
+    return out.length ? out : [""];
+  }
+
+  function mdTableRow(line) {
+    var cells = line.split("|");
+    if (cells.length && !cells[0].trim()) cells = cells.slice(1);
+    if (cells.length && !cells[cells.length - 1].trim()) cells = cells.slice(0, cells.length - 1);
+    return cells.map(function (cell) { return cell.trim(); });
+  }
+
+  function mdIsDivider(line) {
+    return /^\s*\|?[\s:-]*-[\s:|-]*\|?\s*$/.test(line) && line.indexOf("-") >= 0;
+  }
+
+  function renderMarkdown(source, keyPrefix) {
+    var text = source == null ? "" : String(source);
+    if (!text.trim()) return null;
+    var prefix = keyPrefix || "md";
+    var lines = text.replace(/\r\n/g, "\n").split("\n");
+    var nodes = [];
+    var index = 0;
+    var key = 0;
+
+    function nextKey(tag) { key += 1; return prefix + "-" + tag + key; }
+
+    while (index < lines.length) {
+      var line = lines[index];
+
+      // Fenced code — verbatim, never parsed for markup.
+      if (/^\s*```/.test(line)) {
+        var fence = [];
+        index += 1;
+        while (index < lines.length && !/^\s*```/.test(lines[index])) {
+          fence.push(lines[index]);
+          index += 1;
+        }
+        index += 1;
+        nodes.push(h("pre", { key: nextKey("pre"), className: "factory-md-pre" }, fence.join("\n")));
+        continue;
+      }
+
+      if (!line.trim()) { index += 1; continue; }
+
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) {
+        nodes.push(h("hr", { key: nextKey("hr"), className: "factory-md-hr" }));
+        index += 1;
+        continue;
+      }
+
+      var heading = line.match(/^(#{1,4})\s+(.*)$/);
+      if (heading) {
+        var level = heading[1].length;
+        nodes.push(h("h" + (level + 2), {
+          key: nextKey("h"), className: "factory-md-h factory-md-h" + level,
+        }, mdInline(heading[2], nextKey("hi"))));
+        index += 1;
+        continue;
+      }
+
+      // GFM pipe table: a header row followed by a --- divider.
+      if (line.indexOf("|") >= 0 && index + 1 < lines.length && mdIsDivider(lines[index + 1])) {
+        var header = mdTableRow(line);
+        var bodyRows = [];
+        index += 2;
+        while (index < lines.length && lines[index].indexOf("|") >= 0 && lines[index].trim()) {
+          bodyRows.push(mdTableRow(lines[index]));
+          index += 1;
+        }
+        nodes.push(h("table", { key: nextKey("t"), className: "factory-md-table" },
+          h("thead", null, h("tr", null, header.map(function (cell, cellIndex) {
+            return h("th", { key: "th" + cellIndex }, mdInline(cell, "th" + cellIndex));
+          }))),
+          h("tbody", null, bodyRows.map(function (row, rowIndex) {
+            return h("tr", { key: "tr" + rowIndex }, row.map(function (cell, cellIndex) {
+              return h("td", { key: "td" + cellIndex }, mdInline(cell, "td" + rowIndex + "" + cellIndex));
+            }));
+          }))
+        ));
+        continue;
+      }
+
+      if (/^\s*>\s?/.test(line)) {
+        var quote = [];
+        while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+          quote.push(lines[index].replace(/^\s*>\s?/, ""));
+          index += 1;
+        }
+        nodes.push(h("blockquote", { key: nextKey("q"), className: "factory-md-quote" },
+          mdInline(quote.join(" "), nextKey("qi"))));
+        continue;
+      }
+
+      var bullet = line.match(/^\s*[-*]\s+(.*)$/);
+      var ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (bullet || ordered) {
+        var isOrdered = !!ordered;
+        var items = [];
+        while (index < lines.length) {
+          var itemMatch = isOrdered
+            ? lines[index].match(/^\s*\d+[.)]\s+(.*)$/)
+            : lines[index].match(/^\s*[-*]\s+(.*)$/);
+          if (!itemMatch) break;
+          items.push(itemMatch[1]);
+          index += 1;
+        }
+        nodes.push(h(isOrdered ? "ol" : "ul", { key: nextKey("l"), className: "factory-md-list" },
+          items.map(function (item, itemIndex) {
+            return h("li", { key: "li" + itemIndex }, mdInline(item, "li" + itemIndex));
+          })));
+        continue;
+      }
+
+      // Anything unrecognised becomes a paragraph — never dropped, never executed.
+      var paragraph = [];
+      while (index < lines.length && lines[index].trim()
+        && !/^\s*(#{1,4}\s|```|>|[-*]\s|\d+[.)]\s)/.test(lines[index])
+        && !(lines[index].indexOf("|") >= 0 && index + 1 < lines.length && mdIsDivider(lines[index + 1]))) {
+        paragraph.push(lines[index]);
+        index += 1;
+      }
+      if (!paragraph.length) { paragraph.push(lines[index]); index += 1; }
+      nodes.push(h("p", { key: nextKey("p"), className: "factory-md-p" },
+        mdInline(paragraph.join(" "), nextKey("pi"))));
+    }
+
+    return nodes;
+  }
+
+  function MarkdownBlock(props) {
+    var rendered = renderMarkdown(props.source, props.keyPrefix);
+    if (!rendered) return h("p", { className: "factory-md-p text-text-tertiary" }, props.empty || "Nothing to show.");
+    return h("div", { className: "factory-md " + (props.className || "") }, rendered);
+  }
+
   function graphV1WorkText(value) {
     if (value == null) return "";
     if (typeof value === "string") return value;
@@ -2237,30 +2404,82 @@
     try { var parsed = JSON.parse(value); return parsed && typeof parsed === "object" ? parsed : {}; } catch (_) { return {}; }
   }
 
+  // A box that CRITIQUES the deliverable is not the deliverable (finding #133).
+  var GRAPH_V1_CRITIC_RE = /review|attack|critic|adversar/i;
+
+  function graphV1IsCritic(box, boxId) {
+    return GRAPH_V1_CRITIC_RE.test(((box && box.who) || "") + " " + (boxId || ""));
+  }
+
+  function graphV1LatestCompleted(attempts, boxId) {
+    var best = null;
+    attempts.forEach(function (item) {
+      if (item.box_id !== boxId || item.state !== "completed") return;
+      if (!best || best.ordinal < item.ordinal) best = item;
+    });
+    return best;
+  }
+
   function graphV1ApprovalContext(graph, attempts) {
     var waiting = graph.run && Array.isArray(graph.run.waiting_human) ? graph.run.waiting_human : [];
     var attempt = waiting[0] || attempts.find(function (item) { return item.state === "waiting_human"; }) || null;
     if (!attempt) return null;
     var input = graphV1Input(attempt.input_work);
     var preceding = Array.isArray(input.preceding_outputs) ? input.preceding_outputs : [];
+    var boxes = Array.isArray(graph.boxes) ? graph.boxes : [];
+
+    // Plan selection, in declared-then-positional order (contract shape 5).
+    // 1. The recipe DECLARES its approvable artifact -> newest completed attempt.
+    // 2. Else walk the gate's predecessors backwards, skipping critic boxes:
+    //    the last predecessor is the adversary, and showing its attack as
+    //    "the deliverable" is exactly the defect this replaces.
+    // 3. Else fall back to the last preceding output so nothing regresses.
+    var declared = graph.recipe && graph.recipe.approval_artifact;
+    var planAttempt = null;
+    var planBoxId = "";
+    if (declared) {
+      planAttempt = graphV1LatestCompleted(attempts, declared);
+      planBoxId = declared;
+    }
+    if (!planAttempt) {
+      for (var i = preceding.length - 1; i >= 0; i -= 1) {
+        var candidateId = preceding[i] && preceding[i].box_id;
+        var candidateBox = boxes.find(function (item) { return item.id === candidateId; });
+        if (candidateId && !graphV1IsCritic(candidateBox, candidateId)) {
+          planAttempt = graphV1LatestCompleted(attempts, candidateId) || null;
+          planBoxId = candidateId;
+          if (planAttempt) break;
+        }
+      }
+    }
     var proposedItem = preceding.length ? preceding[preceding.length - 1] : null;
-    var proposed = graphV1WorkText(proposedItem && proposedItem.output_work);
+    var proposed = planAttempt
+      ? graphV1WorkText(planAttempt.output_work)
+      : graphV1WorkText(proposedItem && proposedItem.output_work);
+    if (!planAttempt && !planBoxId && proposedItem) planBoxId = proposedItem.box_id || "";
     if (!proposed) {
       var completed = attempts.filter(function (item) { return item.state === "completed" && item.output_work != null; });
       proposed = graphV1WorkText(completed.length ? completed[completed.length - 1].output_work : "");
     }
-    var synthesis = attempts.slice().reverse().find(function (item) { return item.state === "completed" && item.box_id === (proposedItem && proposedItem.box_id); });
-    var boxes = Array.isArray(graph.boxes) ? graph.boxes : [];
+    var planBox = boxes.find(function (item) { return item.id === planBoxId; }) || null;
+    var synthesis = planAttempt
+      || attempts.slice().reverse().find(function (item) { return item.state === "completed" && item.box_id === (proposedItem && proposedItem.box_id); });
+
+    // Every critic that ran, whatever it is called — the old /review/-only
+    // filter dropped `decomposition-attack` from the card entirely.
     var latestReviews = {};
     attempts.forEach(function (item) {
+      if (item.state !== "completed" || item.box_id === planBoxId) return;
       var box = boxes.find(function (candidate) { return candidate.id === item.box_id; });
-      var identity = ((box && box.who) || "") + " " + item.box_id;
-      if (item.state === "completed" && identity.toLowerCase().indexOf("review") >= 0 && (!latestReviews[item.box_id] || latestReviews[item.box_id].ordinal < item.ordinal)) latestReviews[item.box_id] = item;
+      if (!graphV1IsCritic(box, item.box_id)) return;
+      if (!latestReviews[item.box_id] || latestReviews[item.box_id].ordinal < item.ordinal) latestReviews[item.box_id] = item;
     });
     return {
       attempt: attempt,
       request: graphV1WorkText(input.request),
       proposed: proposed,
+      planBox: planBox,
+      planSource: declared && planAttempt ? "declared" : (planBox ? "derived" : "fallback"),
       recommendation: (synthesis && synthesis.result) || "review",
       reviews: Object.keys(latestReviews).map(function (boxId) {
         return { box: boxes.find(function (candidate) { return candidate.id === boxId; }) || { id: boxId, name: boxId }, attempt: latestReviews[boxId] };
@@ -2276,33 +2495,88 @@
 
   function GraphV1ApprovalCard(props) {
     var context = props.context;
+    var _r = useState(""), pendingResult = _r[0], setPendingResult = _r[1];
+    var _f = useState(""), feedback = _f[0], setFeedback = _f[1];
     if (!context || !context.attempt) return null;
     var attempt = context.attempt;
     var declaredResults = props.graph.arrows.filter(function (arrow) { return arrow.from === attempt.box_id; }).map(function (arrow) { return arrow.result; });
+    var planLabel = context.planBox ? context.planBox.name : "Proposed deliverable";
+    // A rejection with no reason starves the downstream box of any signal to
+    // act on — the rework box literally received "Human decision: rejected"
+    // and re-planned blind (finding #136). Reason is mandatory to reject.
+    var needsFeedback = pendingResult === "rejected";
+    var canSubmit = pendingResult && (!needsFeedback || feedback.trim());
+
+    function submitDecision() {
+      if (!canSubmit) return;
+      props.onDecide(attempt, pendingResult, feedback.trim());
+    }
+
     return h("section", { className: "factory-v1-approval", "aria-label": "Human approval decision", "data-graph-v1-approval": attempt.id },
       h("div", { className: "factory-v1-approval-head" },
         h("div", null, h("span", { className: "factory-v1-eyebrow" }, "Decision required"), h("h3", { className: "text-base font-semibold text-foreground" }, "Review the proposed deliverable")),
         h(StatePill, { value: attempt.state })
       ),
-      context.request ? h("section", { className: "factory-v1-summary-block" }, h("strong", null, "Original request"), h("p", null, context.request)) : null,
+      context.request ? h("details", { className: "factory-v1-raw-section" },
+        h("summary", null, "Original request"),
+        h(MarkdownBlock, { source: context.request, keyPrefix: "req", empty: "No request text." })
+      ) : null,
       h("div", { className: "factory-v1-recommendation" }, h("span", null, "Recommended outcome"), h(StatePill, { value: context.recommendation })),
-      h("section", { className: "factory-v1-summary-block" }, h("strong", null, "Proposed deliverable"), h("pre", { className: "factory-v1-deliverable" }, context.proposed || "No deliverable summary was provided.")),
+      h("section", { className: "factory-v1-summary-block" },
+        h("div", { className: "factory-v1-review-head" },
+          h("strong", null, "Final plan — " + planLabel),
+          context.planSource === "declared" ? h(MonoChip, null, "declared") : null
+        ),
+        h(MarkdownBlock, { source: context.proposed, keyPrefix: "plan", className: "factory-v1-deliverable", empty: "No deliverable summary was provided." })
+      ),
       context.reviews.length ? h("section", { className: "factory-v1-review-section" },
-        h("strong", null, "Review results"),
-        h("div", { className: "factory-v1-review-grid" }, context.reviews.map(function (review) {
-          return h("article", { key: review.attempt.id, className: "factory-v1-review-card" },
-            h("div", { className: "factory-v1-review-head" }, h("span", null, review.box.name), h(StatePill, { value: review.attempt.result || review.attempt.state })),
-            h("details", null, h("summary", null, "Full review"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(review.attempt.output_work) || "No review text."))
+        h("strong", null, "Critic verdicts"),
+        h("div", { className: "factory-v1-review-stack" }, context.reviews.map(function (review) {
+          return h("details", { key: review.attempt.id, className: "factory-v1-review-card" },
+            h("summary", null,
+              h("span", { className: "factory-v1-review-head" },
+                h("span", null, review.box.name),
+                h(StatePill, { value: review.attempt.result || review.attempt.state })
+              )
+            ),
+            h(MarkdownBlock, { source: graphV1WorkText(review.attempt.output_work), keyPrefix: "rev" + review.attempt.id, empty: "No review text." })
           );
         }))
       ) : null,
-      h("details", { className: "factory-v1-raw-section" }, h("summary", null, "Run details"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(attempt.input_work))),
+      h("details", { className: "factory-v1-raw-section" }, h("summary", null, "Raw payload"), h("pre", { className: "factory-v1-raw" }, graphV1WorkText(attempt.input_work))),
       props.error ? h("p", { className: "text-xs text-destructive", role: "alert" }, props.error) : null,
       h("div", { className: "factory-v1-actions", "aria-label": "Declared human results" },
         h("p", null, "Choose once. ShipFactory records the decision with a fresh protected nonce."),
         h("div", { className: "flex flex-wrap gap-2" }, declaredResults.map(function (result) {
-          return h(Button, { key: result, type: "button", size: "sm", disabled: !!props.busy, "data-graph-v1-decision": result, onClick: function () { props.onDecide(attempt, result); } }, props.busy === attempt.id + ":" + result ? h(Spinner, { label: "Recording" }) : graphV1DecisionLabel(result));
-        }))
+          return h(Button, {
+            key: result, type: "button", size: "sm", disabled: !!props.busy,
+            "data-graph-v1-decision": result,
+            "aria-pressed": pendingResult === result,
+            onClick: function () { setPendingResult(pendingResult === result ? "" : result); },
+          }, graphV1DecisionLabel(result));
+        })),
+        pendingResult ? h("div", { className: "factory-v1-feedback" },
+          h(FieldLabel, {
+            htmlFor: "graph-v1-feedback",
+            control: h("textarea", {
+              id: "graph-v1-feedback", className: TEXTAREA_CLASS, rows: 4,
+              value: feedback,
+              "data-graph-v1-feedback": pendingResult,
+              onChange: function (event) { setFeedback(event.target.value); },
+              placeholder: needsFeedback ? "What is wrong, and what should change?" : "Optional note recorded with the decision",
+            }),
+          }, needsFeedback ? "Why are you rejecting? (required)" : "Note (optional)"),
+          needsFeedback && !feedback.trim()
+            ? h("p", { className: "text-xs text-text-tertiary" }, "The rework box receives this text — without it the worker cannot know what to fix.")
+            : null,
+          h("div", { className: "flex justify-end gap-2" },
+            h(Button, { type: "button", size: "sm", disabled: !!props.busy, onClick: function () { setPendingResult(""); setFeedback(""); } }, "Cancel"),
+            h(Button, {
+              type: "button", size: "sm", disabled: !canSubmit || !!props.busy,
+              "data-graph-v1-confirm": pendingResult, onClick: submitDecision,
+            }, props.busy === attempt.id + ":" + pendingResult ? h(Spinner, { label: "Recording" }) : "Confirm " + graphV1DecisionLabel(pendingResult))
+          )
+        ) : null
       )
     );
   }
@@ -2311,23 +2585,61 @@
     var graph = props.graph;
     var _a = useState(""), busy = _a[0], setBusy = _a[1];
     var _b = useState(""), error = _b[0], setError = _b[1];
+    var _c = useState(false), cancelOpen = _c[0], setCancelOpen = _c[1];
+    var _d = useState(""), cancelReason = _d[0], setCancelReason = _d[1];
     if (!graph || !graph.run) return null;
     var attempts = Array.isArray(graph.run.attempts) ? graph.run.attempts : [];
     var approval = graphV1ApprovalContext(graph, attempts);
+    var cancellable = ["running", "paused", "escalated"].indexOf(graph.run.state) >= 0;
 
-    function decideHuman(attempt, result) {
+    function decideHuman(attempt, result, reason) {
       var key = attempt.id + ":" + result;
       setBusy(key); setError("");
+      var payload = { result: result, nonce: newNonce(), actor_kind: "human", actor_id: "local-operator", channel: "dashboard" };
+      if (reason) payload.reason = reason;
       request("/v1/human-boxes/" + encodeURIComponent(attempt.id) + "/decision", {
         method: "POST",
-        body: JSON.stringify({ result: result, nonce: newNonce(), actor_kind: "human", actor_id: "local-operator", channel: "dashboard" }),
+        body: JSON.stringify(payload),
       }).then(function () { return props.onRefresh(); })
+        .catch(function (err) { setError(errorText(err)); })
+        .finally(function () { setBusy(""); });
+    }
+
+    // Cancelling is an audited OPERATOR action, not an approval — it never
+    // advances a gate. Two-step confirm so it can't be hit by accident, and
+    // deliberately placed away from the approval controls (finding #135).
+    function cancelRun() {
+      setBusy("cancel"); setError("");
+      request("/v1/runs/" + encodeURIComponent(graph.run.id) + "/cancel", {
+        method: "POST",
+        body: JSON.stringify({ reason: cancelReason.trim() || null }),
+      }).then(function () { setCancelOpen(false); setCancelReason(""); return props.onRefresh(); })
         .catch(function (err) { setError(errorText(err)); })
         .finally(function () { setBusy(""); });
     }
 
     return h("section", { className: "grid gap-3 border border-border bg-background/20 p-4", "data-graph-v1-run": graph.run.id },
       h("div", { className: "flex flex-wrap items-center justify-between gap-2" }, h("div", null, h("strong", { className: "font-mono-ui text-sm text-foreground" }, graph.recipe.name), h("span", { className: "ml-2 font-mono-ui text-xs text-text-tertiary" }, graph.run.id)), h(StatePill, { value: graph.run.state })),
+      cancellable ? h("div", { className: "factory-v1-cancel" },
+        cancelOpen ? h("div", { className: "grid gap-2" },
+          h("p", { className: "text-xs text-text-secondary" }, "Cancelling stops this Run for good. Attempts are terminated, queued work is discarded, and no gate is advanced. Completed effects are not reversed."),
+          h(FieldLabel, {
+            htmlFor: "graph-v1-cancel-reason",
+            control: h("textarea", {
+              id: "graph-v1-cancel-reason", className: TEXTAREA_CLASS, rows: 2,
+              value: cancelReason,
+              onChange: function (event) { setCancelReason(event.target.value); },
+              placeholder: "Why is this Run being cancelled?",
+            }),
+          }, "Cancellation reason (optional)"),
+          h("div", { className: "flex justify-end gap-2" },
+            h(Button, { type: "button", size: "xs", disabled: !!busy, onClick: function () { setCancelOpen(false); setCancelReason(""); } }, "Keep running"),
+            h(Button, { type: "button", size: "xs", disabled: !!busy, "data-graph-v1-cancel-confirm": graph.run.id, onClick: cancelRun }, busy === "cancel" ? h(Spinner, { label: "Cancelling" }) : "Confirm cancel")
+          )
+        ) : h("div", { className: "flex justify-end" },
+          h(Button, { type: "button", size: "xs", disabled: !!busy, "data-graph-v1-cancel": graph.run.id, onClick: function () { setCancelOpen(true); } }, "Cancel Run")
+        )
+      ) : null,
       h(GraphV1ApprovalCard, { graph: graph, context: approval, busy: busy, error: error, onDecide: decideHuman }),
       h("div", { className: "grid gap-3", "aria-label": "Declared GraphRunner recipe" }, graph.boxes.map(function (box) {
         var boxAttempts = attempts.filter(function (attempt) { return attempt.box_id === box.id; });

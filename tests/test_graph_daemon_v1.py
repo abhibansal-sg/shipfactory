@@ -6,6 +6,7 @@ The unchanged singleton boundary is exercised by
 
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 from shipfactory import (
@@ -31,7 +32,7 @@ def _install_tick_shell(monkeypatch, calls):
         spawn, "restore_running",
         lambda **_kwargs: calls.append("restore") or {"restored": [], "crashed": []},
     )
-    reaps = iter(([], []))
+    reaps = iter(([], [], [], []))
     monkeypatch.setattr(
         spawn, "reap_finished", lambda: calls.append("reap") or next(reaps),
     )
@@ -159,6 +160,99 @@ def test_tick_orders_graph_before_unchanged_legacy_path(monkeypatch):
     assert result["dispatch"] is dispatched
     assert calls.index("reap") < calls.index("graph") < calls.index("legacy")
     assert calls == ["restore", "reap", "graph", "legacy", "reap", "watchdog"]
+
+
+def test_graph_mode_advances_real_graph_run_without_mutating_legacy_instance(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    recipe = validate({
+        "name": "graph-only-integration",
+        "start": "approve",
+        "boxes": [{
+            "id": "approve",
+            "name": "Approve",
+            "who": "human",
+            "instructions": "Choose the declared result.",
+            "end": True,
+        }],
+        "arrows": [],
+    })
+    run = graph_runner.start_run(
+        project_id="project-graph", board="graph-board", recipe=recipe,
+        request_text="Prove graph-only mode", workspace_path=str(workspace),
+        launch_key="graph-only-integration",
+    )
+    store.init_db()
+    with store._connect() as db:
+        db.execute(
+            "INSERT INTO recipe_instances "
+            "(id,board,collector_task_id,recipe_id,recipe_version,recipe_hash,status,"
+            "parameters_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                "legacy-frozen", "graph-board", "legacy-task", "legacy", 1,
+                "legacy-hash", "blocked", "{}", "before", "before",
+            ),
+        )
+        before = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id='legacy-frozen'"
+        ).fetchone())
+
+    cfg = SimpleNamespace(company="graph-board", recipes={"runner_mode": "graph"})
+    monkeypatch.setattr(daemon, "validate_recipe_mode", lambda required=False: cfg)
+    monkeypatch.setattr(
+        spawn, "restore_running", lambda **_kwargs: {"restored": [], "crashed": []},
+    )
+    monkeypatch.setattr(spawn, "reap_finished", lambda: [])
+    monkeypatch.setattr(daemon, "_board_db_health_pass", lambda *_args: None)
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        result = daemon.tick(conn, board="graph-board")
+    finally:
+        conn.close()
+
+    assert result["dispatch"] is None
+    assert [item["run_id"] for item in result["graph"]["reconciled"]] == [run["id"]]
+    with store._connect() as db:
+        attempt = db.execute(
+            "SELECT state FROM box_attempts_v1 WHERE run_id=?", (run["id"],)
+        ).fetchone()
+        after = dict(db.execute(
+            "SELECT * FROM recipe_instances WHERE id='legacy-frozen'"
+        ).fetchone())
+    assert attempt["state"] == "waiting_human"
+    assert after == before
+
+
+def test_mixed_to_graph_mode_flip_stops_legacy_on_next_tick(monkeypatch):
+    calls = []
+    dispatched = _install_tick_shell(monkeypatch, calls)
+    modes = iter(("mixed", "graph"))
+    monkeypatch.setattr(
+        config,
+        "recipe_runtime_config",
+        lambda _recipes: {"max_workers": 2, "runner_mode": next(modes)},
+    )
+    monkeypatch.setattr(
+        daemon, "_tick_graph_v1",
+        lambda **_kwargs: calls.append("graph") or {
+            "events": {"leased": 0, "applied": 0, "discarded": 0, "failed": 0},
+            "reconciled": [],
+            "spawned": [],
+        },
+    )
+
+    mixed = daemon.tick(_CountConnection(), board="board")
+    graph = daemon.tick(_CountConnection(), board="board")
+
+    assert mixed["dispatch"] is dispatched
+    assert graph["dispatch"] is None
+    assert calls.count("graph") == 2
+    assert calls.count("legacy") == 1
+    assert calls.count("watchdog") == 1
 
 
 def test_graph_failure_is_reported_without_suppressing_legacy_tick(monkeypatch):

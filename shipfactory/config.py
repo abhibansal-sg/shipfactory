@@ -23,6 +23,7 @@ RECIPE_RUNTIME_DEFAULTS = {
     "watchdog_tick_timeout_seconds": 120,
     "artifact_max_bytes": 2 * 1024 * 1024,
 }
+RUNNER_MODES = frozenset({"mixed", "graph"})
 ENVIRONMENT_RUNTIME_DEFAULTS = {
     "manifest_path": ".shipfactory/runtime.yaml",
     "port_min": 19000,
@@ -397,6 +398,8 @@ def validate(cfg) -> None:
             or recipes[field] < 1
         ):
             raise FactoryConfigError(f"recipes.{field} must be a positive integer")
+    if recipes.get("runner_mode", "mixed") not in RUNNER_MODES:
+        raise FactoryConfigError("recipes.runner_mode must be mixed or graph")
     runtime = recipes.get("runtime", {}) or {}
     if not isinstance(runtime, dict) or set(runtime) - set(ENVIRONMENT_RUNTIME_DEFAULTS):
         raise FactoryConfigError("recipes.runtime has unknown keys")
@@ -441,13 +444,15 @@ def verification_profiles_config(recipes: dict[str, Any] | None) -> dict[str, di
     return dict(((recipes or {}).get("verification_profiles", {}) or {}))
 
 
-def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, int]:
+def recipe_runtime_config(recipes: dict[str, Any] | None) -> dict[str, Any]:
     """Return validated operator-owned daemon limits with stable defaults."""
     configured = recipes or {}
-    return {
+    runtime: dict[str, Any] = {
         key: int(configured.get(key, default))
         for key, default in RECIPE_RUNTIME_DEFAULTS.items()
     }
+    runtime["runner_mode"] = str(configured.get("runner_mode", "mixed"))
+    return runtime
 
 
 __all__ = [

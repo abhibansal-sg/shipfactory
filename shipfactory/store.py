@@ -599,6 +599,49 @@ FROM recipe_runs_v1""",
 _GRAPH_RUNNER_ESCALATED_MIGRATION_TEXT = (
     ";\n".join(_GRAPH_RUNNER_ESCALATED_MIGRATION_STATEMENTS) + ";\n"
 )
+_GRAPH_RUNNER_DECISION_REASON_MIGRATION_STATEMENTS = (
+    "ALTER TABLE human_box_decisions_v1 ADD COLUMN reason TEXT",
+    "PRAGMA defer_foreign_keys=ON",
+    """CREATE TABLE recipe_runs_v1_next (
+  id TEXT PRIMARY KEY NOT NULL,
+  project_id TEXT NOT NULL,
+  board TEXT NOT NULL,
+  recipe_name TEXT NOT NULL,
+  recipe_hash TEXT NOT NULL CHECK(
+    typeof(recipe_hash)='text'
+    AND length(recipe_hash)=64
+    AND recipe_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  recipe_snapshot_json TEXT NOT NULL CHECK(json_valid(recipe_snapshot_json)),
+  request_text TEXT NOT NULL,
+  workspace_path TEXT,
+  launch_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('running','paused','escalated','completed','failed','cancelled')),
+  blocked_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  CHECK(
+    (state IN ('completed','failed','cancelled') AND completed_at IS NOT NULL)
+    OR (state IN ('running','paused','escalated') AND completed_at IS NULL)
+  )
+)""",
+    """INSERT INTO recipe_runs_v1_next(
+  id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,request_text,
+  workspace_path,launch_key,state,blocked_reason,created_at,updated_at,completed_at
+)
+SELECT
+  id,project_id,board,recipe_name,recipe_hash,recipe_snapshot_json,request_text,
+  workspace_path,launch_key,state,blocked_reason,created_at,updated_at,completed_at
+FROM recipe_runs_v1""",
+    "DROP TABLE recipe_runs_v1",
+    "ALTER TABLE recipe_runs_v1_next RENAME TO recipe_runs_v1",
+    "CREATE INDEX idx_recipe_runs_v1_active ON recipe_runs_v1(state,updated_at DESC)",
+    "PRAGMA defer_foreign_keys=OFF",
+)
+_GRAPH_RUNNER_DECISION_REASON_MIGRATION_TEXT = (
+    ";\n".join(_GRAPH_RUNNER_DECISION_REASON_MIGRATION_STATEMENTS) + ";\n"
+)
 _MIGRATIONS = (
     (1, "a0_single_writer_recoverable_actions", _A0_MIGRATION_TEXT),
     (2, "a1_durable_runs_resource_governor", _A1_MIGRATION_TEXT),
@@ -618,6 +661,7 @@ _MIGRATIONS = (
     (16, "sf18_project_recipe_policy_and_flight_identity", _PROJECT_RECIPE_POLICY_MIGRATION_TEXT),
     (17, "graphrunner_v1_durable_state", _GRAPH_RUNNER_V1_MIGRATION_TEXT),
     (18, "graphrunner_v1_escalated_runs", _GRAPH_RUNNER_ESCALATED_MIGRATION_TEXT),
+    (19, "graphrunner_v1_decision_reason_and_cancel", _GRAPH_RUNNER_DECISION_REASON_MIGRATION_TEXT),
 )
 _MIGRATION_STATEMENTS = {
     1: _A0_MIGRATION_STATEMENTS,
@@ -638,6 +682,7 @@ _MIGRATION_STATEMENTS = {
     16: _PROJECT_RECIPE_POLICY_MIGRATION_STATEMENTS,
     17: _GRAPH_RUNNER_V1_MIGRATION_STATEMENTS,
     18: _GRAPH_RUNNER_ESCALATED_MIGRATION_STATEMENTS,
+    19: _GRAPH_RUNNER_DECISION_REASON_MIGRATION_STATEMENTS,
 }
 
 
@@ -952,6 +997,22 @@ def init_db() -> None:
                         or (
                             run_schema is not None
                             and "'escalated'" in str(run_schema["sql"])
+                        )
+                    )
+                elif version == 19:
+                    decision_columns = {row["name"] for row in conn.execute(
+                        "PRAGMA table_info(human_box_decisions_v1)"
+                    )}
+                    run_schema = conn.execute(
+                        """SELECT sql FROM sqlite_master
+                           WHERE type='table' AND name='recipe_runs_v1'"""
+                    ).fetchone()
+                    migration_artifacts = bool(
+                        "reason" in decision_columns
+                        or "recipe_runs_v1_next" in existing_tables
+                        or (
+                            run_schema is not None
+                            and "'cancelled'" in str(run_schema["sql"])
                         )
                     )
                 if migration_artifacts:
@@ -2587,7 +2648,7 @@ def finish_run_event_v1(
 def record_human_box_decision_v1(
     *, decision_id: str, attempt_id: str, result: str, actor_kind: str,
     actor_id: str, channel: str, nonce_hash: str, event_key: str,
-    conn: sqlite3.Connection | None = None,
+    reason: str | None = None, conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     if conn is None:
         init_db()
@@ -2596,7 +2657,7 @@ def record_human_box_decision_v1(
             return record_human_box_decision_v1(
                 decision_id=decision_id, attempt_id=attempt_id, result=result,
                 actor_kind=actor_kind, actor_id=actor_id, channel=channel,
-                nonce_hash=nonce_hash, event_key=event_key, conn=db,
+                nonce_hash=nonce_hash, event_key=event_key, reason=reason, conn=db,
             )
     binding = conn.execute(
         """SELECT a.run_id AS attempt_run_id,a.box_id AS box_id,
@@ -2625,19 +2686,21 @@ def record_human_box_decision_v1(
     expected = {
         "attempt_id": attempt_id, "result": result, "actor_kind": actor_kind,
         "actor_id": actor_id, "channel": channel, "nonce_hash": nonce_hash,
-        "event_key": event_key,
+        "event_key": event_key, "reason": reason or None,
     }
     if rows:
-        if len(rows) == 1 and all(rows[0][key] == value for key, value in expected.items()):
+        if len(rows) == 1 and all(
+            (rows[0][key] or None) == value for key, value in expected.items()
+        ):
             return rows[0]
         raise GraphStoreConflict("human decision replay conflicts with durable decision")
     try:
         conn.execute(
             """INSERT INTO human_box_decisions_v1(
-                id,attempt_id,result,actor_kind,actor_id,channel,nonce_hash,created_at,event_key
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                id,attempt_id,result,actor_kind,actor_id,channel,nonce_hash,created_at,event_key,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (decision_id, attempt_id, result, actor_kind, actor_id, channel,
-             nonce_hash, _now(), event_key),
+             nonce_hash, _now(), event_key, reason or None),
         )
     except sqlite3.IntegrityError as exc:
         rows = _rows(conn.execute(
@@ -2646,7 +2709,7 @@ def record_human_box_decision_v1(
             (decision_id, attempt_id, nonce_hash, event_key),
         ))
         if len(rows) == 1 and all(
-            rows[0][key] == value for key, value in expected.items()
+            (rows[0][key] or None) == value for key, value in expected.items()
         ):
             return rows[0]
         if rows:
@@ -2657,4 +2720,71 @@ def record_human_box_decision_v1(
     return _graph_row(conn, "human_box_decisions_v1", "id", decision_id)  # type: ignore[return-value]
 
 
-__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "load_project_recipe_policy", "save_project_recipe_policy", "project_flight", "project_flight_by_idempotency_key", "project_flight_by_linear_issue_id", "project_rollup", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert", "GraphStoreConflict", "GraphStoreIntegrityError", "create_recipe_run_v1", "get_recipe_run_v1", "list_recipe_runs_v1", "insert_box_attempt_v1", "update_box_attempt_v1", "insert_route_token_v1", "consume_route_tokens_v1", "enqueue_run_event_v1", "lease_run_events_v1", "finish_run_event_v1", "record_human_box_decision_v1"]
+_RUN_CANCELLABLE_STATES = {"running", "paused", "escalated"}
+
+
+def cancel_recipe_run_v1(
+    run_id: str, *, actor_id: str, reason: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """Cancel a GraphRunner v1 Run: mark state only, never kill OS processes.
+
+    The daemon's existing reap path observes the resulting failed attempts and
+    cleans up worker processes; killing from the request thread would race the
+    daemon (SHARED SHAPE 4). Idempotent: cancelling an already-cancelled run
+    returns the existing row rather than raising GraphStoreConflict.
+    """
+    if conn is None:
+        init_db()
+        with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return cancel_recipe_run_v1(
+                run_id, actor_id=actor_id, reason=reason, conn=db,
+            )
+    run = _graph_row(conn, "recipe_runs_v1", "id", run_id)
+    if run is None:
+        raise GraphStoreIntegrityError(f"unknown GraphRunner run: {run_id}")
+    if run["state"] == "cancelled":
+        return run
+    if run["state"] not in _RUN_CANCELLABLE_STATES:
+        raise GraphStoreConflict(
+            f"run is not cancellable from state {run['state']!r}: {run_id}"
+        )
+    now = _now()
+    conn.execute(
+        """UPDATE box_attempts_v1
+           SET state='failed',technical_failure=?,updated_at=?,finished_at=?
+           WHERE run_id=? AND state NOT IN ('completed','failed','cancelled')""",
+        ("operator cancelled the run", now, now, run_id),
+    )
+    conn.execute(
+        """UPDATE route_tokens_v1
+           SET state='cancelled',consumed_at=?
+           WHERE run_id=? AND state='pending'""",
+        (now, run_id),
+    )
+    conn.execute(
+        """UPDATE run_events_v1
+           SET state='discarded',outcome='operator_cancelled',
+               lease_owner=NULL,lease_until=NULL,applied_at=?
+           WHERE run_id=? AND state IN ('pending','leased')""",
+        (now, run_id),
+    )
+    blocked_reason = _graph_json({
+        "type": "operator_cancelled",
+        "reason": reason or None,
+        "actor": actor_id,
+        "at": now,
+    })
+    updated = conn.execute(
+        """UPDATE recipe_runs_v1
+           SET state='cancelled',blocked_reason=?,completed_at=?,updated_at=?
+           WHERE id=? AND state=?""",
+        (blocked_reason, now, now, run_id, run["state"]),
+    ).rowcount
+    if updated != 1:
+        raise GraphStoreConflict(f"run state changed concurrently: {run_id}")
+    return _graph_row(conn, "recipe_runs_v1", "id", run_id)  # type: ignore[return-value]
+
+
+__all__ = ["init_db", "record_run_start", "record_run_spawned", "record_run_end", "record_run_crashed", "nonterminal_runs", "nonterminal_verification_runs", "nonterminal_daemon_runs", "reconcile_daemon_runs", "run_row", "exact_workspace_run", "record_daemon_start", "record_daemon_tick", "record_daemon_end", "latest_daemon_run", "get_policy", "set_policy", "load_project_recipe_policy", "save_project_recipe_policy", "project_flight", "project_flight_by_idempotency_key", "project_flight_by_linear_issue_id", "project_rollup", "record_decision", "decisions_for", "add_monitor", "due_monitors", "advance_monitor", "record_monitor_outcome", "clear_monitor", "add_watchdog", "watchdogs", "set_watchdog_fingerprint", "seat_paused", "set_seat_paused", "costs_rollup", "reap_resource_leases", "active_resource_units", "available_resource_units", "acquire_resource_lease", "renew_resource_lease", "release_resource_lease", "acquire_port_lease", "insert_env_session", "env_session_row", "latest_env_session_for_key", "mark_env_session_spawned", "update_env_session_state", "nonterminal_env_sessions", "insert_app_session", "app_session_row", "app_session_by_request_key", "mark_app_session_bound", "mark_app_session_spawned", "update_app_session_state", "nonterminal_app_sessions", "sync_get", "sync_upsert", "GraphStoreConflict", "GraphStoreIntegrityError", "create_recipe_run_v1", "get_recipe_run_v1", "list_recipe_runs_v1", "insert_box_attempt_v1", "update_box_attempt_v1", "insert_route_token_v1", "consume_route_tokens_v1", "enqueue_run_event_v1", "lease_run_events_v1", "finish_run_event_v1", "record_human_box_decision_v1", "cancel_recipe_run_v1"]

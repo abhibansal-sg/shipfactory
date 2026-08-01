@@ -971,6 +971,59 @@ checkout -- package-lock.json`. It is a generated lockfile line, never real code
   original request, the final synthesis and its result, compact reviewer
   verdicts, and the protected decisions; exact raw payloads and attempt history
   remain available but are collapsed and height-bounded by default.
+- Selecting only GraphRunner-bound boards does not retire LegacyRunner by
+  itself (finding #132). The shared daemon tick still ran environment sessions,
+  recipe events/outbox/selector, ordinary Kanban dispatch, seat rescue,
+  watchdog, and GitHub sync on every served board. The hot-reloaded
+  `recipes.runner_mode: graph` cutover now preserves shared worker reaping and
+  GraphRunner reconciliation while skipping every legacy control-plane path;
+  `/status` exposes the effective mode. Historical legacy rows remain immutable
+  until `legacy-drain-report` is deletion-eligible.
+- The approval card's "proposed deliverable" was whatever box ran LAST before
+  the gate (finding #133). In `planner → adversary-critic → human-gate` that is
+  the CRITIQUE, so the operator was shown an attack on a plan he could never
+  read, while the `/review/`-only reviewer filter dropped a box named
+  `decomposition-attack` from the card entirely. Plan selection is now
+  declared-then-positional: an optional `approval_artifact: <box-id>` recipe key
+  (absent = published recipes load byte-identical, hash unchanged), else walk the
+  gate's predecessors backwards skipping `/review|attack|critic|adversar/i`, else
+  the original last-predecessor fallback. Critic identity uses that same regex,
+  so every critic appears under its own heading whatever it is called.
+- Worker output is markdown; rendering it into one `<pre>` with
+  `font-family: inherit` flattened headings, tables and lists into an
+  unreadable grey wall — the operator could not actually READ what he was
+  approving (finding #134). A bounded markdown subset now renders as real
+  elements (headings, lists, GFM tables, fenced code, quotes, rules, bold,
+  inline code) with unrecognised input falling through as a paragraph — never
+  dropped, never executed. Finding #51 still governs: React text children only,
+  no HTML-injection props anywhere in the bundle. NB the guard test asserts the
+  literal absence of the injection prop name, so even a CODE COMMENT naming it
+  fails the suite; describe it, don't spell it.
+- A graph Run had no cancel surface (finding #135): `recipe cancel` covers only
+  legacy instances, so a looping Run could be stopped only by hand-edited SQL.
+  `POST /v1/runs/{id}/cancel` + `run cancel` CLI now share one store function —
+  attempts terminated, pending tokens cancelled, pending/leased events
+  discarded, run parked `cancelled` with a canonical audited `blocked_reason`,
+  all in one `BEGIN IMMEDIATE`. It marks STATE ONLY and never kills OS
+  processes: killing from the request thread races the daemon's reap path.
+  Migration 19 rebuilds `recipe_runs_v1` to admit the new terminal state
+  (SQLite cannot ALTER a CHECK constraint).
+- A rejection carried no reason (finding #136). `work` was the fixed string
+  `f"Human decision: {result}"`, so a rework box received literally
+  `Human decision: rejected` and re-planned blind — the operator's rejection was
+  structurally mute. `reason` is now a column on `human_box_decisions_v1`, joins
+  the replay identity tuple, and is folded into the routed work as
+  `Human decision: rejected\n\nOperator feedback:\n<text>`. It is REQUIRED for
+  `rejected` (422, field `reason`) and optional otherwise, enforced in
+  `decisions.py` rather than only in the Pydantic model so the CLI cannot bypass
+  it (finding #67).
+- A migration written but never executed is not a migration (finding #137).
+  Migration 19's table-rebuild statements were authored with backslash-escaped
+  triple quotes (`\"\"\"`), fusing two SQL statements into one string:
+  `sqlite3.OperationalError: near "INSERT"` on every `init_db()`, i.e. **559
+  failing tests**, one root cause. The authoring lane timed out before it ever
+  ran the suite. A landing that adds a migration MUST show the suite result,
+  and reviewing the diff is not a substitute for running it.
 
 ## Conventions
 

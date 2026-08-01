@@ -33,6 +33,7 @@ def project_direct_graph_v1(
             "name": recipe.name,
             "start": recipe.start,
             "hash": recipe.hash,
+            "approval_artifact": recipe.approval_artifact,
         },
         "boxes": [
             {

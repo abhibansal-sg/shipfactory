@@ -417,17 +417,18 @@ def consume_phone_token(
 
 def enqueue_human_box_decision(
     *, attempt_id: str, result: str, actor_kind: str, actor_id: str,
-    channel: str, nonce: str,
+    channel: str, nonce: str, reason: str | None = None,
 ) -> dict[str, Any]:
     """Atomically persist a human box decision and enqueue its completion event.
 
     Only an authorized human actor may write a decision for an attempt that is
     frozen ``who: human`` and currently ``waiting_human``. A replay of the
-    exact nonce/tuple returns the prior durable decision unchanged; reusing a
-    nonce for a different tuple, or targeting an attempt that already has a
-    durable decision with different content, fails closed. This function never
-    marks the attempt or Run complete -- GraphRunner applies the resulting
-    ``box_completed`` event on its next tick.
+    exact nonce/tuple (including ``reason``) returns the prior durable
+    decision unchanged; reusing a nonce for a different tuple, or targeting an
+    attempt that already has a durable decision with different content, fails
+    closed. This function never marks the attempt or Run complete --
+    GraphRunner applies the resulting ``box_completed`` event on its next
+    tick.
     """
     attempt_id = _required_text("attempt_id", attempt_id)
     result = _required_text("result", result)
@@ -435,6 +436,15 @@ def enqueue_human_box_decision(
     actor_id = _required_text("actor_id", actor_id)
     channel = _required_text("channel", channel)
     nonce_digest = _nonce_hash(nonce)
+    normalized_reason = reason.strip() if isinstance(reason, str) else None
+    normalized_reason = normalized_reason or None
+    if result == "rejected" and not normalized_reason:
+        # Policy ratified by the operator (SHARED SHAPE 2, defect #4): a
+        # rejection without feedback silently starves the downstream box of
+        # any signal to act on. Enforced HERE, not only in the Pydantic model,
+        # so the CLI decide path cannot bypass it (finding #67 — one policy,
+        # shared by every operator surface).
+        raise ValueError("a rejection requires operator feedback")
     if actor_kind != "human":
         raise DecisionConflict("human box decisions require actor_kind == 'human'")
 
@@ -449,16 +459,18 @@ def enqueue_human_box_decision(
         submitted = {
             "attempt_id": attempt_id, "result": result, "actor_kind": actor_kind,
             "actor_id": actor_id, "channel": channel, "nonce_hash": nonce_digest,
+            "reason": normalized_reason,
         }
         if existing:
             # A prior durable decision already passed authority/recipe
             # validation when it was recorded. An identical replay of the
-            # exact tuple must return that decision unchanged even if
-            # GraphRunner has since consumed the event and the attempt is no
-            # longer waiting_human. A conflicting attempt/nonce still fails
-            # closed regardless of the attempt's current state.
+            # exact tuple (including reason) must return that decision
+            # unchanged even if GraphRunner has since consumed the event and
+            # the attempt is no longer waiting_human. A conflicting
+            # attempt/nonce/reason still fails closed regardless of the
+            # attempt's current state.
             if len(existing) == 1 and all(
-                existing[0][key] == value for key, value in submitted.items()
+                (existing[0][key] or None) == value for key, value in submitted.items()
             ):
                 return dict(existing[0]) | {"replayed": True}
             raise DecisionConflict(
@@ -494,13 +506,16 @@ def enqueue_human_box_decision(
         event_key = hashlib.sha256(
             f"human-box-decision|{decision_id}".encode("utf-8")
         ).hexdigest()
+        work = f"Human decision: {result}"
+        if normalized_reason:
+            work = f"{work}\n\nOperator feedback:\n{normalized_reason}"
         payload = {
             "type": "box_completed",
             "run_id": attempt["run_id"],
             "attempt_id": attempt_id,
             "expected_state": "waiting_human",
             "result": result,
-            "work": f"Human decision: {result}",
+            "work": work,
         }
         try:
             store.enqueue_run_event_v1(
@@ -519,7 +534,8 @@ def enqueue_human_box_decision(
             row = store.record_human_box_decision_v1(
                 decision_id=decision_id, attempt_id=attempt_id, result=result,
                 actor_kind=actor_kind, actor_id=actor_id, channel=channel,
-                nonce_hash=nonce_digest, event_key=event_key, conn=db,
+                nonce_hash=nonce_digest, event_key=event_key,
+                reason=normalized_reason, conn=db,
             )
         except (
             store.GraphStoreConflict,

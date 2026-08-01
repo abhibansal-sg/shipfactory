@@ -1,0 +1,106 @@
+# DRAFT — NOT PUBLISHED. Lives in recipes/drafts/ which the v1 library does NOT
+# scan (only recipes/v1/ is loaded — dashboard/plugin_api.py:946). Move to
+# recipes/v1/ only after operator approval and after the weave-intake seat
+# exists in seats.yaml. Designed 2026-08-01 with Abhi.
+
+name: weave-phase-intake
+start: intake-architect
+
+boxes:
+  - id: intake-architect
+    name: Review phase plan and design sprints
+    who: weave-intake
+    instructions: |
+      The request contains a ratified phase plan from the operator's planning
+      session. Do not re-plan the phase. Your job is to turn it into a sprint
+      decomposition that builders can execute one sprint at a time.
+
+      First verify the plan's factual claims against the repository — grep for
+      the files, symbols, and tests it names. Never trust a claim you did not
+      check. If a premise is false, say so in your output.
+
+      Architecture gate (apply to the plan and to your own decomposition):
+      - DRY: does any sprint duplicate logic that already exists in the repo?
+        Name the existing code instead of rebuilding it.
+      - KISS: flag any step that adds a queue, database, daemon, config
+        surface, or abstraction not strictly required. Prefer deleting a broken
+        mechanism over adding a parallel one.
+      - Reuse: for each capability the plan wants, check whether the repo or
+        its pinned runtime already ships it switched off.
+
+      Then produce the sprint decomposition. For each sprint:
+      - one-sentence goal
+      - exact file scope (paths a builder may touch; scopes across sprints
+        must be disjoint)
+      - acceptance criteria phrased as observed behaviour, never "tests pass"
+        alone
+      - focused test commands
+      - dependency order (which sprints must land first)
+      - size check: each sprint must fit one builder session (roughly 40
+        minutes, one commit); split anything larger
+      - complexity tag: fast (mechanical) or standard (default when in doubt)
+
+      End with the numbered sprint list in dependency order. Your last output
+      line must be exactly one declared result label.
+
+  - id: decomposition-attack
+    name: Attack the sprint decomposition
+    who: weave-adversary
+    instructions: |
+      Attack the sprint decomposition in the input work. Verify at source —
+      read the repository, not the plan's own description of itself.
+
+      Hunt specifically for:
+      - hidden file overlaps between sprints (grep every scoped path; two
+        sprints touching one file is a blocking finding)
+      - wrong dependency order (a sprint consuming another sprint's output
+        while scheduled before or parallel to it)
+      - sprints too large for one builder session
+      - missed scope: work the phase plan requires that no sprint covers
+      - scope creep: sprints inventing work the phase plan never asked for
+      - false premises: plan claims about the repo that are untrue
+      - over-engineering the decomposition itself
+
+      A blocking finding needs a concrete counterexample with file paths.
+      Findings without evidence are advisory only. Do not redesign the
+      decomposition; report findings and one verdict.
+
+      Result labels: pass (no blocking findings) or rework (blocking
+      findings, listed with evidence). Your last output line must be exactly
+      one label.
+
+  - id: human-approval
+    name: Operator approves the sprint plan
+    who: human
+    instructions: Review the sprint decomposition and the adversarial findings before approving or rejecting.
+
+  - id: file-report
+    name: Deliver the sprint plan
+    who: weave-deliver
+    instructions: |
+      Deliver the approved sprint decomposition as the final report: numbered
+      sprint list in dependency order, each with goal, file scope, acceptance
+      criteria, test commands, and complexity tag. This document is the source
+      for filing one Linear issue per sprint. Do not add new analysis.
+    end: true
+
+arrows:
+  - from: intake-architect
+    result: done
+    to: [decomposition-attack]
+
+  - from: decomposition-attack
+    result: pass
+    to: [human-approval]
+
+  - from: decomposition-attack
+    result: rework
+    to: [intake-architect]
+
+  - from: human-approval
+    result: approved
+    to: [file-report]
+
+  - from: human-approval
+    result: rejected
+    to: [intake-architect]
