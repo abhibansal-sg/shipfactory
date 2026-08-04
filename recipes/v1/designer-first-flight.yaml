@@ -1,0 +1,63 @@
+name: designer-first-flight
+start: builder
+boxes:
+- id: builder
+  name: Builder
+  who: builder
+  instructions: Implement the eligible Linear issue and produce a candidate with evidence.
+- id: tests
+  name: Focused tests
+  who: verifier
+  instructions: Run the focused test contract and attach exact evidence.
+- id: code-review
+  name: Code review
+  who: reviewer
+  instructions: Review correctness, maintainability, and scope discipline.
+- id: security-review
+  name: Security review
+  who: security-reviewer
+  instructions: Review trust boundaries, unsafe inputs, and privilege changes.
+- id: synthesis
+  name: Synthesize reviews
+  who: lead-reviewer
+  instructions: Wait for all active review branches and synthesize one recommendation.
+- id: approval
+  name: Human approval
+  who: human
+  instructions: Review the candidate and evidence, then approve or request rework.
+- id: delivery
+  name: Merge and update Linear
+  who: release-manager
+  instructions: Deliver the approved candidate and record final evidence.
+  end: true
+arrows:
+- from: builder
+  result: candidate-ready
+  to:
+  - tests
+  - code-review
+  - security-review
+- from: tests
+  result: pass
+  to:
+  - synthesis
+- from: code-review
+  result: approved
+  to:
+  - synthesis
+- from: security-review
+  result: approved
+  to:
+  - synthesis
+- from: synthesis
+  result: verified
+  to:
+  - approval
+- from: approval
+  result: rework
+  to:
+  - builder
+- from: approval
+  result: approved
+  to:
+  - delivery

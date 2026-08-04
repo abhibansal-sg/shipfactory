@@ -15,6 +15,34 @@ from shipfactory import store
 from shipfactory.graph_recipe import validate
 
 
+def test_frozen_v2_recipe_is_not_runtime_executable():
+    recipe = validate({
+        "version": 2,
+        "name": "unsupported-runtime-v2",
+        "start": "build",
+        "capability_sets": {
+            "coding": {"skills": [], "toolsets": [], "plugins": []},
+        },
+        "boxes": [{
+            "id": "build",
+            "name": "Build",
+            "who": "worker",
+            "instructions": "Build.",
+            "workspace": {"lane": "build", "access": "write"},
+            "capabilities": "coding",
+            "end": True,
+        }],
+        "arrows": [],
+    })
+
+    with pytest.raises(graph_runtime.GraphRuntimeError, match="not executable"):
+        graph_runtime._load_recipe({
+            "recipe_snapshot_json": recipe.canonical_json,
+            "recipe_hash": recipe.hash,
+            "recipe_name": recipe.name,
+        })
+
+
 def test_render_graph_prompt_preserves_unicode_and_exact_sections():
     recipe = validate({
         "name": "runtime",

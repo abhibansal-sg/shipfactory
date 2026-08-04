@@ -77,17 +77,22 @@ def enqueue(instance_id: str, source: str, payload: dict[str, Any], *, key: str 
 
 def startup_guard(config: Any) -> None:
     """Fail closed before recipes run on an incompatible Hermes install/config."""
-    if not (getattr(config, "recipes", {}) or {}).get("enabled"):
+    recipes = getattr(config, "recipes", {}) or {}
+    if not recipes.get("enabled"):
         return
-    from hermes_cli import kanban_db
-    if not callable(getattr(kanban_db, "create_blocked_task", None)) or not callable(getattr(kanban_db, "cancel_subtree", None)):
-        raise RuntimeError("recipe engine requires kanban create_blocked_task and cancel_subtree APIs")
-    try:
-        from hermes_cli.config import load_config
-        if bool((load_config() or {}).get("kanban", {}).get("auto_decompose", True)):
-            raise RuntimeError("recipe engine refuses kanban.auto_decompose=true")
-    except ImportError:
-        pass
+    # GraphRunner v1 never runs the legacy kanban-coupled recipe engine
+    # (drain-only), so its two Hermes Kanban compatibility checks do not
+    # apply.  Every other runner mode keeps the exact legacy contract.
+    if recipes.get("runner_mode") != "graph":
+        from hermes_cli import kanban_db
+        if not callable(getattr(kanban_db, "create_blocked_task", None)) or not callable(getattr(kanban_db, "cancel_subtree", None)):
+            raise RuntimeError("recipe engine requires kanban create_blocked_task and cancel_subtree APIs")
+        try:
+            from hermes_cli.config import load_config
+            if bool((load_config() or {}).get("kanban", {}).get("auto_decompose", True)):
+                raise RuntimeError("recipe engine refuses kanban.auto_decompose=true")
+        except ImportError:
+            pass
     recipes = config.recipes or {}
     # Some callers use the guard only to enforce the Hermes compatibility
     # contract before a recipe library has been configured.  Validate the

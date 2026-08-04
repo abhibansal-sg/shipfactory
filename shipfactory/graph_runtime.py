@@ -11,7 +11,12 @@ from typing import Any
 from shipfactory import spawn, store
 from shipfactory.config import load_seats
 from shipfactory.executors import get_executor
-from shipfactory.graph_recipe import GraphRecipe, validate
+from shipfactory.graph_recipe import (
+    GraphRecipe,
+    GraphRecipeError,
+    ensure_runtime_supported,
+    validate,
+)
 
 
 class GraphRuntimeError(RuntimeError):
@@ -107,6 +112,10 @@ def _load_recipe(row: dict[str, Any]) -> GraphRecipe:
         raise GraphRuntimeError("frozen recipe is malformed") from exc
     if recipe.hash != row["recipe_hash"] or recipe.name != row["recipe_name"]:
         raise GraphRuntimeError("frozen recipe identity mismatch")
+    try:
+        ensure_runtime_supported(recipe)
+    except GraphRecipeError as exc:
+        raise GraphRuntimeError(str(exc)) from exc
     return recipe
 
 

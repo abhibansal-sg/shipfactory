@@ -43,6 +43,25 @@ RECIPE = validate({
     ],
 })
 
+V2_RECIPE = validate({
+    "version": 2,
+    "name": "non-executable-v2",
+    "start": "build",
+    "capability_sets": {
+        "coding": {"skills": [], "toolsets": [], "plugins": []},
+    },
+    "boxes": [{
+        "id": "build",
+        "name": "Build",
+        "who": "worker",
+        "instructions": "Build.",
+        "workspace": {"lane": "build", "access": "write"},
+        "capabilities": "coding",
+        "end": True,
+    }],
+    "arrows": [],
+})
+
 CONFLICTING_RECIPE = validate({
     "name": "task-6-conflicting-recipe",
     "start": "conflicting-start",
@@ -423,6 +442,15 @@ def _start(**overrides):
     }
     arguments.update(overrides)
     return start_run(**arguments)
+
+
+def test_start_run_rejects_v2_before_creating_runtime_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with pytest.raises(ValueError, match="not executable"):
+        _start(recipe=V2_RECIPE, launch_key="must-not-launch-v2")
+
+    assert not (tmp_path / "shipfactory" / "factory.db").exists()
 
 
 def _reconcile(run_id):

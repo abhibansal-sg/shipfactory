@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from . import store
-from .graph_recipe import GraphRecipe
+from .graph_recipe import GraphRecipe, ensure_runtime_supported
 
 
 _RESULT_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -45,6 +45,7 @@ def start_run(
     workspace_path: str | None = None,
 ) -> dict[str, Any]:
     """Create one frozen Run and its pending root route token atomically."""
+    ensure_runtime_supported(recipe)
     store.init_db()
     with store._connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
