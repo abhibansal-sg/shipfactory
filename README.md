@@ -15,6 +15,24 @@ cp -R . "$HERMES_HOME/plugins/shipfactory"
 
 If `HERMES_HOME` is unset, Hermes normally uses `~/.hermes`, so the installed path is `~/.hermes/plugins/shipfactory/`.
 
+### Hermes Desktop
+
+ShipFactory also ships a native disk plugin for the released Hermes Desktop
+Plugin SDK. Install its single uncompiled ESM entrypoint under the matching
+plugin id:
+
+```sh
+mkdir -p "$HERMES_HOME/desktop-plugins/shipfactory"
+cp desktop-plugin/plugin.js "$HERMES_HOME/desktop-plugins/shipfactory/plugin.js"
+```
+
+The Desktop app loads it without a build step and adds a ShipFactory page,
+sidebar item, status chip, command-palette actions, and `mod+alt+f` keybind.
+Its data calls use the SDK-scoped `ctx.rest` namespace, so the Python plugin
+above must be enabled and the Hermes backend restarted once after first
+installation. The full xyflow editor remains in the authenticated dashboard;
+the native page opens that editor from its toolbar.
+
 ## Seat configuration
 
 `hermes shipfactory init` creates `$HERMES_HOME/shipfactory/seats.yaml`. A representative configuration is:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 from types import SimpleNamespace
 
@@ -116,6 +118,7 @@ def test_v1_api_route_set_is_complete(api):
     }
     assert routes == {
         ("GET", "/api/plugins/shipfactory/v1/recipes"),
+        ("POST", "/api/plugins/shipfactory/v1/recipes"),
         ("GET", "/api/plugins/shipfactory/v1/recipes/{name}"),
         ("GET", "/api/plugins/shipfactory/v1/projects/{project_id}/recipes"),
         ("PUT", "/api/plugins/shipfactory/v1/projects/{project_id}/recipes/{name}"),
@@ -273,3 +276,219 @@ def test_v1_cli_recipe_and_run_commands_preserve_idempotency(api):
     assert replay["id"] == started["id"]
     assert [item["id"] for item in listed] == [started["id"]]
     assert shown["workspace_path"] == str(workspace.resolve())
+
+
+def _publish_document(name: str = "publish-flow",
+                      instructions: str = "Do the work") -> dict:
+    return {
+        "name": name,
+        "start": "work",
+        "boxes": [
+            {
+                "id": "work",
+                "name": "Work",
+                "who": "worker",
+                "instructions": instructions,
+            },
+            {
+                "id": "finish",
+                "name": "Finish",
+                "who": "human",
+                "instructions": "Confirm delivery",
+                "end": True,
+            },
+        ],
+        "arrows": [
+            {"from": "work", "result": "done", "to": ["finish"]},
+        ],
+    }
+
+
+def _publish(client: TestClient, name: str, document: dict):
+    return client.post(
+        "/api/plugins/shipfactory/v1/recipes",
+        json={"name": name, "document": document},
+    )
+
+
+def test_publish_graph_recipe_v1_writes_new_recipe(api):
+    client, _workspace, _recipe_path = api
+    response = _publish(client, "publish-flow", _publish_document())
+    assert response.status_code == 201
+    assert response.json()["recipe"]["name"] == "publish-flow"
+    assert response.json()["recipe"]["start"] == "work"
+
+    shown = client.get("/api/plugins/shipfactory/v1/recipes/publish-flow")
+    assert shown.status_code == 200
+    assert shown.json()["recipe"]["hash"] == response.json()["recipe"]["hash"]
+    listed = client.get("/api/plugins/shipfactory/v1/recipes")
+    assert [item["name"] for item in listed.json()["recipes"]] == [
+        "approval-flow", "publish-flow",
+    ]
+
+
+def test_publish_graph_recipe_v1_rejects_invalid_name(api):
+    client, _workspace, _recipe_path = api
+    response = _publish(client, "Bad_Name", _publish_document(name="Bad_Name"))
+    assert response.status_code == 422
+    assert response.json()["field"] == "name"
+
+
+def test_publish_graph_recipe_v1_rejects_invalid_document(api):
+    client, _workspace, _recipe_path = api
+    document = _publish_document()
+    document["boxes"][0].pop("who")
+    response = _publish(client, "publish-flow", document)
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_recipe"
+
+
+def test_publish_graph_recipe_v1_rejects_name_mismatch(api):
+    client, _workspace, _recipe_path = api
+    response = _publish(client, "publish-flow", _publish_document(name="other-flow"))
+    assert response.status_code == 422
+
+
+def test_publish_graph_recipe_v1_rejects_v2_document(api):
+    client, _workspace, _recipe_path = api
+    document = _publish_document(name="v2-flow")
+    document["version"] = 2
+    document["capability_sets"] = {
+        "basic": {"skills": [], "toolsets": [], "plugins": []},
+    }
+    for box in document["boxes"]:
+        box["workspace"] = {"lane": "build", "access": "read"}
+        box["capabilities"] = "basic"
+    response = _publish(client, "v2-flow", document)
+    assert response.status_code == 422
+    assert response.json()["message"] == (
+        "v2 recipes are not yet executable (SF-28..31)"
+    )
+
+
+def test_publish_graph_recipe_v1_conflict_and_idempotent_replay(api):
+    client, _workspace, recipe_path = api
+    document = _publish_document()
+    first = _publish(client, "publish-flow", document)
+    assert first.status_code == 201
+    target = recipe_path.parent / "publish-flow.yaml"
+    original = target.read_text(encoding="utf-8")
+
+    conflict = _publish(
+        client, "publish-flow", _publish_document(instructions="Changed"),
+    )
+    assert conflict.status_code == 409
+    assert target.read_text(encoding="utf-8") == original
+
+    replay = _publish(client, "publish-flow", document)
+    assert replay.status_code == 200
+    assert replay.json()["recipe"]["hash"] == first.json()["recipe"]["hash"]
+
+
+# ---------------------------------------------------------------------------
+# Same-origin Factory Workflow designer (served as a static plugin asset).
+#
+# The Hermes dashboard host serves any file under a plugin's dashboard/
+# directory at GET /dashboard-plugins/<name>/<path> with a browser-asset
+# suffix allowlist.  The standalone designer build lives in
+# dashboard/designer/ and the dashboard bundle embeds it in an iframe pane.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DESIGNER_DIR = REPO_ROOT / "dashboard" / "designer"
+
+
+@pytest.fixture
+def host_client(monkeypatch: pytest.MonkeyPatch):
+    """TestClient against the real Hermes dashboard app.
+
+    Points the hermetic HERMES_HOME (created by the autouse conftest
+    fixture) at this repository via a user-plugin symlink, enables the
+    plugin in config.yaml, and forces a fresh plugin scan.
+    """
+    home = Path(os.environ["HERMES_HOME"])
+    plugins_root = home / "plugins"
+    plugins_root.mkdir(parents=True, exist_ok=True)
+    link = plugins_root / "shipfactory"
+    if not link.exists():
+        link.symlink_to(REPO_ROOT)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - shipfactory\n", encoding="utf-8"
+    )
+    from hermes_cli import web_server
+
+    web_server._get_dashboard_plugins(force_rescan=True)
+    from fastapi.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    try:
+        yield client
+    finally:
+        web_server._dashboard_plugins_cache = None
+
+
+def test_designer_page_served_same_origin(host_client: TestClient):
+    response = host_client.get(
+        "/dashboard-plugins/shipfactory/designer/index.html"
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert '<div id="root">' in response.text
+    # Assets must be referenced relatively so the page keeps working under
+    # the /dashboard-plugins/shipfactory/designer/ prefix (and any
+    # X-Forwarded-Prefix rewrite).
+    assert "./assets/" in response.text
+
+
+def test_designer_js_asset_served_with_javascript_content_type(
+    host_client: TestClient,
+):
+    scripts = sorted(DESIGNER_DIR.glob("assets/*.js"))
+    assert scripts, "designer build must ship a bundled JS asset"
+    asset = scripts[0]
+    response = host_client.get(
+        f"/dashboard-plugins/shipfactory/designer/assets/{asset.name}"
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/javascript")
+    assert response.content == asset.read_bytes()
+
+
+def test_designer_unknown_asset_404(host_client: TestClient):
+    response = host_client.get(
+        "/dashboard-plugins/shipfactory/designer/assets/missing-asset.js"
+    )
+    assert response.status_code == 404
+
+
+def test_designer_asset_traversal_is_blocked(host_client: TestClient):
+    # plugin_api.py sits next to designer/ — traversal must never serve it
+    # (and .py is outside the browser-asset allowlist regardless).
+    response = host_client.get(
+        "/dashboard-plugins/shipfactory/designer/../plugin_api.py"
+    )
+    assert response.status_code in (403, 404)
+
+
+def test_dashboard_bundle_registers_workflows_tab():
+    bundle = (REPO_ROOT / "dashboard" / "dist" / "index.js").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r'id:\s*"workflows"', bundle)
+    assert 'label: "Workflows"' in bundle
+    assert all(f'label: "{label}"' in bundle for label in (
+        "Projects", "Workflows", "Runs", "Settings",
+    ))
+    assert "/dashboard-plugins/shipfactory/designer/index.html" in bundle
+    assert "iframe" in bundle
+
+
+def test_project_screen_opens_designer_with_project_identity():
+    bundle = (REPO_ROOT / "dashboard" / "dist" / "index.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'data-project-new-workflow' in bundle
+    assert 'props.onCreateWorkflow(project)' in bundle
+    assert '"sf-project-id"' in bundle
+    assert '"sf-project-name"' in bundle
+    assert 'h(DesignerView, { project: designerProject' in bundle

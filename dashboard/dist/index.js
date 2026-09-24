@@ -2666,6 +2666,74 @@
   }
 
 
+  function ProjectOverview(props) {
+    var project = props.project;
+    var recipesResource = usePollingResource("/v1/recipes", props.refreshKey);
+    var attachedResource = usePollingResource("/v1/projects/" + encodeURIComponent(project.id) + "/recipes", props.refreshKey);
+    var runsResource = usePollingResource("/v1/runs?project_id=" + encodeURIComponent(project.id), props.refreshKey);
+    var seatsResource = usePollingResource("/seats", props.refreshKey);
+    var library = recipesResource.data && Array.isArray(recipesResource.data.recipes) ? recipesResource.data.recipes : [];
+    var attachments = attachedResource.data && Array.isArray(attachedResource.data.recipes) ? attachedResource.data.recipes.filter(function (item) { return item.enabled; }) : [];
+    var workflows = attachments.map(function (attachment) {
+      var recipe = library.find(function (item) { return item.name === attachment.name; });
+      return { attachment: attachment, recipe: recipe || { name: attachment.name, boxes: [], arrows: [] } };
+    });
+    var runs = runsResource.data && Array.isArray(runsResource.data.runs) ? runsResource.data.runs.slice(0, 5) : [];
+    var seatCount = Array.isArray(seatsResource.data) ? seatsResource.data.filter(function (seat) { return !seat.paused; }).length : null;
+    var loading = [recipesResource, attachedResource, runsResource].some(function (resource) { return resource.loading && resource.data === null; });
+    var error = recipesResource.error || attachedResource.error || runsResource.error;
+
+    return h("section", { className: "factory-project-overview grid gap-5" },
+      h(ViewHeading, {
+        title: project.name || project.id,
+        description: "Versioned workflows and separate executions for this project.",
+        action: h(Button, {
+          type: "button", size: "sm", "data-project-new-workflow": project.id,
+          onClick: function () { props.onCreateWorkflow(project); },
+        }, "New workflow"),
+      }),
+      h("div", { className: "factory-project-overview-meta flex flex-wrap gap-2 text-xs" },
+        h(MonoChip, null, "Policy · operator approval"),
+        h(MonoChip, null, "Adapters · " + (seatCount == null ? "…" : seatCount + " live")),
+        h(MonoChip, null, "Runs · " + ((project.rollup && project.rollup.active) || 0) + " active"),
+        h(MonoChip, null, "Boundary · project workspace")
+      ),
+      error ? h(ErrorState, { title: "Project overview refresh failed", message: error }) : null,
+      loading ? h(LoadingState, { label: "Loading project workflows…" }) : h("section", { className: "grid gap-2" },
+        h(SectionHeading, { title: "Workflows", description: "Published GraphRunner recipes attached to this project.", meta: workflows.length + (workflows.length === 1 ? " workflow" : " workflows") }),
+        workflows.length ? h("div", { className: "border-y border-border" }, workflows.map(function (item) {
+          var boxes = Array.isArray(item.recipe.boxes) ? item.recipe.boxes : [];
+          var adapters = new Set(boxes.map(function (box) { return box.who; }).filter(function (who) { return who && who !== "human"; })).size;
+          return h("article", { key: item.attachment.name, className: "factory-project-overview-workflow-row grid gap-2 border-b border-border/50 px-2 py-4 last:border-b-0" },
+            h("div", { className: "min-w-0" },
+              h("div", { className: "flex flex-wrap items-center gap-2" },
+                h("strong", { className: "font-mondwest normal-case text-sm text-foreground" }, item.recipe.name),
+                item.attachment.is_default ? h(StatePill, { value: "running" }, "Default") : null
+              ),
+              h("p", { className: "mt-1 text-xs text-text-tertiary" }, boxes.length + " steps · " + (Array.isArray(item.recipe.arrows) ? item.recipe.arrows.length : 0) + " result routes")
+            ),
+            h("div", { className: "flex gap-5 text-xs text-text-secondary" },
+              h("span", null, adapters + (adapters === 1 ? " adapter" : " adapters")),
+              h("span", null, "Immutable v1")
+            )
+          );
+        })) : h(EmptyState, { title: "No workflows yet", description: "Create and publish the first workflow for this project." })
+      ),
+      !loading ? h("section", { className: "grid gap-2" },
+        h(SectionHeading, { title: "Recent runs", description: "Each row is one separate execution of a published workflow.", meta: runs.length ? "Latest " + runs.length : "No runs" }),
+        runs.length ? h("div", { className: "border-y border-border" }, runs.map(function (run) {
+          return h("article", { key: run.id, className: "factory-project-overview-run-row grid gap-2 border-b border-border/50 px-2 py-3 last:border-b-0" },
+            h("strong", { className: "truncate font-mono-ui text-xs text-foreground", title: run.id }, String(run.id).slice(0, 12)),
+            h("span", { className: "truncate text-xs text-text-secondary" }, run.recipe_name || "Workflow run"),
+            h(StatePill, { value: run.state }),
+            h(Ago, { value: run.updated_at || run.created_at })
+          );
+        })) : h(EmptyState, { title: "No recent runs", description: "Publish a workflow, then start a Run from the builder." })
+      ) : null
+    );
+  }
+
+
   function ProjectDetails(props) {
     var project = props.project;
     var runtime = props.runtime;
@@ -2826,7 +2894,15 @@
       );
     }
     return h("section", { className: "factory-project-detail grid gap-4" },
-      h(ViewHeading, { title: project.name || project.id, description: "Choose an attached recipe, configure its immutable inputs, and start one flight." }),
+      h(ViewHeading, {
+        title: project.name || project.id,
+        description: "Create workflows, inspect attached versions, and start one Run.",
+        action: h(Button, {
+          type: "button", size: "sm",
+          "data-project-new-workflow": project.id,
+          onClick: function () { props.onCreateWorkflow(project); },
+        }, "New workflow"),
+      }),
       h(GraphV1ProjectPanel, { project: project, runtime: runtime }),
       policyError ? h("div", { className: "border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive", role: "alert" }, policyError) : null,
       !runtime.policy_editing_enabled ? h("p", { className: "border border-border bg-background/20 p-3 text-xs text-text-tertiary" }, "Recipe policy editing is disabled by runtime configuration.") : null,
@@ -2855,12 +2931,15 @@
 
   function ProjectsView(props) {
     var resource = useProjectsResource(props.refreshKey);
-    var _a = useState(null), selectedId = _a[0], setSelectedId = _a[1];
+    var _a = useState(props.initialProjectId || null), selectedId = _a[0], setSelectedId = _a[1];
     var projects = resource.data && Array.isArray(resource.data.projects) ? resource.data.projects : [];
     var runtime = resource.data && resource.data.runtime_config;
     var selected = projects.find(function (project) { return project.id === selectedId; }) || (resource.data && resource.data.unclassified && resource.data.unclassified.id === selectedId ? resource.data.unclassified : null);
     useEffect(function () {
-      if (!selected && projects.length) setSelectedId(projects[0].id);
+      if (!selected && projects.length) {
+        var launchable = projects.find(function (project) { return project.binding === "bound"; });
+        setSelectedId((launchable || projects[0]).id);
+      }
     }, [resource.data && resource.data.projects && resource.data.projects.map(function (project) { return project.id; }).join("|"), selectedId]);
     if (resource.loading && resource.data === null) return h("section", { className: "factory-projects-view flex min-w-0 flex-col gap-4" }, h(LoadingState, { label: "Loading projects…" }));
     if (resource.error && resource.data === null) return h("section", { className: "factory-projects-view flex min-w-0 flex-col gap-4" }, h(ErrorState, { title: "Projects unavailable", message: resource.error, onRetry: resource.reload }));
@@ -2868,28 +2947,158 @@
     return h("section", { className: "factory-projects-view grid min-w-0 gap-4" },
       h(ProjectsHeader, { runtime: runtime }),
       resource.error ? h(ErrorState, { title: "Projects refresh failed", message: resource.error, onRetry: resource.reload }) : null,
-      h("div", { className: "factory-projects-layout" },
-        h("section", { className: "factory-project-list border border-border bg-card", "aria-label": "Projects" },
-          h("div", { className: "border-b border-border p-4" },
-            h("h2", { className: "font-mondwest text-display text-base tracking-wider text-foreground" }, "Projects"),
-            h("p", { className: "mt-1 text-xs text-text-tertiary" }, "Choose a bound project to configure and start a flight." )
+      h("label", { className: "factory-project-switcher flex max-w-xl items-center gap-3 border border-border bg-card px-3 py-2 text-xs text-text-secondary" },
+        h("span", { className: "shrink-0 font-medium text-foreground" }, "Current project"),
+        h("select", {
+          className: "min-h-9 min-w-0 flex-1 border border-border bg-background px-2 text-sm text-foreground",
+          value: selectedId || "",
+          onChange: function (event) { setSelectedId(event.target.value || null); },
+        },
+          projects.map(function (project) { return h("option", { key: project.id, value: project.id }, project.name || project.label || project.id); }),
+          resource.data.unclassified ? h("option", { value: "unclassified" }, resource.data.unclassified.label || "Unclassified") : null
+        )
+      ),
+      selected ? (selected.binding === "bound"
+        ? h(ProjectOverview, { project: selected, runtime: runtime, refreshKey: props.refreshKey, onCreateWorkflow: props.onCreateWorkflow })
+        : h(ProjectDetails, { project: selected, runtime: runtime, refreshKey: props.refreshKey, onCreateWorkflow: props.onCreateWorkflow, onProjectsRefresh: function () { resource.reload().catch(function () {}); } }))
+        : h(EmptyState, { title: "No project selected", description: "Select a project to continue." })
+    );
+  }
+
+  // The xyflow Factory Workflow designer ships as a standalone Vite build in
+  // dashboard/designer/. The Hermes plugin host serves it same-origin under
+  // /dashboard-plugins/shipfactory/designer/ (suffix-allowlisted static
+  // assets), so the iframe shares the dashboard session cookie and the
+  // designer's Publish button can POST to /api/plugins/shipfactory/v1/recipes
+  // without CORS.
+  var DESIGNER_URL =
+    (typeof window.__HERMES_BASE_PATH__ === "string" ? window.__HERMES_BASE_PATH__ : "") +
+    "/dashboard-plugins/shipfactory/designer/index.html";
+
+  function DesignerView(props) {
+    var project = props.project;
+    var designerUrl = DESIGNER_URL;
+    if (project) {
+      var query = new URLSearchParams();
+      query.set("sf-project-id", project.id);
+      query.set("sf-project-name", project.name || project.label || project.slug || project.id);
+      designerUrl += "?" + query.toString();
+    }
+    return h("section", {
+      className: "factory-designer-pane flex min-h-0 flex-1 flex-col overflow-hidden border border-midground/15 bg-background",
+      "aria-label": "Factory workflow designer",
+    },
+      h("iframe", {
+        src: designerUrl,
+        title: "Factory workflow designer",
+        className: "block h-full w-full border-0 bg-background",
+        style: { height: "calc(100vh - 190px)", minHeight: "640px" },
+      })
+    );
+  }
+
+  function HubNav(props) {
+    return h("nav", { className: "factory-hub-tabs flex flex-wrap gap-2", "aria-label": props.label },
+      props.items.map(function (item) {
+        var active = item.id === props.value;
+        return h("button", {
+          key: item.id, type: "button", "aria-pressed": active,
+          className: "min-h-9 border px-3 text-xs font-medium transition-colors " + (active ? "border-midground bg-midground text-background" : "border-border bg-card text-text-secondary hover:border-midground/50 hover:text-foreground"),
+          onClick: function () { props.onChange(item.id); },
+        }, item.label);
+      })
+    );
+  }
+
+  function V1RunsView(props) {
+    var resource = usePollingResource("/v1/runs", props.refreshKey);
+    var _a = useState(null), selectedId = _a[0], setSelectedId = _a[1];
+    var _b = useState(null), graph = _b[0], setGraph = _b[1];
+    var _c = useState(false), loadingGraph = _c[0], setLoadingGraph = _c[1];
+    var _d = useState(""), graphError = _d[0], setGraphError = _d[1];
+    var runs = resource.data && Array.isArray(resource.data.runs) ? resource.data.runs.slice(0, 20) : [];
+
+    function loadRunGraph(id) {
+      setGraphError(""); setLoadingGraph(true);
+      return request("/v1/runs/" + encodeURIComponent(id) + "/graph")
+        .then(setGraph)
+        .catch(function (err) { setGraphError(errorText(err)); })
+        .finally(function () { setLoadingGraph(false); });
+    }
+    function openRun(id) {
+      if (selectedId === id) {
+        setSelectedId(null); setGraph(null); setGraphError("");
+        return;
+      }
+      setSelectedId(id); setGraph(null);
+      loadRunGraph(id);
+    }
+
+    return h("section", { className: "factory-v1-runs-view grid gap-4" },
+      h(ViewHeading, { title: "Runs", description: "Each Run is one execution of one immutable workflow version." }),
+      resource.loading && resource.data === null ? h(LoadingState, { label: "Loading runs…" }) :
+      resource.error && resource.data === null ? h(ErrorState, { title: "Runs unavailable", message: resource.error, onRetry: resource.reload }) :
+      runs.length === 0 ? h(EmptyState, { title: "No runs yet", description: "Publish a project workflow, then start its first Run." }) :
+      h("div", { className: "factory-v1-runs-list border-y border-border" }, runs.map(function (run) {
+        var selected = run.id === selectedId;
+        return h("article", { key: run.id, className: "border-b border-border/50 last:border-b-0" },
+          h("button", {
+            type: "button", className: "factory-v1-run-row grid w-full gap-2 px-2 py-3 text-left hover:bg-secondary/20",
+            "aria-expanded": selected, onClick: function () { openRun(run.id); },
+          },
+            h("strong", { className: "truncate font-mono-ui text-xs text-foreground", title: run.id }, String(run.id).slice(0, 12)),
+            h("span", { className: "truncate text-xs text-text-secondary" }, run.recipe_name || "Workflow run"),
+            h("span", { className: "truncate text-xs text-text-tertiary" }, run.project_id || run.board || "Unclassified"),
+            h(StatePill, { value: run.state }),
+            h(Ago, { value: run.updated_at || run.created_at })
           ),
-          projects.map(function (project) { return h(ProjectRow, { key: project.id, project: project, selected: selectedId === project.id, onSelect: function (value) { setSelectedId(value.id); } }); }),
-          resource.data.unclassified ? h(ProjectRow, { key: "unclassified", project: resource.data.unclassified, selected: selectedId === "unclassified", onSelect: function () { setSelectedId("unclassified"); } }) : null
-        ),
-        selected ? h(ProjectDetails, { project: selected, runtime: runtime, refreshKey: props.refreshKey, onProjectsRefresh: function () { resource.reload().catch(function () {}); } }) : h(EmptyState, { title: "No project selected", description: "Select a project to continue." })
-      )
+          selected ? h("div", { className: "grid gap-3 border-t border-border bg-background/20 p-4" },
+            loadingGraph ? h(LoadingState, { label: "Loading run graph…" }) :
+            graphError ? h(ErrorState, { title: "Run graph unavailable", message: graphError, onRetry: function () { return loadRunGraph(run.id); } }) :
+            graph ? h(GraphV1Run, { graph: graph, onRefresh: function () { return loadRunGraph(run.id); } }) : null
+          ) : null
+        );
+      }))
+    );
+  }
+
+  var RUN_VIEWS = [
+    { id: "active", label: "Graph runs", component: V1RunsView },
+    { id: "approvals", label: "Approvals", component: WaitingView },
+    { id: "journeys", label: "History", component: JourneyView },
+  ];
+
+  function RunsHubView(props) {
+    var _a = useState("active"), activeId = _a[0], setActiveId = _a[1];
+    var view = RUN_VIEWS.find(function (item) { return item.id === activeId; }) || RUN_VIEWS[0];
+    var ActiveView = view.component;
+    return h("section", { className: "grid gap-4" },
+      h(HubNav, { label: "Run views", items: RUN_VIEWS, value: activeId, onChange: setActiveId }),
+      h(ActiveView, props)
+    );
+  }
+
+  var SETTINGS_VIEWS = [
+    { id: "recipes", label: "Published recipes", component: RecipesView },
+    { id: "seats", label: "Adapter seats", component: SeatsView },
+    { id: "costs", label: "Costs", component: CostsView },
+  ];
+
+  function SettingsHubView(props) {
+    var _a = useState("recipes"), activeId = _a[0], setActiveId = _a[1];
+    var view = SETTINGS_VIEWS.find(function (item) { return item.id === activeId; }) || SETTINGS_VIEWS[0];
+    var ActiveView = view.component;
+    return h("section", { className: "grid gap-4" },
+      h(HubNav, { label: "ShipFactory settings", items: SETTINGS_VIEWS, value: activeId, onChange: setActiveId }),
+      h(ActiveView, props)
     );
   }
 
   var VIEW_REGISTRY = [
     { id: "projects", label: "Projects", component: ProjectsView },
-    { id: "journey", label: "Journeys", component: JourneyView },
-    { id: "waiting", label: "Waiting gates", component: WaitingView },
-    { id: "instances", label: "Instances", component: InstancesView },
-    { id: "recipes", label: "Recipes", component: RecipesView },
-    { id: "seats", label: "Seats", component: SeatsView },
-    { id: "costs", label: "Costs", component: CostsView },
+    { id: "workflows", label: "Workflows", component: DesignerView },
+    { id: "runs", label: "Runs", component: RunsHubView },
+    { id: "settings", label: "Settings", component: SettingsHubView },
   ];
 
   function FactoryHeader(props) {
@@ -2908,7 +3117,7 @@
         h("div", { className: "flex flex-wrap items-center gap-2" },
           h(StatePill, { value: "running" }, props.board || "All boards"),
           h(StatePill, { value: daemonState, title: daemonTitle }, daemonLabel),
-          h("p", { className: "text-sm text-text-secondary" }, "Recipe operations, approvals, capacity, and spend.")
+        h("p", { className: "text-sm text-text-secondary" }, "Projects, workflows, runs, approvals, and spend.")
         ),
         h("div", { className: "mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-tertiary" },
           h("span", null, "Board scope: ", h("strong", { className: "font-medium text-foreground" }, props.board || "All boards")),
@@ -2964,7 +3173,7 @@
     var statusResource = usePollingResource("/status", props.refreshKey);
     var _a = useState({ board: "All boards", loadedAt: null }), meta = _a[0], setMeta = _a[1];
     var active = useMemo(function () {
-      return VIEW_REGISTRY.find(function (view) { return view.id === props.activeId && view.id !== "projects"; }) || VIEW_REGISTRY[1];
+      return VIEW_REGISTRY.find(function (view) { return view.id === props.activeId && view.id !== "projects" && view.id !== "workflows"; }) || VIEW_REGISTRY[2];
     }, [props.activeId]);
     var ActiveView = active.component;
     var onMeta = useCallback(function (next) { setMeta(next); }, []);
@@ -2982,19 +3191,37 @@
   function FactoryPage() {
     var _a = useState("projects"), activeId = _a[0], setActiveId = _a[1];
     var _b = useState(0), refreshKey = _b[0], setRefreshKey = _b[1];
+    var _c = useState(null), designerProject = _c[0], setDesignerProject = _c[1];
     var active = useMemo(function () {
       return VIEW_REGISTRY.find(function (view) { return view.id === activeId; }) || VIEW_REGISTRY[0];
     }, [activeId]);
+    function changeView(nextId) {
+      setActiveId(nextId);
+    }
+    function createProjectWorkflow(project) {
+      setDesignerProject(project);
+      setActiveId("workflows");
+    }
     if (active.id === "projects") {
       return h("main", { className: "hermes-factory flex flex-col gap-4" },
-        h(SegmentedNav, { value: activeId, onChange: setActiveId }),
-        h(ProjectsView, { refreshKey: refreshKey })
+        h(SegmentedNav, { value: activeId, onChange: changeView }),
+        h(ProjectsView, { refreshKey: refreshKey, initialProjectId: designerProject && designerProject.id, onCreateWorkflow: createProjectWorkflow })
+      );
+    }
+    if (active.id === "workflows") {
+      // Full-bleed same-origin iframe pane: no polling header, no status
+      // props — the designer bundle owns its own chrome (palette, canvas,
+      // inspector) and its Publish button posts straight to
+      // /api/plugins/shipfactory/v1/recipes with the session cookie.
+      return h("main", { className: "hermes-factory flex flex-col gap-4" },
+        h(SegmentedNav, { value: activeId, onChange: changeView }),
+        h(DesignerView, { project: designerProject, onBack: function () { setActiveId("projects"); } })
       );
     }
     return h(LegacyFactoryShell, {
       activeId: activeId,
       refreshKey: refreshKey,
-      onChange: setActiveId,
+      onChange: changeView,
       onRefresh: function () { setRefreshKey(function (value) { return value + 1; }); },
     });
   }

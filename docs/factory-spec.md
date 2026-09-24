@@ -52,7 +52,7 @@ GitHub Issues <--sync--> kanban board (per company) <-- factory daemon
 ```
 factory/
   __init__.py           # plugin entry: register(ctx) — tools, CLI, hooks
-  plugin.yaml           # name: factory, kind: general
+  plugin.yaml           # repository-root manifest: name: shipfactory, kind: standalone
   config.py             # load/validate factory config + seat registry
   store.py              # factory.db SQLite schema + migrations + accessors
   spawn.py              # shipfactory_spawn(task, workspace, board) -> pid

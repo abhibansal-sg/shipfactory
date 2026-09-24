@@ -462,9 +462,14 @@ def test_recipes_and_compact_journey_bundle_contract() -> None:
     assert "function RecipeStepDetail" in bundle
     registry = re.search(r"var VIEW_REGISTRY = \[(.*?)\n  \];", bundle, re.S)
     assert registry
-    assert ["instances", "recipes"] == re.findall(
-        r'id: "(instances|recipes)"', registry.group(1)
+    assert ["projects", "workflows", "runs", "settings"] == re.findall(
+        r'id: "(projects|workflows|runs|settings)"', registry.group(1)
     )
+    assert "function RunsHubView" in bundle
+    assert "function SettingsHubView" in bundle
+    assert "function ProjectOverview" in bundle
+    assert "function V1RunsView" in bundle
+    assert 'label: "Graph runs", component: V1RunsView' in bundle
 
     recipes = _bundle_component(bundle, "RecipesView", "SeatDialog")
     assert "Object.keys(groups).sort()" in recipes

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 from typing import Any
@@ -36,6 +37,8 @@ router = APIRouter()
 
 
 _APPROVAL_WAITING_STATES = frozenset({"waiting", "waiting_gate", "needs_input"})
+
+_RECIPE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
 class GateDecision(BaseModel):
@@ -113,6 +116,13 @@ class GraphProjectRecipeWrite(BaseModel):
 
     enabled: bool = True
     is_default: bool = False
+
+
+class GraphRecipePublish(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    document: dict[str, object]
 
 
 class GraphRunLaunch(BaseModel):
@@ -957,6 +967,21 @@ def _v1_library() -> dict[str, Any]:
         _project_error(400, "invalid_recipe_library", str(exc))
 
 
+def _v1_library_dir() -> Path:
+    """Return the writable v1 recipe directory from the configured root."""
+    from shipfactory.config import load_seats
+
+    config = load_seats()
+    recipes = config.recipes or {}
+    root = recipes.get("library_path")
+    if not isinstance(root, str) or not root.strip():
+        _project_error(
+            400, "invalid_recipe_library",
+            "recipes.library_path is not configured",
+        )
+    return Path(root).expanduser() / "v1"
+
+
 def _v1_recipe_projection(recipe: Any) -> dict[str, Any]:
     return {
         "name": recipe.name,
@@ -1550,6 +1575,60 @@ def list_graph_recipes_v1() -> dict[str, Any] | JSONResponse:
         }
     except _ProjectAPIError as exc:
         return _project_error_response(exc)
+
+
+@router.post("/v1/recipes", status_code=201, response_model=None)
+def publish_graph_recipe_v1(
+    request: GraphRecipePublish,
+) -> dict[str, Any] | JSONResponse:
+    from shipfactory.graph_recipe import GraphRecipeError
+    from shipfactory.graph_recipe import validate as validate_graph_recipe
+
+    try:
+        if not request.name or _RECIPE_NAME_RE.fullmatch(request.name) is None:
+            _project_error(
+                422, "invalid_recipe_name",
+                "recipe name must match ^[a-z][a-z0-9-]*$",
+                "name",
+            )
+        document = request.document
+        if document.get("version") == 2:
+            _project_error(
+                422, "invalid_recipe_version",
+                "v2 recipes are not yet executable (SF-28..31)",
+                "document.version",
+            )
+        try:
+            recipe = validate_graph_recipe(document)
+        except GraphRecipeError as exc:
+            _project_error(422, "invalid_recipe", str(exc), "document")
+        if recipe.name != request.name:
+            _project_error(
+                422, "invalid_recipe_name",
+                "document name must match the request name",
+                "name",
+            )
+        payload = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+        target = _v1_library_dir() / f"{request.name}.yaml"
+        if target.exists():
+            if target.read_text(encoding="utf-8") == payload:
+                return JSONResponse(
+                    status_code=200,
+                    content={"recipe": _v1_recipe_projection(recipe)},
+                )
+            _project_error(
+                409, "recipe_conflict",
+                "recipe name already used with different content",
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload, encoding="utf-8")
+        return {"recipe": _v1_recipe_projection(recipe)}
+    except _ProjectAPIError as exc:
+        return _project_error_response(exc)
+    except (OSError, sqlite3.Error) as exc:
+        return _project_error_response(
+            _ProjectAPIError(400, "projects_unavailable", str(exc))
+        )
 
 
 @router.get("/v1/legacy-drain-report")
