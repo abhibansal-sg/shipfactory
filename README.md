@@ -1,5 +1,7 @@
 # ShipFactory
 
+> **Archived 2026-09-24.** Not maintained. Its workflow now runs through Hermes `delegate_task`, cross-family review and `kanban_swarm`. See [LESSONS.md](LESSONS.md) for the design rules worth keeping and for when to revive it.
+
 > *Specs in, shipped code out. Agents build below deck; nothing ships without the operator's signal.*
 
 ShipFactory is a governed software factory for [Hermes](https://hermes-agent.nousresearch.com) agents. It adds teams, hierarchy, review/approval policy, watchdog recovery, GitHub Issue sync, and cost telemetry on top of Hermes kanban.
